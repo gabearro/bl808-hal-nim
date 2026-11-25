@@ -1,7 +1,6 @@
-"""Check owned SCANU request preparation and publication from the station manager."""
+"""Check SM's SCANU request preparation and its send (states 1 and 2)."""
 
 from pathlib import Path
-import re
 
 import pytest
 
@@ -29,7 +28,6 @@ const
   ScanuStartReqPayloadSize = sizeof(ScanuStartReqPayload).uint32
   StatusCfmPayloadSize = 1'u32
   SCAN_STATUS_FAIL = 1'u8
-  KeMsgTailSlack = 4'u32
   ScanChannelEntrySize = sizeof(ScanChannelEntry).uint32
 type
   ConnectInfoView = object
@@ -52,9 +50,6 @@ var
   state: uint16
   sm: tuple[connectInfo, connectIndMsg: pointer, joinBssFlag, cancelRequested: uint8]
   indication, otherIndication: uint32
-  smTxSerials: array[2, uint32]
-  rxVifEpochs: array[2, uint32]
-  txResetEpoch: uint32
   config: ScanuChannelConfigOverlay
   channel: ScanChannelEntry
   localMac, target: array[6, uint8]
@@ -79,7 +74,6 @@ proc connectInfoView(p: pointer): ptr ConnectInfoView = cast[ptr ConnectInfoView
 proc vifChannelForIdx(index: uint8): ptr Vif =
   doAssert index < 2
   addr vifs[index]
-proc staDeleteEpoch(index: uint8): uint32 = 0
 proc ke_state_get(task: uint8): uint16 = state
 proc ke_state_set(task: uint8; value: uint16) =
   state = value
@@ -91,11 +85,9 @@ proc scanuStartReqView(p: pointer): ptr ScanuStartReqPayload = cast[ptr ScanuSta
 proc scanuChannelConfig(): ptr ScanuChannelConfigOverlay = addr config
 proc keMsgHdrFromPayload(p: pointer): ptr Header = cast[ptr Header](cast[uint](p) - sizeof(Header).uint)
 proc statusCfmView(p: pointer): ptr StatusCfmPayload = cast[ptr StatusCfmPayload](p)
-proc smScanForget(header: pointer)
-proc resetScanTracking()
 proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   if id in [SCANU_START_REQ, SCANU_JOIN_REQ]:
-    doAssert dst == TASK_SCANU and src == TASK_SM and size >= ScanuStartReqPayloadSize
+    doAssert dst == TASK_SCANU and src == TASK_SM and size == ScanuStartReqPayloadSize
   else:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]
     doAssert dst == TASK_SM and src == TASK_SCANU and size >= 1
@@ -109,7 +101,6 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
 proc ke_msg_try_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   ke_msg_alloc(id, dst, src, size)
 proc ke_msg_free(p: pointer) =
-  smScanForget(p)
   let index = live.find(p)
   doAssert index >= 0
   live.delete(index)
@@ -127,9 +118,12 @@ proc c_memset(dst: pointer; value: cint; size: csize_t): pointer =
   for i in 0 ..< size.int: bytes[i] = value.uint8
   dst
 proc sm_connect_ind(status, reason: uint16) = failures.add((status, reason))
+'''
+
+HELPERS = r'''
 proc setup(vifIndex = 1'u8) =
   doAssert live.len == 0
-  resetScanTracking()
+  smOwn = default(typeof(smOwn))
   conn = ConnectInfoView(vifIdx: vifIndex, ssidLen: 4, channelDuration: 0x12345678)
   conn.ssid[0..3] = [65'u8, 0, 66, 67]
   replacement = ConnectInfoView(vifIdx: vifIndex)
@@ -153,9 +147,10 @@ proc setup(vifIndex = 1'u8) =
   onState = nil
   onSend = nil
 proc replaceOwner() =
+  ## The attempt ended and another one is past its scan: SM changed state.
   sm.connectInfo = addr replacement
   sm.connectIndMsg = addr otherIndication
-  state = 6
+  discard smGo(6)
 proc submit(joining: bool; allChannels = false) =
   let chan = if allChannels: nil else: cast[pointer](addr channel)
   if joining: sm_join_bss(addr localMac[0], addr target[0], chan, true)
@@ -164,11 +159,10 @@ proc submit(joining: bool; allChannels = false) =
 
 
 def source() -> str:
-    # submit() calls the two production entry points defined below it.
     layout = (FW / "layout_types.nim").read_text()
     code = "type\n"
-    for name in ["TxSessionIdentity", "SmTxBuildContext", "ScanChannelEntry",
-                 "ScanSsidSlotView", "ScanuStartReqPayload", "ScanuChannelConfigOverlay"]:
+    for name in ["ScanChannelEntry", "ScanSsidSlotView", "ScanuStartReqPayload",
+                 "ScanuChannelConfigOverlay"]:
         declaration = "  " + name + layout.split("  " + name, 1)[1]
         lines = declaration.splitlines()
         code += lines[0] + "\n"
@@ -176,40 +170,27 @@ def source() -> str:
             if line and not line.startswith("    "):
                 break
             code += line + "\n"
-    code += "\nproc sm_join_bss*(bssid, ssid, joinInfo: pointer; flag: bool) {.exportc, cdecl.}\n"
-    code += "proc sm_scan_bss*(bssid, ssid, chanInfo: pointer) {.exportc, cdecl.}\n" + PLATFORM
-    owner = (FW / "station_tx_build.nim").read_text()
-    code += station_sm_source()
-    for name in ["smTxCapture", "smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSetOwnerState"]:
-        code += procedure(owner, name)
+    code += PLATFORM
+    code += station_sm_source("smGo", "smSend", "smAwaits", "smTakeAnswer")
     for name in ["connectInfoSsidLen", "connectInfoFillSsidSlot"]:
         code += procedure(layout, name)
-    code += "\n{.pragma: wifiCtrl.}\n" + (FW / "station_scan.nim").read_text()
-    code += "\nproc resetScanTracking() =\n  doAssert smScanTags == nil\n  smScanLost = default(SmScanLost)\n"
     handlers = (FW / "scan_station_ap_me.nim").read_text()
-    code += procedure(handlers, "scanChannelValid")
-    if re.search(r"^proc smSubmitScanRequest\(", handlers, re.M):
-        code += procedure(handlers, "smSubmitScanRequest")
-    code += procedure(handlers, "sm_scan_bss") + procedure(handlers, "sm_join_bss")
-    return code
+    for name in ["scanChannelValid", "smSubmitScanRequest", "sm_scan_bss", "sm_join_bss"]:
+        code += procedure(handlers, name)
+    return code + HELPERS
 
 
 CASES = {
-    "publication_precedes_send": r'''
+    "state_precedes_send": r'''
 for joining in [false, true]:
   setup()
+  let before = smOwn.op.serial
   onSend = proc() = state = 8
   submit(joining)
   doAssert sent.len == 1
   doAssert sent[0].state == (if joining: SmWaitingState else: SmScanningState)
+  doAssert smOwn.op.serial == before + 1 and smOwn.request != nil
   doAssert state == 8 and live.len == 0
-''',
-    "allocation_replaces_owner": r'''
-for joining in [false, true]:
-  setup()
-  onAlloc = replaceOwner
-  submit(joining)
-  doAssert sent.len == 0 and state == 6 and live.len == 0 and failures.len == 0
 ''',
     "input_snapshot_before_allocation": r'''
 for joining in [false, true]:
@@ -230,19 +211,13 @@ for joining in [false, true]:
   doAssert payload.channelList[0].prim20Freq == expectedChannel.prim20Freq
   doAssert payload.flags == 0x12345678 and payload.ssidFilter[1..4] == [65'u8, 0, 66, 67]
 ''',
-    "state_callback_replaces_owner": r'''
-for joining in [false, true]:
-  setup()
-  onState = replaceOwner
-  submit(joining)
-  doAssert sent.len == 0 and state == 6 and live.len == 0
-''',
     "allocation_failure": r'''
 for joining in [false, true]:
   setup()
   failAlloc = true
   submit(joining)
   doAssert sent.len == 0 and live.len == 0 and state == SmIdleState
+  doAssert smOwn.request == nil
   doAssert failures == @[(14'u16, 0xFFFF'u16)]
 ''',
     "request_fields": r'''
@@ -250,7 +225,7 @@ for vifIndex in 0'u8 .. 1'u8:
   for joining in [false, true]:
     setup(vifIndex)
     submit(joining)
-    doAssert sent.len == 1 and allocations == 2 and frees == 2
+    doAssert sent.len == 1 and allocations == 1 and frees == 1
     let request = sent[0]
     doAssert request.id == (if joining: SCANU_JOIN_REQ else: SCANU_START_REQ)
     doAssert request.payload.vifIdx == vifIndex and request.payload.scanType == 1
@@ -296,17 +271,30 @@ config.entries[0].flags = 2
 submit(false, true)
 doAssert sent.len == 0 and allocations == 0 and failures == @[(12'u16, 0xFFFF'u16)]
 ''',
-    "invalid_state_or_owner": r'''
-for mutation in 0 .. 4:
+    "no_live_attempt": r'''
+# Nothing to send for and nothing to end.
+for mutation in 0 .. 2:
   setup()
   case mutation
-  of 0: state = 6
-  of 1: sm.connectInfo = nil
-  of 2: sm.connectIndMsg = nil
-  of 3: conn.vifIdx = 2
-  else: vifs[1].vifType = 2
+  of 0: sm.connectInfo = nil
+  of 1: sm.connectIndMsg = nil
+  else: smOwn.teardown = tdCleanup
   submit(true)
   doAssert allocations == 0 and sent.len == 0 and failures.len == 0
+''',
+    "sta_vif_gone": r'''
+# SCAN-N3: the attempt's STA VIF was removed or re-typed. The attempt ends
+# instead of waiting in its state for a request that was never sent.
+for mutation in 0 .. 2:
+  for joining in [false, true]:
+    setup()
+    case mutation
+    of 0: conn.vifIdx = 2
+    of 1: vifs[1].vifType = 4
+    else: vifs[1].vifIdx = 127
+    submit(joining)
+    doAssert allocations == 0 and sent.len == 0
+    doAssert failures == @[(12'u16, 0xFFFF'u16)]
 ''',
     "nil_inputs": r'''
 for missing in 0 .. 2:
@@ -321,33 +309,6 @@ setup()
 enabled = false
 submit(true)
 doAssert not enabled and sent.len == 1
-''',
-    "nested_allocation_submission": r'''
-setup()
-onAlloc = proc() = sm_scan_bss(addr localMac[0], nil, addr channel)
-submit(true)
-doAssert sent.len == 1 and sent[0].id == SCANU_START_REQ
-doAssert allocations == 3 and frees == 3 and live.len == 0
-doAssert state == SmScanningState and sm.joinBssFlag == 7
-''',
-    "nested_state_submission": r'''
-setup()
-onState = proc() = sm_scan_bss(addr localMac[0], nil, addr channel)
-submit(true)
-doAssert sent.len == 1 and sent[0].id == SCANU_START_REQ
-doAssert state == SmScanningState and allocations == 4 and frees == 4
-''',
-    "owner_generation_changes": r'''
-for mutation in 0 .. 2:
-  setup()
-  onAlloc = proc() =
-    case mutation
-    of 0: inc rxVifEpochs[1]
-    of 1: inc smTxSerials[1]
-    else: sm.connectIndMsg = addr otherIndication
-  submit(true)
-  doAssert sent.len == 0 and live.len == 0 and failures.len == 0
-  doAssert state == SmIdleState
 ''',
     "all_channel_count_boundaries": r'''
 for count in 0 .. 14:

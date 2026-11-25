@@ -323,10 +323,6 @@ proc smActivationCancel() = discard
 proc smActivationCancelConnection(connection: pointer) = discard
 proc smActivationNeedsService(): bool = false
 proc smActivationService() = discard
-proc smScanNeedsService(): bool = false
-proc smRegistrationNeedsService(): bool = false
-proc smRegistrationService() = discard
-proc smScanService() = discard
 proc ps_set_mode(mode, requester: uint8) =
   ps.mode = requester
   psModes.add(mode)

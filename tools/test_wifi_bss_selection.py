@@ -71,6 +71,28 @@ proc configureSelectedBssAuth(entry: ptr ScanuResultEntry; ci: ptr ConnectInfoVi
 '''
 
 
+def owner_source() -> str:
+    """The SM connection identity sm_get_bss_params re-checks after each
+    callout (station_tx_build.nim)."""
+    layout = (FW / "layout_types.nim").read_text()
+    code = "type\n"
+    for name in ["TxSessionIdentity", "SmTxBuildContext"]:
+        lines = ("  " + name + layout.split("  " + name, 1)[1]).splitlines()
+        code += lines[0] + "\n"
+        for line in lines[1:]:
+            if line and not line.startswith("    "):
+                break
+            code += line + "\n"
+    code += r'''
+var smTxSerials, rxVifEpochs: array[2, uint32]
+var txResetEpoch: uint32
+proc staDeleteEpoch(index: uint8): uint32 = 0
+'''
+    owner = (FW / "station_tx_build.nim").read_text()
+    return code + "".join(procedure(owner, name) for name in
+                          ("smTxCapture", "smTxSessionCurrent", "smTxOwnerCurrent"))
+
+
 def selection_source() -> str:
     code = "{.define: bl808WifiConnectTrace.}\n" + layouts("ScanuCachedSsid") + completion_source()
     code = code.replace("    channelDuration: uint32", """    channelDuration: uint32
@@ -96,7 +118,7 @@ type ScanEnvironment = object""", 1)
   entries: array[SCANU_MAX_RESULT_ENTRIES, ScanuResultEntry]""", 1)
     scan = (FW / "scan_station_ap_me.nim").read_text()
     layout = (FW / "layout_types.nim").read_text()
-    helpers = SUPPORT
+    helpers = owner_source() + SUPPORT
     for name in ["connectInfoChannelFrequency", "connectInfoHasChannelHint"]:
         helpers += procedure(layout, name)
     helpers += snapshot_source()
@@ -289,32 +311,6 @@ prepare(0)
 sm.connectIndMsg = nil
 doAssert selectBss(addr bss, addr chan)
 doAssert bss == (addr conn.bssid[0]) and chan == (addr channel)
-''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_scan_handler_rechecks_owner(tmp_path: Path, mode: str) -> None:
-    code = "var onLookup, onVif: proc()\n" + completion_source()
-    code = code.replace("  inc lookups\n", "  inc lookups\n  invoke(onLookup)\n", 1)
-    code = code.replace("proc vif_mgmt_get_vif(index: uint8): pointer = addr vifs[index]",
-                        "proc vif_mgmt_get_vif(index: uint8): pointer =\n"
-                        "  invoke(onVif)\n  addr vifs[index]", 1)
-    run_program(tmp_path, mode, code + r'''
-for duringVif in [false, true]:
-  for haveBss in [false, true]:
-    begin()
-    let reply = complete(take())
-    found = haveBss
-    let replace = proc() =
-      replaceOwner()
-      state = SmScanningState
-    if duringVif: onVif = replace
-    else: onLookup = replace
-    doAssert scanu_start_cfm_handler(reply) == 0
-    doAssert failures.len == 0 and queued.len == 0
-    doAssert sm.connectInfo == (addr replacement) and state == SmScanningState
-    release(reply)
-    finish()
 ''')
 
 

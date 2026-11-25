@@ -18731,8 +18731,8 @@ def test_wifi_mm_sta_add_confirm_uses_vif_overlays():
         "c_memcpy(cast[pointer](addr sta.supportedRates[0]),\n                   addr vif.basicRates[0], 13.csize_t)",
         "c_memcpy(cast[pointer](addr sta.vhtCaps[0]),\n                     cast[pointer](vifHtCapabilities(vif)), 32.csize_t)",
         "me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))",
-        "if not smRegistrationClaim(param, owner, indication): return KeMsgConsumed",
-        "not smRegistrationHandoff(param)",
+        "if not smTakeAnswer(param):",
+        "let staIdx = smStaAddStation(param)",
     ]:
         assert expected in wifi_fw if expected.startswith("doAssert") else expected in body
 

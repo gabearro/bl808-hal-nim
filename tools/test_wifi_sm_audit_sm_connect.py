@@ -113,9 +113,7 @@ def test_response_expiry_that_cannot_be_posted_is_delivered_later(tmp_path: Path
     """SMSTRUCT-N2: the real ke_timer_schedule could not allocate the
     SM_RSP_TIMEOUT_IND, so the dispatch had claimed the expiry, asserted and
     dropped it, leaving SM in state 6 or 8 with no deadline. The expiry is now
-    re-queued on the same entry 1 ms later with its stamp, and delivered. An
-    association comeback chunk whose re-arm cannot be allocated ends the wait
-    (and the retry policy runs) instead of losing it."""
+    re-queued on the same entry 1 ms later with its stamp, and delivered."""
     from test_wifi_message_allocation import run_program
     from test_wifi_response_timeout import source
     run_program(tmp_path, "checked", source() + r'''
@@ -136,16 +134,6 @@ for waiting in [SmAuthenticatingState, SmAssocRspState]:
   doAssert connection.retry == 1 and authRetries + assocRetries == 1 and failures == 0
   doAssert state == waiting and ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
   finish()
-setup(SmAssocRspState)
-doAssert smArmResponse(smGo(SmAssocRspState), 1_000_000'u64 * 1024)
-let chunk = expire()
-failAlloc = true
-onAlloc = proc() = failAlloc = false
-deliver(chunk)
-doAssert assocRetries == 1 and connection.retry == 1 and allocationFailures == 0,
-  "[SMSTRUCT-N2] a comeback chunk that could not be re-armed was lost"
-doAssert ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
-finish()
 ''')
 
 
@@ -484,4 +472,39 @@ for idle in [false, true]:
   doAssert replies == 1 and assertions == 1,
     "[SMSTRUCT-N1] an owned request was consumed without its reply"
   finish()
+''')
+
+
+def test_registration_request_is_always_answered(tmp_path: Path) -> None:
+    """SMSTRUCT-N1 (registration): MM consumed SM's MM_STA_ADD_REQ without a
+    reply when its admission failed, and only a forget hook and a polled
+    service turned that into sm_connect_ind(15). MM now answers SM's live
+    request in place whatever mm_sta_add returns, and needs no memory to do
+    so, so state 3 always ends: with the BSS batch or with
+    sm_connect_ind(15). A station registered for an attempt that SM has
+    left since (sm_init on MM_RESET_REQ) is deleted, not leaked."""
+    from test_wifi_message_allocation import run_program
+    from test_wifi_registration_exchange import source
+    run_program(tmp_path, "checked", source() + r'''
+for status in [0'u8, 1'u8, 7'u8]:
+  resetExchange()
+  registerStatus = status
+  let request = issue()
+  failAlloc = true
+  let reply = completeRegistration(request)
+  failAlloc = false
+  doAssert reply == request, "[SMSTRUCT-N1] MM consumed SM's registration without an answer"
+  doAssert mm_sta_add_cfm_handler(reply) == 0
+  release(reply)
+  if status == 0: doAssert bssCalls == 1 and state == 4 and failures.len == 0
+  else: doAssert failures == @[(15'u16, 0xFFFF'u16)] and bssCalls == 0
+  finishExchange()
+resetExchange()
+let reply = completeRegistration(issue())
+discard smGo(SmIdleState)
+doAssert mm_sta_add_cfm_handler(reply) == 0
+release(reply)
+doAssert deletions == 1 and stations[0].valid == 0,
+  "a station registered for an attempt SM has left was leaked"
+finishExchange()
 ''')

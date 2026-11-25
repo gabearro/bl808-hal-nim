@@ -60,8 +60,7 @@ var
   scanuProducerRequest: pointer
   scanuProducerEpoch: uint32
   interruptsEnabled = true
-proc smScanAdmitRequest(p: pointer): bool = true
-proc smScanOwnsRequest(p: pointer): bool = false
+proc smScanRefused(p: pointer): bool = false
 proc irqSave(): uint32 =
   result = if interruptsEnabled: 8'u32 else: 0'u32
   interruptsEnabled = false

@@ -178,21 +178,19 @@ var
   registrationReady, scanReady, messageReady, holdReset, registrationPostsReset: bool
 proc keEnvEventField(): ptr uint32 = addr events
 proc macTimeNow(): uint32 = regRead(MACHW_TIMLO_REG)
-proc smRegistrationNeedsService(): bool = registrationReady
-proc smScanNeedsService(): bool = scanReady
-proc smActivationNeedsService(): bool = false
-proc smBssNeedsService(): bool = false
+# The first two polled services in wifiDrainScheduledWork's order stand in
+# for any: "registration" runs first and can post a reset, "scan" second.
+proc smActivationNeedsService(): bool = registrationReady
+proc smBssNeedsService(): bool = scanReady
 proc smCleanupNeedsService(): bool = false
-proc smRegistrationService() =
+proc smActivationService() =
   registrationReady = false
   inc registrations
   if registrationPostsReset:
     ke_evt_set(KE_EVT_RESET)
-proc smScanService() =
+proc smBssService() =
   scanReady = false
   inc scans
-proc smActivationService() = discard
-proc smBssService() = discard
 proc smCleanupService() = discard
 proc wifiMessagePendingWork(): bool = messageReady
 proc ke_task_schedule() =

@@ -195,7 +195,8 @@ when defined(bl808WifiScanOwnershipBench):
     require("station scan retired once without a dwell",
       firmware.nimFwDbgScanOwnershipCancelled == cancelledBefore + 1 and
       overlap.admitted - control.admitted == 1 and
-      bl808_wifi_backend_last_status() == WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.cint)
+      bl808_wifi_backend_last_status() ==
+        status_codes.WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.cint)
 
 proc dumpReg(label: string, address: uint) =
   discard console.sendString(label)

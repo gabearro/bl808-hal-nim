@@ -53,18 +53,17 @@ proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   addr cast[ptr Envelope](p).header
 proc statusCfmView(p: pointer): ptr StatusCfmPayload =
   addr cast[ptr Envelope](p).payload
-proc smScanOwnsRequest(p: pointer): bool = false
 proc ke_msg_try_alloc(id: uint16; dest, src: uint8; size: uint32): pointer =
-  if allocHook != nil and dest == TASK_SM:
+  # SM's request is answered in place; only the join's TASK_API notice
+  # is allocated.
+  doAssert dest == TASK_API
+  if allocHook != nil:
     let hook = allocHook
     allocHook = nil
     hook()
-  if dest == TASK_SM and (scheduleMode and 2) != 0: return nil
-  let env = if dest == TASK_API: addr notice else: addr reply
-  env[] = Envelope(header: KeMsgHdr(id: id, destId: dest, srcId: src, paramLen: size))
-  env
-proc smScanCompletionAlloc(p: pointer; id: uint16; dest: uint8): pointer =
-  ke_msg_try_alloc(id, dest, TASK_SCANU, StatusCfmPayloadSize)
+  if (scheduleMode and 2) != 0: return nil
+  notice = Envelope(header: KeMsgHdr(id: id, destId: dest, srcId: src, paramLen: size))
+  addr notice
 proc ke_msg_send(p: pointer) =
   let header = keMsgHdrFromPayload(p)
   if header.destId == TASK_API:
@@ -84,7 +83,9 @@ proc exercise(trace: string; mode: int): string =
   actualStatuses.setLen(0)
   optNotices = 0
   allocHook = nil
-  request = Envelope(header: KeMsgHdr(paramLen: 316))
+  # SM's request; its answer has the request's type.
+  request = Envelope(header: KeMsgHdr(paramLen: 316,
+    id: (if (mode and 1) != 0: SCANU_JOIN_REQ else: SCANU_JOIN_REQ - 2)))
   scanu_env = (cast[pointer](addr request), nil, TASK_SM, (mode and 1).uint8)
   states[TASK_SCANU] = 1
   let confirmation = if (mode and 1) != 0: SCANU_JOIN_CFM else: SCANU_START_CFM
@@ -98,10 +99,11 @@ proc exercise(trace: string; mode: int): string =
       inc modelNext
   proc prepareCompletion() =
     let phase = mode shr 2
-    if phase == 1:
+    if phase == 1 and (mode and 1) != 0:
       expectScanBatch(1)
       allocHook = proc() = save(TASK_SCANU, 1)
-    if phase == 2 and (mode and 1) != 0: expectScanBatch(1)
+    # The TASK_API notice's send saves a scan; bit 1 fails its allocation.
+    if phase == 2 and (mode and 1) != 0 and (mode and 2) == 0: expectScanBatch(1)
     if phase == 3:
       onEvent = proc() =
         onEvent = nil
@@ -143,7 +145,8 @@ proc exercise(trace: string; mode: int): string =
   for id in delivered:
     if id == confirmation or id in scanIds: actual.add(id)
   if actual != @[confirmation] & scanIds: return "fifo-before-confirm"
-  if actualStatuses != @[7'u8] or optNotices != (mode and 1):
+  # Mode bit 0 joins (TASK_API is notified too); bit 1 fails that allocation.
+  if actualStatuses != @[7'u8] or optNotices != int((mode and 1) != 0 and (mode and 2) == 0):
     return "terminal-outcome-count"
 
 proc check(trace: string; mode: int) =
@@ -174,7 +177,8 @@ def test_scanu_saved_queue_model(tmp_path: Path, mutation: bool) -> None:
                                          "    destId, srcId: uint8\n    paramLen: uint32\n", 1)
     fixture = fixture.replace("array[80, KeMsgHdr]", "array[512, KeMsgHdr]")
     source = (fixture + PLATFORM + procedure(kernel, "ke_msg_forward_and_change_id")
-              + procedure(scan, "scanuReleaseCompletedOwner")
+              + procedure(scan, "scanuReleaseCompletedOwner") + procedure(scan, "scanuAnswer")
+              + procedure(scan, "scanuReply")
               + procedure(scan, "scanuPublishCompletion") + completion + DRIVER)
     cases = schedules(seed, steps)
     source += f'echo "queue seed={seed} cases={len(cases)}"\n'

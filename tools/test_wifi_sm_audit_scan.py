@@ -17,6 +17,12 @@ SCAN-F2  The same recovery invalidates the channel timers that carry the
 SCAN-F3  MM_SCAN_CHANNEL_END_EARLY (quick-connect, flags bit 8) carries no
          owner. When it reaches an idle TASK_SCAN, it hits assert_err(186),
          which raises KE_EVT_RESET (a full MAC recovery, see F1/F2).
+SCAN-N3  The SM scan/join exchange was judged by an identity that included
+         the STA VIF's epoch and type. Removing the STA VIF in state 1 or 2
+         made SCANU's completion free SM's reply unrecorded, so SM stayed in
+         state 1 or 2 for good. SCANU now answers SM's request in place and
+         SM takes the answer while its operation is live; with its STA VIF
+         gone, the attempt ends.
 """
 
 import re
@@ -36,16 +42,15 @@ MODES = ["checked", "asan"]
 
 TASKS = (FW / "task_handlers.nim").read_text()
 
-# chanForceIdle is the only TX drain that carries owned scan exchanges across
-# txResetEpoch. These stubs match test_wifi_sm_scan_completion's drain case.
+# The TX drain of a channel switch (chanForceIdle). SM's scan exchange is
+# not a frame, so it carries no TX reset epoch.
 CHANNEL_DRAIN = r'''
-var chanTbttTimerOwner, chanConnlessTimerOwner: tuple[valid: bool, resetEpoch: uint32]
+var txResetEpoch: uint32
 var failIdle: bool
 proc mm_force_idle_req(): bool =
   doAssert not enabled
   inc txResetEpoch
   not failIdle
-proc smRegistrationPreserveAcrossChannelReset(previous: uint32) = discard
 '''
 
 DELIVERY = r'''
@@ -54,7 +59,7 @@ proc deliver(reply: pointer; id = SCANU_START_CFM) =
   if reply == nil: return
   if id == SCANU_START_CFM:
     doAssert scanu_start_cfm_handler(reply) == KeMsgConsumed
-  elif smScanAcceptReply(reply, id):
+  elif smScanAccept(reply, id):
     failures.add((0'u16, 0'u16)) # join accepted: SM proceeds to registration
   release(reply)
 '''
@@ -86,7 +91,6 @@ sm.cancelRequested = 1
 deliver(reply)
 doAssert sm.cancelRequested == 0 and failures == @[(26'u16, 0xFFFF'u16)]
 doAssert queued.len == 0 and state == SmScanningState, "cancelled connection submitted a join"
-doAssert not smScanNeedsService()
 finish()
 ''')
 
@@ -116,11 +120,10 @@ for joining in [false, true]:
   doAssert queued.len == 1 and state == (if joining: SmWaitingState else: SmScanningState)
   let newRequest = take()
   found = true
-  if joining: doAssert not smScanAcceptReply(oldReply, id)
+  if joining: doAssert not smScanAccept(oldReply, id)
   else: doAssert scanu_start_cfm_handler(oldReply) == KeMsgConsumed
   doAssert lookups == 0 and failures.len == 0 and queued.len == 0, "old CFM acted on session B"
   release(oldReply)
-  doAssert not smScanNeedsService()
   found = false
   deliver(complete(newRequest), id)
   doAssert failures.len == 1
@@ -146,7 +149,6 @@ for replyQueued in [false, true]:
   let request = take()
   var reply: pointer
   if replyQueued: reply = complete(request)
-  chanConnlessTimerOwner = (true, txResetEpoch)
   let before = txResetEpoch
   doAssert chanForceIdle() and txResetEpoch == before + 1
   sm.cancelRequested = 1
@@ -154,7 +156,6 @@ for replyQueued in [false, true]:
   doAssert reply != nil
   deliver(reply)
   doAssert failures == @[(26'u16, 0xFFFF'u16)] and sm.cancelRequested == 0
-  doAssert not smScanNeedsService()
   finish()
 ''')
 
@@ -167,14 +168,14 @@ let request = take()
 inc txResetEpoch # bl_reset_evt -> txl_reset, not the chanForceIdle drain
 deliver(complete(request))
 ''',
-    # The SCANU_START_REQ is still queued. SCANU's first admission check
-    # (smScanAdmitRequest) decides between running it and consuming it.
+    # The SCANU_START_REQ is still queued; SCANU's entry check
+    # (smScanRefused) lets SM's live request through.
     "queued_request_after_recovery": r'''
 begin()
 let request = take()
 inc txResetEpoch
-if smScanAdmitRequest(request): deliver(complete(request))
-else: release(request) # scanu_start_req_handler returns KeMsgConsumed
+doAssert not smScanRefused(request)
+deliver(complete(request))
 ''',
     "join_completion_after_recovery": r'''
 begin(true)
@@ -196,7 +197,6 @@ deliver(complete(request))
 @pytest.mark.parametrize("case", FULL_RECOVERY)
 def test_full_recovery_during_owned_scan_reaches_sm(tmp_path: Path, case: str) -> None:
     run_program(tmp_path, "checked", scan_exchange() + FULL_RECOVERY[case] + r'''
-if smScanNeedsService(): smScanService()
 doAssert failures.len == 1, "SM never received a terminal scan result after MAC recovery"
 finish()
 ''')
@@ -493,4 +493,32 @@ doAssert MM_SCAN_CHANNEL_END_IND notin notices
 doAssert dwellStarted(), "the scan dwell never started"
 doAssert idleSwitch() and mmState == MM_ACTIVE_STATE
 finishSwitch()
+''')
+
+
+# --------------------------------------------------------------------------
+# The STA VIF removed during the scan or join (SCAN-N3)
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("joining", [False, True], ids=["scanning", "joining"])
+@pytest.mark.parametrize("mode", MODES)
+def test_sta_vif_removed_while_scanning_ends_attempt(tmp_path: Path, joining: bool, mode: str) -> None:
+    """SCAN-N3: MM_REMOVE_IF_REQ for the STA VIF in state 1 or 2 resets its
+    slot (vif_mgmt_unregister) while SCANU works on SM's request. SCANU
+    still answers, SM takes the answer, and the attempt ends instead of
+    staying in state 1 or 2."""
+    from test_wifi_join_registration import submission_source
+    run_program(tmp_path, mode, submission_source() + f"let joining = {str(joining).lower()}\n" + r'''
+begin(joining)
+let request = take()
+vifs[conn.vifIdx] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+found = true
+let reply = complete(request)
+if joining: doAssert scanu_join_cfm_handler(reply) == 0
+else: doAssert scanu_start_cfm_handler(reply) == 0
+release(reply)
+doAssert failures == @[(12'u16, 0xFFFF'u16)],
+  "[SCAN-N3] SM stayed in state " & $state & " after its STA VIF was removed"
+doAssert queued.len == 0 and smOwn.request == nil
+finish()
 ''')

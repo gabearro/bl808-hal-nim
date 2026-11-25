@@ -58,7 +58,6 @@ var
   registerStatus, keyIndex: uint8
   wpaSetupResult: cint
   addressFails, addressCleanupFails: bool
-  registrationAdmitted: bool
   hook: proc(point: string)
   nimFwDbgPreauthStaAddEntry, nimFwDbgPreauthStaAddMeta: uint32
   nimFwDbgPreauthStaAddResult, nimFwDbgPreauthStaAddExit: uint32
@@ -74,7 +73,6 @@ proc vifChannelForIdx(index: uint8): ptr VifChannelView =
   addr vifs[index]
 proc vifSecurity(vif: ptr VifChannelView): ptr VifSecurityOverlay = addr vif.security
 proc smEnvView(): ptr Sm = addr sm
-proc smRegistrationAdmitRequest(p: pointer): bool = registrationAdmitted
 proc connectInfoCredentials(p: pointer): ptr ConnectInfoCredentialOverlay = cast[ptr ConnectInfoCredentialOverlay](p)
 proc keMsgHdrFromPayload(p: pointer): ptr Header =
   doAssert p == (addr connection) or p == (addr replacementConnection)
@@ -162,7 +160,6 @@ proc wpaCallbacks(): ptr WpaCallbacks = addr wpa
 proc wpsCallbacks(): ptr WpsCallbacks = addr wpsTable
 proc setup(mode: string; incomingIrq = true) =
   hook = nil
-  registrationAdmitted = true
   irq = incomingIrq
   vifs = default(typeof(vifs))
   stations = default(typeof(stations))
@@ -224,16 +221,6 @@ proc invoke(): uint8 =
 """
 
 CHECKS = r"""
-for mode in ["open", "wps", "wpa", "wep"]:
-  for point in ["register", "address"]:
-    setup(mode)
-    hook = proc(stage: string) =
-      if stage == point: registrationAdmitted = false
-    doAssert invoke() != 0
-    doAssert registrations == 1 and abortCleanups == 1 and rollbacks == 0
-    doAssert addressDeletes == 1 and unregisters == 1
-    doAssert stations[0].valid == 0
-
 for mode in ["ap", "open", "wps", "wpa", "wep"]:
   for incomingIrq in [false, true]:
     setup(mode, incomingIrq)

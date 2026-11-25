@@ -644,29 +644,30 @@ proc mm_sta_add_req_handler*(param: pointer): cint {.exportc, cdecl, discardable
   ## From blob: allocates 3-byte CFM message (id=11=MM_STA_ADD_CFM),
   ## calls mm_sta_add(param, &msg[1], &msg[2]), stores status at msg[0],
   ## sends via ke_msg_send, returns 0.
-  if param == nil or keMsgHdrFromPayload(param).paramLen < MmStaAddReqPayloadSize or
-      not smRegistrationAdmitRequest(param): return KeMsgConsumed
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let requester = keMsgHdrFromPayload(param).srcId
-  var cfm = cast[ptr MmStaAddCfmPayload](smRegistrationTakeReply(param))
-  defer:
-    if cfm != nil: ke_msg_free(keMsgHdrFromPayload(cfm))
-  if cfm != nil:
-    var staIdx = 0xFF'u8
-    var hwStaIdx = 0xFF'u8
-    cfm.status = mm_sta_add(param, addr staIdx, addr hwStaIdx)
-    cfm.staIdx = staIdx
-    cfm.hwStaIdx = hwStaIdx
-    if not smRegistrationComplete(param, cfm): return KeMsgConsumed
-    inc nimFwDbgPreauthStaCfm
-    nimFwDbgPreauthStaCfmMeta =
-      cfm.status.uint32 or (cfm.staIdx.uint32 shl 8) or
-      (cfm.hwStaIdx.uint32 shl 16) or (requester.uint32 shl 24)
-    let outgoing = cfm
-    cfm = nil
-    ke_msg_send(outgoing)
-  return 0
+  ## SM's request is answered in place instead (smStaAddAnswer), so its
+  ## confirmation cannot be lost; one SM no longer waits on is not applied.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmStaAddReqPayloadSize:
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(param)
+  let requester = header.srcId
+  if requester == TASK_SM and not smAwaits(param): return KeMsgConsumed
+  var cfm: ptr MmStaAddCfmPayload
+  if requester != TASK_SM:
+    cfm = cast[ptr MmStaAddCfmPayload](
+      ke_msg_alloc(MM_STA_ADD_CFM, requester, header.destId, MmStaAddCfmPayloadSize))
+    if cfm == nil: return KeMsgConsumed
+  var staIdx = 0xFF'u8
+  var hwStaIdx = 0xFF'u8
+  let status = mm_sta_add(param, addr staIdx, addr hwStaIdx)
+  inc nimFwDbgPreauthStaCfm
+  nimFwDbgPreauthStaCfmMeta = status.uint32 or (staIdx.uint32 shl 8) or
+    (hwStaIdx.uint32 shl 16) or (requester.uint32 shl 24)
+  if cfm == nil:
+    smStaAddAnswer(param, status, staIdx, hwStaIdx)
+    return KeMsgNoFree
+  cfm[] = MmStaAddCfmPayload(status: status, staIdx: staIdx, hwStaIdx: hwStaIdx)
+  ke_msg_send(cfm)
+  return KeMsgConsumed
 
 proc mm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_STA_ADD_CFM (288 bytes in blob, 72 instrs).
@@ -677,14 +678,17 @@ proc mm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
   ## on vif.flags(484). If VHT: copies 32 bytes of HT cap from vif(348) to
   ## sta(264), calls me_set_sta_ht_vht_param. Invokes WPA callback, then
   ## calls sm_set_bss_param.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  var owner: SmTxBuildContext
-  var indication: pointer
-  if not smRegistrationClaim(param, owner, indication): return KeMsgConsumed
-  let cfm = cast[ptr MmStaAddCfmPayload](param)
+  ## Only the answer to SM's live registration is taken, so SM is in state 3
+  ## here; a station MM registered for an earlier one is deleted.
+  if not smTakeAnswer(param):
+    smStaAddRetire(param)
+    return KeMsgConsumed
+  # A failure, or a station deleted since MM registered it, ends the attempt.
+  let staIdx = smStaAddStation(param)
+  if staIdx == 0xFF:
+    sm_connect_ind(15, 0xFFFF)
+    return KeMsgConsumed
   # Success path: set up station entry
-  let staIdx = cfm.staIdx
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
   let vif = vifChannelForIdx(vifIdx)
@@ -701,8 +705,6 @@ proc mm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
     discard c_memcpy(cast[pointer](addr sta.vhtCaps[0]),
                      cast[pointer](vifHtCapabilities(vif)), 32.csize_t)
     me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))
-  if not smScanOwnerCurrent(owner, indication) or not smRegistrationHandoff(param):
-    return KeMsgConsumed
   sm_set_bss_param()
   return 0
 
@@ -1594,7 +1596,6 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## scanu_scan_next either start the next phase or issue SCANU_START_CFM.
   var completedRequest: pointer
   var completedEpoch: uint32
-  var smOwned: bool
   var reqSrcId: uint8
   var retired: array[SCANU_MAX_RESULT_ENTRIES, pointer]
   # Request and cache ownership move together before the task becomes idle.
@@ -1606,7 +1607,6 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
     if replayDone != nil:
       if param != replayDone: return KeMsgConsumed
       completedRequest = scanu_env.paramPtr
-      smOwned = smScanOwnsRequest(completedRequest)
       reqSrcId = scanu_env.requester
       retired = scanuDetachCachedScanResults()
       inc scanuRequestEpoch
@@ -1620,8 +1620,8 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   defer: scanuReleaseCompletedOwner(completedEpoch)
   for frame in retired:
     ke_msg_free_payload(frame)
-  let msg = smScanCompletionAlloc(completedRequest, SCANU_JOIN_CFM, reqSrcId)
-  scanuPublishCompletion(completedRequest, msg, SCANU_JOIN_CFM, reqSrcId, 0, smOwned)
+  scanuPublishCompletion(completedRequest, scanuReply(SCANU_JOIN_CFM, reqSrcId),
+                         SCANU_JOIN_CFM, reqSrcId, 0)
   return KeMsgConsumed
 
 proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -1643,9 +1643,8 @@ proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 const SmScanAbortPayloadSize = sizeof(uint32).uint32
 
 proc smAbortOwnsLowerScan(): bool =
-  let upper = scanu_env.paramPtr
-  scanuLowerCurrent(scan_env.paramPtr) and smScanOwnsRequest(upper) and
-    smScanAdmitRequest(upper)
+  ## The lower scan running is the one SM's live scan request started.
+  scanuLowerCurrent(scan_env.paramPtr) and smAwaits(scanu_env.paramPtr)
 
 proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_ABORT_REQ — blob scan_task.o (74 bytes):
@@ -1710,11 +1709,8 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let reqHdr = keMsgHdrFromPayload(param)
   if reqHdr.paramLen < ScanuStartReqPayloadSize:
     return KeMsgConsumed
-  if not smScanAdmitRequest(param): return KeMsgConsumed
+  if smScanRefused(param): return KeMsgNoFree
   let saved = irqSave()
-  if smScanCompleteCancelledStart(param):
-    irqRestore(saved)
-    return KeMsgConsumed
   # Upper scanu owns a SINGLE scanu_env.paramPtr slot. If a new SCANU_START_REQ
   # arrives while a scan/join is still in flight (state != idle), overwriting
   # paramPtr abandons the in-flight ke_msg and makes scanu_confirm's real free
@@ -1726,15 +1722,11 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   # no leak. Use the rejected request as a busy confirmation so the host
   # completes its wait without allocating or touching the active scan.
   if ke_state_get(TASK_SCANU) != ScanuIdleState:
-    let owned = smScanOwnsRequest(param)
     irqRestore(saved)
-    if owned:
+    if reqHdr.srcId == TASK_SM:
       when defined(bl808WifiScanOwnershipBench): inc nimFwDbgScanOwnershipSaved
       return KeMsgSaved
-    let requester = reqHdr.srcId
-    statusCfmView(param).status = SCAN_STATUS_BUSY
-    reqHdr.paramLen = StatusCfmPayloadSize
-    ke_msg_forward_and_change_id(param, SCANU_START_CFM, requester, TASK_SCANU)
+    scanuAnswer(param, SCANU_START_CFM, reqHdr.srcId, SCAN_STATUS_BUSY)
     return KeMsgNoFree
   defer: irqRestore(saved)
   let req = scanuStartReqView(param)
@@ -1746,9 +1738,6 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_start_cfm_handler(void*);".}
 proc scanu_start_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smScanAcceptReply(param, SCANU_START_CFM): return KeMsgConsumed
   ## Handle SCANU_START_CFM: upper scan complete (164 bytes in blob, 42 instrs).
   ## From blob (scanu_task.o):
   ##   1. Load sm_env[0] (connect info ptr) into s1
@@ -1760,26 +1749,15 @@ proc scanu_start_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardabl
   ##   6. If not canceled: check selectedBssResult and selectedBssChannel
   ##      - If both valid: call sm_join_bss(vif+80, selectedBssResult, selectedBssChannel, 0)
   ##      - If either null: sm_connect_ind(12, 0xFFFF) (no BSS found)
+  ## Only the answer to SM's live scan request is taken (smScanAccept), so
+  ## SM is in state 1 here; a failed scan has already ended the attempt.
+  if not smScanAccept(param, SCANU_START_CFM): return KeMsgConsumed
   let stationManager = smEnvView()
-  let connectInfoPtr = stationManager.connectInfo
-  let owner = smTxCapture(connectInfoPtr)
-  let indication = stationManager.connectIndMsg
-  template current(): bool = smScanOwnerCurrent(owner, indication)
   when defined(bl808WifiDiagColdScan):
     nimFwDbgColdScanFlow[5] = 1
-  if not current(): return KeMsgConsumed
-  let connectInfo = connectInfoView(connectInfoPtr)
-
-  # Assert SM state is 1 (scanning)
-  let smState = ke_state_get(TASK_SM)
-  if smState != SmScanningState:
-    # Blob uses assert_err here.
-    assert_err(cast[cstring](0), cast[cstring](0), 402)
 
   # Get VIF entry (blob: vif_mgmt_get_vif at 0x46, not scanu_confirm)
-  let vifIdx = connectInfo.vifIdx
-  let vifEntry = vif_mgmt_get_vif(vifIdx)
-  if not current(): return KeMsgConsumed
+  let vifEntry = vif_mgmt_get_vif(connectInfoView(stationManager.connectInfo).vifIdx)
   # Prevent the compiler from eliding the call when the result is unused.
   {.emit: ["""__asm__ volatile("" : : "r"(""", vifEntry, """));"""].}
 
@@ -1789,15 +1767,14 @@ proc scanu_start_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardabl
   sm_get_bss_params(addr selectedBssResult, addr selectedBssChannel)
   when defined(bl808WifiDiagColdScan):
     nimFwDbgColdScanFlow[5] = 2 or ((selectedBssResult != nil).uint32 shl 8) or
-      ((selectedBssChannel != nil).uint32 shl 9) or (current().uint32 shl 10)
-  if not current(): return KeMsgConsumed
+      ((selectedBssChannel != nil).uint32 shl 9)
 
   # Check cancel flag
   if stationManager.cancelRequested != 0:
     # Scan was canceled - clear flag and send abort indication
     stationManager.cancelRequested = 0
     sm_connect_ind(WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.uint16, 0xFFFF'u16)
-  elif selectedBssResult != nil and selectedBssChannel != nil:
+  elif selectedBssResult != nil and selectedBssChannel != nil and vifEntry != nil:
     # Found BSS - join it
     let vif = vifChannelAt(vifEntry)
     let vifMacAddr = cast[pointer](addr vif.macAddr[0])
@@ -1825,21 +1802,24 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if param == nil: return KeMsgConsumed
   if keMsgHdrFromPayload(param).paramLen < ScanuStartReqPayloadSize:
     return KeMsgConsumed
-  if not smScanAdmitRequest(param): return KeMsgConsumed
+  if smScanRefused(param): return KeMsgNoFree
   let saved = irqSave()
   defer: irqRestore(saved)
   # Same single-paramPtr-slot hazard as scanu_start_req_handler: reject an
   # overlapping join rather than clobbering scanu_env.paramPtr (which would make
   # scanu_confirm free a still-live ke_msg -> shared-heap UAF -> nimIncRef).
   if ke_state_get(TASK_SCANU) != ScanuIdleState:
-    if smScanOwnsRequest(param): return KeMsgSaved
+    if keMsgHdrFromPayload(param).srcId == TASK_SM: return KeMsgSaved
     return KeMsgConsumed
   let req = scanuStartReqView(param)
   let vifIdx = req.vifIdx
-  if vifIdx >= MAX_VIFS.uint8:
-    return KeMsgConsumed
-  let vif = vifChannelForIdx(vifIdx)
   let reqHdr = keMsgHdrFromPayload(param)
+  if vifIdx >= MAX_VIFS.uint8:
+    # SM's request is always answered, even one its sender should not send.
+    if reqHdr.srcId != TASK_SM: return KeMsgConsumed
+    scanuAnswer(param, reqHdr.id + 1, TASK_SM, SCAN_STATUS_FAIL)
+    return KeMsgNoFree
+  let vif = vifChannelForIdx(vifIdx)
 
   # Store param pointer in scanu_env
   let previousProducer = scanuProducerRequest
@@ -1922,9 +1902,6 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_join_cfm_handler(void*);".}
 proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smScanAcceptReply(param, SCANU_JOIN_CFM): return KeMsgConsumed
   ## Handle SCANU_JOIN_CFM (434 bytes in blob, 106 instrs).
   ## From blob (scanu_task.o): Assert state==2 (SM_JOINING). If sm_env.canceled(18):
   ## clear flag, sm_connect_ind(25, 0xFFFF). Else: get vif_idx from sm_env_ptr[59].
@@ -1933,11 +1910,10 @@ proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
   ## ke_msg_send, ke_state_set(SM,3). Copy connection flags to vif[1496].
   ## If bit31 not set: check sm_env[16] flag for sm_join_bss path, else
   ## sm_connect_ind with various error codes (13,14,17,18).
+  ## Only the answer to SM's live join request is taken (smScanAccept), so
+  ## SM is in state 2 here; a failed join has already ended the attempt.
+  if not smScanAccept(param, SCANU_JOIN_CFM): return KeMsgConsumed
   let sm = smEnvView()
-  var owner = smTxCapture(sm.connectInfo)
-  let indication = sm.connectIndMsg
-  template current(): bool = smScanOwnerCurrent(owner, indication)
-  if not current() or owner.state != SmWaitingState: return KeMsgConsumed
   # Check cancelled flag
   if sm.cancelRequested != 0:
     sm.cancelRequested = 0
@@ -1951,11 +1927,12 @@ proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
   let apConfig = vifApConfig(vif)
   let securityFlagsSigned = cast[int32](apConfig.securityFlags)
   if securityFlagsSigned < 0:  # bit31 set (has channel context to add)
-    # Snapshot the registration fields before allocation or channel callbacks.
+    # The registration of the AP station with MM (state 3). The request and
+    # the channel context are set up before any of it is published.
     var prepared = MmStaAddReqPayload(vifIdx: vifIdx, bssid: vif.bssid,
                                       quickConn: sm.connectFlags)
     var preparedChannel: ChanCtxtDefView
-    if not smPrepareChannelContext(owner.connection, preparedChannel):
+    if not smPrepareChannelContext(connectInfoPtr, preparedChannel):
       sm_connect_ind(13, 0xFFFF'u16)
       return KeMsgConsumed
     let apSecurityFlags = apConfig.securityFlags
@@ -1963,33 +1940,27 @@ proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
       let htCap = vifHtCapabilities(vif).ampduParams
       mmStaFillAggregation(prepared, htCap)
     let connectFlags = connectInfo.channelDuration
-    var msg = cast[ptr MmStaAddReqPayload](
-      smRegistrationAllocate(owner, indication))
-    var channel: ChanCtxtLease
-    defer:
-      if msg != nil: ke_msg_free(keMsgHdrFromPayload(msg))
-      chanLeaseRelease(channel)
-    if not current(): return KeMsgConsumed
+    let msg = cast[ptr MmStaAddReqPayload](
+      ke_msg_try_alloc(MM_STA_ADD_REQ, TASK_MM, TASK_SM, MmStaAddReqPayloadSize))
     if msg == nil:
       sm_connect_ind(WLAN_FW_JOIN_NETWORK_FAILURE.uint16, 0xFFFF)
       return KeMsgConsumed
+    var channel: ChanCtxtLease
     var chanIdx = 0xFF'u8
-    let addStatus = smAddPreparedChannelContext(preparedChannel, addr chanIdx, addr channel)
-    if not current(): return KeMsgConsumed
-    if addStatus != 0:
+    if smAddPreparedChannelContext(preparedChannel, addr chanIdx, addr channel) != 0 or
+        not chanLeaseLink(channel, vifIdx):
+      chanLeaseRelease(channel)
+      ke_msg_free(keMsgHdrFromPayload(msg))
       sm_connect_ind(13, 0xFFFF'u16)
       return KeMsgConsumed
+    # The VIF holds the linked context from here on; the teardown of a failed
+    # attempt unlinks it, as in the blob.
     msg[] = prepared
-    if not chanLeaseLink(channel, vifIdx):
-      if current(): sm_connect_ind(13, 0xFFFF'u16)
-      return KeMsgConsumed
-    if not current(): return KeMsgConsumed
-    if not smRegistrationOwnChannel(msg, channel): return KeMsgConsumed
 
     inc nimFwDbgPreauthStaReq
     nimFwDbgPreauthStaReqMeta =
       vifIdx.uint32 or (vif.staIdx.uint32 shl 8) or
-      (chanIdx.uint32 shl 16) or (owner.state.uint32 shl 24)
+      (chanIdx.uint32 shl 16) or (SmWaitingState.uint32 shl 24)
     nimFwDbgPreauthStaReqBssid0 = cast[ptr uint32](addr msg.bssid[0])[]
     nimFwDbgPreauthStaReqBssid1 = cast[ptr uint16](addr msg.bssid[4])[].uint32
     vifKeyPointers(vif).flags = connectFlags
@@ -1997,12 +1968,8 @@ proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
       var clearedSecurityFlags = apConfig.securityFlags
       clearedSecurityFlags = clearedSecurityFlags and (not 7'u32)  # Clear bits 0-2
       apConfig.securityFlags = clearedSecurityFlags
-    if not smTxSetOwnerState(owner, SmAddingChanState) or not current():
-      return KeMsgConsumed
-    if not smRegistrationPublish(msg): return KeMsgConsumed
-    let outgoing = msg
-    msg = nil
-    ke_msg_send(outgoing)
+    smGo(SmAddingChanState)
+    smSend(msg)
   else:
     # No channel context to add
     if sm.joinBssFlag != 0:

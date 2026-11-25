@@ -35,8 +35,10 @@ proc smTxBegin(connection: pointer): SmTxBuildContext =
 
 proc smTxSessionCurrent(build: SmTxBuildContext): bool =
   ## The connection attempt that captured `build` is still the live one.
-  ## A TX reset retires frames, not the attempt: timers, expected responses
-  ## and control exchanges are checked with this, frames with smTxOwnerCurrent.
+  ## A TX reset retires frames, not the attempt: the BSS parameter batch
+  ## (station_bss.nim) and the activation exchange (station_activation.nim)
+  ## are checked with this, frames with smTxOwnerCurrent, which adds the
+  ## reset epoch.
   let identity = build.identity
   identity.captured and identity.vif < MAX_VIFS.uint8 and
     smTxSerials[identity.vif] == build.serial and

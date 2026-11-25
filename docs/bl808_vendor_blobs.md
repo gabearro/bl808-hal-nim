@@ -7036,14 +7036,15 @@ hardware.
 
 `smTxSessionCurrent` now checks the connection attempt without the reset
 epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The BSS
-parameter batch, the activation exchange and the SM scan/join exchange
-use the session check. The auth/assoc response deadline and the expected
-auth response carry the SM operation's stamp instead (see "SM response
-deadline" below). The deauthentication confirmations end their wait
-with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm` and
-`sm_supplicant_deauth_cfm` do (see "SM teardown" below). `bl_reset_evt` carries the TBTT,
-connectionless and context deadlines and the scan and registration
-exchanges across its `txl_reset` through `chanPreserveAcrossRecovery`.
+parameter batch and the activation exchange use the session check. The
+auth/assoc response deadline and the expected auth response carry the SM
+operation's stamp instead (see "SM response deadline" below), and the
+scan, join and registration exchanges are held by SM's operation (see "SM
+scan, join and registration" below). The deauthentication confirmations
+end their wait with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm`
+and `sm_supplicant_deauth_cfm` do (see "SM teardown" below). None of the
+channel deadlines or SM exchanges depends on the TX reset epoch, so
+nothing is carried across `bl_reset_evt`'s `txl_reset`.
 
 Three deliberate differences from the archive:
 
@@ -7190,8 +7191,10 @@ cleanup waiting for good (audit SMSTRUCT-N1). Differences from the archive:
   without effect. The blob writes the unchecked index and answers.
 - A kernel timer expiry whose message cannot be allocated is retried on the
   same entry 1 ms later. The blob's `ke_timer_schedule` uses `ke_msg_alloc`,
-  which halts; the port had posted a recovery and dropped the expiry. The
-  optional scan probe repeat is still dropped.
+  which halts; the port had posted a recovery and dropped the expiry. Two
+  expiries are not retried: the optional scan probe repeat is dropped, and
+  an SA Query timeout that cannot be posted ends the query
+  (`smSaQueryQueueTimeout`), without the failed-peer verdict.
 
 `ke_msg_send` now retires a message it delivered to the host with
 `ke_msg_free`, as the blob's tail call to `g_bl_ops_funcs[0xBC]` does. The
@@ -7318,19 +7321,17 @@ the archive:
   only while that operation is live, so one arriving after a TX reset
   completes the attempt (SMCONN-F2).
 - An expiry whose message cannot be allocated is re-queued on the same
-  entry 1 ms later with its stamp, like every other kernel timer expiry
-  (SMSTRUCT-N2). The blob's `ke_msg_alloc` halts.
+  entry 1 ms later with its stamp (SMSTRUCT-N2). The blob's `ke_msg_alloc`
+  halts.
 - Association comeback (status 30 with a Timeout Interval element of type
   3): pinned `sm_assoc_rsp_handler+0x182..0x1a6` reads three of the four
   interval bytes, shifts the value left by 10 in 32 bits and calls
   `ke_timer_set`, which asserts on zero or on more than
-  `KE_TIMER_MAX_DELAY`. The port uses all four bytes, waits at least 1 us,
-  and starts a new operation in state 8 first, so an expiry already posted
-  for the request is stale. A wait longer than one kernel timer (about
-  300 s) is armed in chunks under the same stamp; `smOwn.responseUs` holds
-  the rest, and each chunk's expiry arms the next one when it is handled,
-  so the total runs late by that handling time. If a chunk cannot be
-  armed for lack of memory, the wait ends then and the retry policy runs.
+  `KE_TIMER_MAX_DELAY`. The port uses all four bytes, waits at least 1 us
+  and at most `KE_TIMER_MAX_DELAY` (about 300 s), and starts a new
+  operation in state 8 first, so an expiry already posted for the request
+  is stale. The cap keeps a forged interval from holding state 8 for weeks;
+  when it expires, the retry policy runs.
 - A builder that failed or returned after arming used to clear the
   deadline in `smTxEnd`/`smTxFail`. A silent return then left SM in state
   6 or 8 with nothing pending. The deadline now stays: a failure's
@@ -7357,6 +7358,75 @@ Host tests: `tools/test_wifi_response_timeout.py` (rewritten for stamps),
 `tools/test_wifi_sm_audit_sm_connect.py` (SMCONN-F1, SMCONN-F2,
 SMSTRUCT-N2) and `tools/test_wifi_sm_audit_txrx_reset.py` (F2). The M0
 HTTP server manifest built; none of this was flashed.
+
+#### SM scan, join and registration (states 1 to 3)
+
+In states 1, 2 and 3 SM waits for the answer to one request:
+`SCANU_START_REQ` or `SCANU_JOIN_REQ` to SCANU, `MM_STA_ADD_REQ` to MM. The
+sender enters the state with `smGo` and sends with `smSend`, which keeps
+the request's pointer in `smOwn.request`; every `smGo` forgets it. The
+replier answers SM's request in place: it writes the confirmation into the
+request and forwards it back to TASK_SM, so the answer needs no allocation
+and always arrives. SM takes an answer only if it is the message it holds
+(`smTakeAnswer`); the message stays allocated until its answer is handled,
+so the pointer cannot name another message meanwhile. Differences from the
+archive:
+
+- `scanu_confirm` (and the cached-join replay in `scan_done_ind_handler`)
+  answers SM's request in place (`scanuAnswer`) with a one-byte status. The
+  blob allocates a new confirmation with `ke_msg_alloc`, which halts when
+  the heap is exhausted, and frees the request. A host request still gets
+  an allocated confirmation, or the request itself if that fails.
+- SCANU's entry check (`smScanRefused`) answers an SM request at once with
+  `SCAN_STATUS_FAIL`, without using the radio, when SM no longer waits on
+  it or the user aborted the attempt before SCANU started it. The port had
+  this shortcut for an aborted `SCANU_START_REQ` only; it now applies to a
+  join too. The blob runs whatever request it receives.
+- An answer SM does not hold changes nothing. The blob's handlers assert
+  the SM state (`scanu_start_cfm_handler` line 402) and act on it.
+- `mm_sta_add_req_handler` answers SM's request in place. The confirmation
+  SM receives is the pinned three-byte `MM_STA_ADD_CFM` followed by the
+  registered station's delete epoch (`SmStaAddAnswer`, eight bytes); the
+  blob allocates three bytes with `ke_msg_alloc`. A host request is
+  answered as before. MM does not apply an SM request SM no longer waits
+  on.
+- An answer SM no longer waits on that registered a station deletes it
+  with `mm_sta_del`, unless that station was deleted since (epoch). An
+  answer SM takes whose station was deleted since ends the attempt with
+  `sm_connect_ind(15)`. The blob's `mm_sta_add_cfm_handler` asserts state 3
+  and uses the station.
+- `sm_scan_bss` and `sm_join_bss` end the attempt (`sm_connect_ind(12)`)
+  when its STA VIF has been removed or retyped; the blob sends the request
+  anyway. Before, SCANU's completion was dropped with no record when the
+  VIF epoch changed, and SM stayed in state 1 or 2 (SCAN-N3). With no STA
+  VIF left, the teardown ends the attempt unreported (`smTeardownUnclaimed`).
+
+The join links the channel context to the STA VIF before it sends
+`MM_STA_ADD_REQ`, as the blob does, and the VIF holds it from then on: a
+failed attempt's teardown unlinks it. The port had made the registration
+own the context as a lease, released it if the exchange was lost, and had
+MM refuse the registration once that context was replaced; MM now
+registers the station regardless, as in the blob.
+
+Removed: the message tags of both exchanges and their lists, the loss and
+retired-station records, the `smScanForget` and `smRegistrationForget`
+hooks in `ke_msg_free`, the two polled services in `wifiMainHasPendingWork`
+and `wifiDrainScheduledWork`, the admission checks inside `mm_sta_add`,
+and the handlers' re-checks after calls that cannot run SM code (the
+firmware step is not reentered). `sm_get_bss_params` keeps its own
+re-checks.
+
+Host tests: `tools/test_wifi_sm_scan_submit.py`,
+`tools/test_wifi_sm_scan_completion.py`, `tools/test_wifi_join_registration.py`,
+`tools/test_wifi_registration_exchange.py`, `tools/test_wifi_sm_table.py`
+(each state with success, failure, abort, reset before or after the
+answer, and VIF removal, checking that states 1 to 3 always hold their
+request and nothing else does), `tools/test_wifi_sm_audit_scan.py`
+(SCAN-N3), `tools/test_wifi_sm_audit_sm_connect.py` (SMSTRUCT-N1 for the
+registration), `tools/test_wifi_channel_ownership.py`,
+`tools/test_wifi_message_free_depth.py` and
+`tools/test_wifi_queue_model_fuzzer.py`. The M0 HTTP server manifest
+built; none of this was flashed.
 
 ## BLE
 

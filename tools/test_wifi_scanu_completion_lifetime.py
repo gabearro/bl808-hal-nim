@@ -16,6 +16,7 @@ FW = ROOT / "src/bl808/wifi/fw"
 PLATFORM = r"""
 const
   TASK_SCANU = 2'u8
+  TASK_SM = 4'u8
   TASK_API = 9'u8
   SCANU_JOIN_CFM = 0x803'u16
   SCANU_JOIN_REQ = 0x802'u16
@@ -73,8 +74,6 @@ var
   cachedSidecar: CacheSidecar
   scanuRequestEpoch: uint32
 
-proc smScanAdmitRequest(p: pointer): bool = true
-proc smScanOwnsRequest(p: pointer): bool = false
 proc scanuCachedSsidFor(entry: ptr CacheEntry): ptr CacheSidecar =
   doAssert entry == addr cachedEntry
   addr cachedSidecar
@@ -115,8 +114,6 @@ proc ke_msg_free(p: pointer) =
   doAssert requestFrees == 1, "old request released twice"
   request.flags = 0xDDDDDDDD'u32
   fire("request_free")
-proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): pointer =
-  ke_msg_try_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
 proc ke_msg_free_payload(p: pointer) =
   if p == nil: return
   doAssert interruptsEnabled == incoming
@@ -422,7 +419,8 @@ proc scanu_cached_scanresult_clear*() {.exportc, cdecl.} =
     cache_count = int(re.search(r"(?m)^const SCANU_MAX_RESULT_ENTRIES\* = (\d+)$", layout).group(1))
     platform = PLATFORM.replace("SCANU_MAX_RESULT_ENTRIES = 6", f"SCANU_MAX_RESULT_ENTRIES = {cache_count}")
     current = procedure(scan, "scanuRequestCurrent")
-    publication = procedure(scan, "scanuReleaseCompletedOwner") + procedure(scan, "scanuPublishCompletion")
+    publication = "".join(procedure(scan, name) for name in (
+        "scanuReleaseCompletedOwner", "scanuAnswer", "scanuReply", "scanuPublishCompletion"))
     forward = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_forward_and_change_id")
     from test_wifi_scan_start_confirmation import exchange_source
 

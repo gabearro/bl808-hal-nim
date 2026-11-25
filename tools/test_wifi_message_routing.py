@@ -25,7 +25,7 @@ type
 var
   storage: array[40, uint64]
   active: bool
-  metadata: array[15, bool]  # one per owner hook of ke_msg_free
+  metadata: array[13, bool]  # one per owner hook of ke_msg_free
   keMsgQueueSent: CoList
   frees, deliveries, assertions, events, traces: int
   interrupts = true
@@ -93,7 +93,6 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     code = (FW.parent / "fw_messages/tasks.nim").read_text() + PLATFORM
     hooks = ["mmTimForget", "rxMgtForget", "smCleanupForget", "smBssForget", "smActivationForget",
-             "smScanForget", "smRegistrationForget",
              "smDeferredForget", "smAbortForget", "chanUpdateForget", "mmConnLossForget",
              "chanBcnRequestForget"]
     hooks += ["scanDwellForget", "mmEdcaForget"]

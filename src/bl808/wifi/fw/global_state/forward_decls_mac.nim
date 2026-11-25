@@ -172,27 +172,7 @@ proc smAbortCaptureMessage(header: ptr KeMsgHdr)
 proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false)
 proc smTxBegin(connection: pointer): SmTxBuildContext
 proc smTxCapture(connection: pointer): SmTxBuildContext
-proc smScanAlloc(owner: SmTxBuildContext; indication: pointer; id, nextState: uint16): pointer
-proc smScanPublish(request: pointer): bool
-proc smScanOwnsRequest(request: pointer): bool
-proc smScanAdmitRequest(request: pointer): bool
-proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): pointer
-proc smScanAcceptReply(reply: pointer; id: uint16): bool
-proc smScanForget(header: pointer)
-proc smScanNeedsService(): bool
-proc smScanService()
 proc chanForceIdle(): bool
-proc smRegistrationAllocate(owner: SmTxBuildContext; indication: pointer): pointer
-proc smRegistrationPublish(request: pointer): bool
-proc smRegistrationAdmitRequest(request: pointer): bool
-proc smRegistrationTakeReply(request: pointer): pointer
-proc smRegistrationComplete(request, reply: pointer): bool
-proc smRegistrationClaim(reply: pointer; owner: var SmTxBuildContext; indication: var pointer): bool
-proc smRegistrationHandoff(reply: pointer): bool
-proc smRegistrationOwnChannel(request: pointer; lease: var ChanCtxtLease): bool
-proc smRegistrationForget(header: pointer)
-proc smRegistrationNeedsService(): bool
-proc smRegistrationService()
 proc smTxBeginForVif(vifIndex: uint8): SmTxBuildContext
 proc smTxOwnerCurrent(build: SmTxBuildContext): bool
 proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool

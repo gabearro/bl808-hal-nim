@@ -21,6 +21,9 @@ and every stamp handed out is stale: delivering it again changes nothing.
 
 The static part is generated from dispatch_tables.nim: no SM handler writes
 TASK_SM's state itself, and smGo is the only ke_state_set(TASK_SM, ...).
+
+A second table (test_request_answer_table, below) drives the scan, join
+and registration states 1 to 3 through each fate of their one request.
 """
 
 from pathlib import Path
@@ -289,3 +292,156 @@ doAssert smState == SmIdleState and smOwn.teardown == tdNone and not smCleanup.a
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil and allocated.len == 0
 doAssert report() == 0 and not smGuardArmed
 """)
+
+
+# --------------------------------------------------------------------------
+# The request/answer states: scan (1), join (2) and registration (3)
+# --------------------------------------------------------------------------
+#
+# The harness is test_wifi_registration_exchange's: the real sm_scan_bss /
+# sm_join_bss sender, SCANU's scanu_confirm and entry check (smScanRefused),
+# MM's mm_sta_add_req_handler, the SM handlers scanu_start_cfm_handler,
+# scanu_join_cfm_handler and mm_sta_add_cfm_handler, and station_sm.nim's
+# smGo/smSend/smTakeAnswer. sm_connect_ind is modelled as the end of the
+# attempt (state 0); test_teardown_table covers what it really runs.
+#
+# Each row puts SM in one state with its request outstanding, applies one
+# fate and runs to quiescence. At every step a state in 1..3 holds its
+# request and no other state does, and an attempt ends at most once.
+
+FAMILY = r'''
+proc held(): bool = smOwn.request != nil
+proc checkFamily(where: string) =
+  doAssert (state in [SmScanningState, SmWaitingState, SmAddingChanState]) == held(),
+    where & ": state " & $state & " with request held " & $held()
+  doAssert failures.len <= 1, where & ": the attempt ended twice"
+proc startFamily(family: uint16): pointer =
+  ## SM in `family` with its request sent; returns the request.
+  resetExchange()
+  attemptEnds = proc() = discard smGo(SmIdleState)
+  case family
+  of SmScanningState:
+    begin(false)
+    result = take()
+  of SmWaitingState:
+    begin(true)
+    result = take()
+    let vif = addr vifs[conn.vifIdx]
+    vif.ap.securityFlags = 0x80000002'u32
+    vif.bssid = target
+    vif.operChan = addr channel
+    contextIndex = 1
+  else:
+    result = issue()
+  doAssert state == family
+  checkFamily("start")
+proc answer(family: uint16; request: pointer; failed: bool): pointer =
+  ## The replier's answer, in place.
+  if family == SmAddingChanState:
+    if failed: registerStatus = 7
+    result = completeRegistration(request)
+  else:
+    result = complete(request, (if failed: 4'u8 else: 0'u8))
+  checkFamily("answered")
+proc take(family: uint16; reply: pointer) =
+  ## SM's handler for the answer, as the kernel dispatches it.
+  case family
+  of SmScanningState: discard scanu_start_cfm_handler(reply)
+  of SmWaitingState: discard scanu_join_cfm_handler(reply)
+  else: discard mm_sta_add_cfm_handler(reply)
+  release(reply)
+  checkFamily("taken")
+'''
+
+FAMILY_FATES = {
+    # The answer reports success: SM sends the next state's request.
+    "success": r'''
+found = true
+take(family, answer(family, request, false))
+doAssert failures.len == 0
+doAssert state == (if family == SmAddingChanState: 4'u16 else: family + 1)
+''',
+    "failure": r'''
+take(family, answer(family, request, true))
+doAssert failures.len == 1 and state == SmIdleState
+''',
+    # The user's abort while the request is out (states 1 and 2 save none).
+    "abort": r'''
+let reply = answer(family, request, false)
+sm.cancelRequested = 1
+take(family, reply)
+doAssert failures == @[((if family == SmScanningState: 26'u16 else: 25'u16), 0xFFFF'u16)]
+doAssert state == SmIdleState
+''',
+    # SM moved on (sm_init) before the replier ran: nothing is applied.
+    "refused": r'''
+discard smGo(SmIdleState)
+checkFamily("reset")
+if family == SmAddingChanState:
+  doAssert completeRegistration(request) == nil and registrations == 0
+else:
+  doAssert smScanRefused(request)
+  take(family, take())
+doAssert failures.len == 0 and state == SmIdleState
+''',
+    # SM moved on after the replier answered: the answer changes nothing,
+    # and a station registered for it is deleted.
+    "stale": r'''
+let reply = answer(family, request, false)
+discard smGo(SmIdleState)
+checkFamily("reset")
+take(family, reply)
+doAssert failures.len == 0 and state == SmIdleState
+if family == SmAddingChanState: doAssert deletions == 1 and stations[0].valid == 0
+''',
+    # SCAN-N3: the STA VIF is removed while SCANU works on the request.
+    "vif_gone": r'''
+vifs[conn.vifIdx] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+found = true
+take(family, answer(family, request, false))
+doAssert failures.len == 1 and state == SmIdleState
+''',
+}
+
+FAMILY_ROWS = [(family, fate) for family in (1, 2, 3) for fate in FAMILY_FATES
+               if not (family == 3 and fate in ("abort", "vif_gone"))]
+
+
+def family_source() -> str:
+    from test_wifi_registration_exchange import source as registration_source
+    code = registration_source()
+    stub = "  failures.add((status, reason))\n  invoke(onFailure)\n"
+    assert stub in code
+    code = "var attemptEnds: proc()\n" + code.replace(
+        stub, stub + "  if attemptEnds != nil: attemptEnds()\n", 1)
+    return code + FAMILY
+
+
+@pytest.mark.parametrize("family,fate", FAMILY_ROWS, ids=[f"{s}-{f}" for s, f in FAMILY_ROWS])
+def test_request_answer_table(tmp_path: Path, family: int, fate: str) -> None:
+    run_program(tmp_path, "checked", family_source() + f"""
+let family = {family}'u16
+let request = startFamily(family)
+""" + FAMILY_FATES[fate] + r'''
+# Quiescence: what is left is the next state's own request.
+while queued.len != 0: release(take())
+discard smGo(SmIdleState)
+checkFamily("end")
+finishExchange()
+''')
+
+
+def test_request_answer_states_have_one_exit() -> None:
+    """Each SM answer handler takes the answer with smTakeAnswer (directly
+    or through smScanAccept) and nothing else in the firmware tracks,
+    forgets or services the scan, join or registration exchange."""
+    tasks = (FW / "task_handlers.nim").read_text()
+    for handler, take in [("scanu_start_cfm_handler", "smScanAccept(param, SCANU_START_CFM)"),
+                          ("scanu_join_cfm_handler", "smScanAccept(param, SCANU_JOIN_CFM)"),
+                          ("mm_sta_add_cfm_handler", "smTakeAnswer(param)")]:
+        assert take in procedure(tasks, handler), handler
+    assert "smTakeAnswer(reply)" in procedure((FW / "station_scan.nim").read_text(), "smScanAccept")
+    senders = [path.name for path in _wifi_sources() if "smSend(" in _code(path)]
+    assert sorted(senders) == ["scan_station_ap_me.nim", "station_sm.nim", "task_handlers.nim"], senders
+    main = _code(FW / "task_init_main.nim")
+    assert "smScanNeedsService" not in main and "smRegistrationNeedsService" not in main

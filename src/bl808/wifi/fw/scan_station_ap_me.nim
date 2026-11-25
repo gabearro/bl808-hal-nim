@@ -345,18 +345,27 @@ proc scanuReleaseCompletedOwner(epoch: uint32) =
   if scanuRequestEpoch == epoch and scanu_env.paramPtr == nil:
     ke_state_set(TASK_SCANU, ScanuIdleState)
 
+proc scanuAnswer(request: pointer; id: uint16; destination, status: uint8) =
+  ## Answer `request` in place: it becomes its own confirmation. This needs
+  ## no allocation, so it cannot fail.
+  statusCfmView(request).status = status
+  keMsgHdrFromPayload(request).paramLen = StatusCfmPayloadSize
+  ke_msg_forward_and_change_id(request, id, destination, TASK_SCANU)
+
+proc scanuReply(id: uint16; destination: uint8): pointer =
+  ## A separate confirmation, as the blob allocates one. SM's requests, and
+  ## any whose allocation fails, are answered in place instead (nil).
+  if destination == TASK_SM: nil
+  else: ke_msg_try_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
+
 proc scanuPublishCompletion(request, reply: pointer; id: uint16;
-                            destination, status: uint8; smOwned: bool) =
-  let header = keMsgHdrFromPayload(request)
-  if reply == nil and not smOwned and header.paramLen >= StatusCfmPayloadSize:
-    # SM requests must use their reserved reply with its owner tag.
-    statusCfmView(request).status = status
-    header.paramLen = StatusCfmPayloadSize
-    ke_msg_forward_and_change_id(request, id, destination, TASK_SCANU)
+                            destination, status: uint8) =
+  if reply == nil:
+    scanuAnswer(request, id, destination, status)
   else:
-    if reply != nil: statusCfmView(reply).status = status
-    ke_msg_free(header)
-    if reply != nil: ke_msg_send(reply)
+    statusCfmView(reply).status = status
+    ke_msg_free(keMsgHdrFromPayload(request))
+    ke_msg_send(reply)
 
 proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
   ## Send scan completion confirmation to host (58 instrs).
@@ -370,18 +379,18 @@ proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
     defer: irqRestore(saved)
     let oldRequest = scanu_env.paramPtr
     if oldRequest == nil: return
-    let smOwned = smScanOwnsRequest(oldRequest)
-    let joining = if smOwned:
+    # SM's answer has the type of its request; SM does not read the filter.
+    let joining = if scanu_env.requester == TASK_SM:
         uint8(keMsgHdrFromPayload(oldRequest).id == SCANU_JOIN_REQ)
       else: scanu_env.bssidFilterEnabled
     inc scanuRequestEpoch
     scanu_env.paramPtr = nil
     scanu_env.pendingJoinRxuMgtInd = nil
-    (request: oldRequest, join: joining, smOwned: smOwned,
+    (request: oldRequest, join: joining,
      source: scanu_env.requester, epoch: scanuRequestEpoch)
   defer: scanuReleaseCompletedOwner(completion.epoch)
   let primaryId = if completion.join != 0: SCANU_JOIN_CFM else: SCANU_START_CFM
-  let primaryCfm = smScanCompletionAlloc(completion.request, primaryId, completion.source)
+  let primaryCfm = scanuReply(primaryId, completion.source)
   var apiJoinCfm: pointer = nil
   if completion.join != 0:
     apiJoinCfm = ke_msg_try_alloc(SCANU_JOIN_CFM, TASK_API, TASK_SCANU,
@@ -389,7 +398,7 @@ proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
   if apiJoinCfm != nil:
     statusCfmView(apiJoinCfm).status = status
   scanuPublishCompletion(completion.request, primaryCfm, primaryId,
-                         completion.source, status, completion.smOwned)
+                         completion.source, status)
   if apiJoinCfm != nil:
     ke_msg_send(apiJoinCfm)
 
@@ -2535,29 +2544,30 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
 
 proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
                          joining: bool; joinFlag: uint32) =
-  var owner = smTxCapture(smEnvView().connectInfo)
-  let indication = smEnvView().connectIndMsg
-  if not owner.identity.captured or indication == nil or
-      owner.state notin [SmIdleState, SmScanningState, SmWaitingState]: return
-  template current(): bool =
-    smTxOwnerCurrent(owner) and smEnvView().connectIndMsg == indication
+  ## Send the attempt's scan (state 1) or join (state 2) request. Unless no
+  ## attempt is live, this ends in the new state or in sm_connect_ind.
+  let sm = smEnvView()
+  let connectionPtr = sm.connectInfo
+  if connectionPtr == nil or sm.connectIndMsg == nil or smOwn.teardown != tdNone: return
   template invalidInput() =
-    if current(): sm_connect_ind(WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16, 0xFFFF)
-  if not current(): return
-  if localMac == nil or (joining and (targetBssid == nil or channelInfo == nil)):
+    sm_connect_ind(WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16, 0xFFFF)
+  let vifIdx = connectInfoView(connectionPtr).vifIdx
+  # The STA VIF can be removed while the attempt scans (SCAN-N3).
+  if localMac == nil or (joining and (targetBssid == nil or channelInfo == nil)) or
+      vifIdx >= MAX_VIFS.uint8 or vifChannelForIdx(vifIdx).vifIdx != vifIdx or
+      vifChannelForIdx(vifIdx).vifType != VIF_TYPE_STA:
     invalidInput()
     return
 
-  # Snapshot borrowed inputs before allocation or state publication can call out.
   var prepared: ScanuStartReqPayload
   prepared.localMac = cast[ptr array[6, uint8]](localMac)[]
   if targetBssid != nil:
     prepared.bssid = cast[ptr array[6, uint8]](targetBssid)[]
   else:
     for value in prepared.bssid.mitems: value = 0xFF
-  let connection = connectInfoView(owner.connection)
+  let connection = connectInfoView(connectionPtr)
   connectInfoFillSsidSlot(scanSsidSlot(addr prepared, 0), connection)
-  prepared.vifIdx = owner.identity.vif
+  prepared.vifIdx = vifIdx
   prepared.flags = connection.channelDuration
   prepared.scanType = 1
   if channelInfo != nil:
@@ -2586,32 +2596,17 @@ proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
       invalidInput()
       return
 
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if not current(): return
-    owner = smTxBegin(owner.connection)
-  if not current(): return
   let messageId = if joining: SCANU_JOIN_REQ else: SCANU_START_REQ
-  let nextState = if joining: SmWaitingState else: SmScanningState
-  var message = smScanAlloc(owner, indication, messageId, nextState)
-  defer:
-    if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
-  if not current(): return
+  let message = ke_msg_try_alloc(messageId, TASK_SCANU, TASK_SM, ScanuStartReqPayloadSize)
   if message == nil:
     sm_connect_ind(WLAN_FW_JOIN_NETWORK_FAILURE.uint16, 0xFFFF)
     return
   scanuStartReqView(message)[] = prepared
-
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not current(): return
-  if joining: smEnvView().joinBssFlag = cast[uint8](joinFlag)
-  if not smTxSetOwnerState(owner, nextState) or not current(): return
-  if not smScanPublish(message): return
-  let outgoing = message
-  message = nil
-  ke_msg_send(outgoing)
+  if joining: sm.joinBssFlag = cast[uint8](joinFlag)
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[0] = messageId.uint32 + 1
+  smGo(if joining: SmWaitingState else: SmScanningState)
+  smSend(message)
 
 proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, cdecl.} =
   smSubmitScanRequest(bssid, ssid, chanInfo, false, 0)

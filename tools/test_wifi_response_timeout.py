@@ -345,56 +345,24 @@ onTimeout = proc() = discard smGo(SmDisconnectingState)
 deliver(expire())
 doAssert callbackCalls == 1 and authRetries == 0 and connection.retry == 1
 ''',
-    "comeback_full_duration_and_clock_wrap": r'''
+    "comeback_is_bounded": r'''
+# An association comeback (status 30) longer than the longest kernel timer
+# is cut to it, so a spoofed interval cannot hold state 8 for weeks.
 setup(SmAssocRspState)
 now = high(uint32) - 100
-let duration = high(uint32).uint64 * 1024
-doAssert smArmResponse(smGo(SmAssocRspState), duration)
-var elapsed = 0'u64
-var chunks = 0
-while assocRetries == 0:
-  let timer = cast[ptr KeTimerEntry](keTimerQueue.first)
-  doAssert timer != nil
-  let delta = timer.time - now
-  doAssert delta > 0 and delta <= KE_TIMER_MAX_DELAY
-  elapsed += delta.uint64
-  deliver(expire())
-  inc chunks
-  doAssert chunks < 15000
-doAssert elapsed == duration and chunks > 1
+doAssert smArmResponse(smGo(SmAssocRspState), high(uint32).uint64 * 1024)
+let timer = cast[ptr KeTimerEntry](keTimerQueue.first)
+doAssert timer != nil and timer.time - now == KE_TIMER_MAX_DELAY
+deliver(expire())
 doAssert assocRetries == 1 and connection.retry == 1
 ''',
-    "comeback_cancel_between_chunks": r'''
+    "comeback_cancelled": r'''
 setup(SmAssocRspState)
 doAssert smArmResponse(smGo(SmAssocRspState), 1_000_000'u64 * 1024)
-deliver(expire())
-doAssert assocRetries == 0 and keTimerQueue.first != nil
-# The attempt moves on between chunks: the next chunk's expiry is stale.
-let next = expire()
+let old = expire()
 discard smGo(SmIdleState)
-deliver(next)
+deliver(old)
 doAssert assocRetries == 0 and failures == 0 and keTimerQueue.first == nil
-''',
-    "comeback_chunk_allocation_failure": r'''
-setup(SmAssocRspState)
-doAssert smArmResponse(smGo(SmAssocRspState), 1_000_000'u64 * 1024)
-let chunk = expire()
-# No memory for the next chunk: the wait ends now and the retry policy runs.
-failAlloc = true
-onAlloc = proc() = failAlloc = false
-deliver(chunk)
-doAssert assocRetries == 1 and connection.retry == 1 and allocationFailures == 0
-''',
-    "comeback_replacement_during_chunk_allocation": r'''
-setup(SmAssocRspState)
-doAssert smArmResponse(smGo(SmAssocRspState), 1_000_000'u64 * 1024)
-let chunk = expire()
-onAlloc = replaceAttempt
-deliver(chunk)
-# The kernel lets the nested set of the same timer win.
-doAssert assocRetries == 0 and authRetries == 0 and allocationFailures == 0
-doAssert cast[ptr KeTimerEntry](keTimerQueue.first).time == now + 200
-doAssert cast[ptr KeTimerEntry](keTimerQueue.first).stamp == smOwn.op.serial
 ''',
     "allocator_replacement": r'''
 setup()

@@ -78,9 +78,6 @@ proc chan_ctxt_link(vif, index: uint8) =
   doAssert index == 1 and vif == conn.vifIdx
   inc links
   invoke(onLink)
-proc smRegistrationAllocate(owner: SmTxBuildContext; indication: pointer): pointer =
-  ke_msg_try_alloc(MM_STA_ADD_REQ, TASK_MM, TASK_SM, MmStaAddReqPayloadSize)
-proc smRegistrationPublish(request: pointer): bool = true
 proc chanLeaseCurrent(lease: ChanCtxtLease): bool = lease.held
 proc chanLeaseAcquire(request: pointer; lease: var ChanCtxtLease): uint8 =
   var index = 255'u8
@@ -94,9 +91,6 @@ proc chanLeaseLink(lease: var ChanCtxtLease; vifIndex: uint8): bool =
   lease.vif = vifIndex
   true
 proc chanLeaseRelease(lease: var ChanCtxtLease) = lease = default(ChanCtxtLease)
-proc smRegistrationOwnChannel(request: pointer; lease: var ChanCtxtLease): bool =
-  lease = default(ChanCtxtLease)
-  true
 '''
     code = code.replace(
         "proc sm_connect_ind(status, reason: uint16) = failures.add((status, reason))",
@@ -200,32 +194,6 @@ doAssert contextAdds == 0 and links == 0
 doAssert failures == @[(14'u16, 0xFFFF'u16)]
 finishJoin(reply)
 ''',
-    "allocation_replacement": r'''
-let reply = ready()
-onAlloc = replaceOwner
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and state == 6 and links == 0 and contextAdds == 0
-doAssert failures.len == 0
-finishJoin(reply)
-''',
-    "link_replacement": r'''
-let reply = ready()
-onLink = proc() =
-  replaceOwner()
-  vifs[conn.vifIdx].keys.flags = 0x76543210
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and state == 6
-doAssert vifs[conn.vifIdx].keys.flags == 0x76543210
-finishJoin(reply)
-''',
-    "context_replacement": r'''
-let reply = ready()
-onContext = replaceOwner
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and state == 6 and links == 0
-doAssert failures.len == 0
-finishJoin(reply)
-''',
     "invalid_context_index": r'''
 for index in [3'u8, 255'u8]:
   let reply = ready()
@@ -264,16 +232,6 @@ vifs[conn.vifIdx].operChan = nil
 doAssert scanu_join_cfm_handler(reply) == 0
 doAssert queued.len == 0 and contextAdds == 0 and links == 0
 doAssert failures == @[(13'u16, 0xFFFF'u16)]
-finishJoin(reply)
-''',
-    "state_replacement": r'''
-let reply = ready()
-onState = proc() =
-  replaceOwner()
-  vifs[conn.vifIdx].keys.flags = 0x76543210
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and state == 6
-doAssert vifs[conn.vifIdx].keys.flags == 0x76543210
 finishJoin(reply)
 ''',
     "context_failure_callback": r'''

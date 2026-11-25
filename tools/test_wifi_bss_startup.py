@@ -30,15 +30,15 @@ def source() -> str:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]""", 1)
     code = code.replace(procedure(code, "sm_set_bss_param"),
                         "proc sm_set_bss_param*() {.exportc, cdecl.}\n", 1)
+    code = code.replace("  let index = live.find(p)\n", "  smBssForget(p)\n  let index = live.find(p)\n", 1)
     code = "proc smBssForget(header: pointer)\n" + code
-    code = code.replace("  smRegistrationForget(p)\n",
-                        "  smBssForget(p)\n  smRegistrationForget(p)\n", 1)
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
              "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
     code += layouts(*names)
     code += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     code += r'''
 const
+  KeMsgTailSlack = 4'u32
   TASK_ME = 3'u8
   SmSettingBssState = 4'u16
   ME_SET_PS_DISABLE_REQ = 0xC0F'u16
@@ -69,7 +69,22 @@ type CoListHdr = KeMsgHdr
 proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool = false
 proc meCancelQueuedPayload(payload: pointer) = discard
 '''
-    code += (FW / "station_bss.nim").read_text()
+    # The SM connection identity the BSS batch still uses (station_tx_build.nim).
+    code += "type\n"
+    layout = (FW / "layout_types.nim").read_text()
+    for name in ["TxSessionIdentity", "SmTxBuildContext"]:
+        lines = ("  " + name + layout.split("  " + name, 1)[1]).splitlines()
+        code += lines[0] + "\n"
+        for line in lines[1:]:
+            if line and not line.startswith("    "):
+                break
+            code += line + "\n"
+    code += "var smTxSerials, rxVifEpochs: array[2, uint32]\nvar txResetEpoch: uint32\n"
+    owner = (FW / "station_tx_build.nim").read_text()
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent",
+                 "smTxBindStation", "smTxSetOwnerState"]:
+        code += procedure(owner, name)
+    code += "{.pragma: wifiCtrl.}\n" + (FW / "station_bss.nim").read_text()
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure(scan, "sm_send_next_bss_param") + procedure(scan, "sm_set_bss_param")
     return code
@@ -94,8 +109,7 @@ for initialIrq in [false, true]:
     doAssert failures == @[(14'u16, 0xFFFF'u16)] and deletions == 1
     bssFailAt = 0
     release(reply)
-    smRegistrationService()
-    doAssert deletions == 1 and not smRegistrationNeedsService()
+    doAssert deletions == 1
     finishExchange()
 ''',
     "replacement_during_startup": r'''
@@ -105,7 +119,6 @@ onAlloc = replaceOwner
 doAssert mm_sta_add_cfm_handler(reply) == 0
 doAssert failures.len == 0 and queued.len == 0 and state == 6
 release(reply)
-smRegistrationService()
 doAssert deletions == 0
 finishExchange()
 ''',

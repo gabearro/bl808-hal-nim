@@ -21,10 +21,6 @@ def source() -> str:
     doAssert dst in [4'u8, 9'u8] and src in [0'u8, 7'u8] and size >= 3
   else:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]""", 1)
-    code = code.replace(procedure(code, "staDeleteEpoch"), """
-proc staDeleteEpoch(index: uint8): uint32 =
-  if index < 5: stationEpochs[index] else: 0
-""", 1)
     code = "var stationEpochs: array[5, uint32]\n" + code
     support = r'''
 const
@@ -46,6 +42,8 @@ var
 proc staInfoForIdx(index: uint8): ptr Station =
   doAssert index < stations.len.uint8
   addr stations[index]
+proc staDeleteEpoch(index: uint8): uint32 =
+  if index < 5: stationEpochs[index] else: 0
 proc staDeleteIsCurrent(index: uint8; epoch: uint32): bool =
   index < 5 and stations[index].valid != 0 and stationEpochs[index] == epoch
 proc mm_sta_del(index: uint8) =
@@ -72,40 +70,17 @@ proc mm_sta_add(request: pointer; logical, hardware: ptr uint8): uint8 =
       invoke(onRegistered)
       return 0
   1
+proc sm_set_bss_param() =
+  inc bssCalls
+  state = 4
+  invoke(onBss)
 proc me_set_sta_ht_vht_param(station, caps: pointer) =
   let index = cast[ptr Station](station).instNbr
   doAssert caps == cast[pointer](addr vifs[index].ht)
   inc htCalls
   invoke(onHt)
-proc sm_set_bss_param() =
-  inc bssCalls
-  state = 4
-  invoke(onBss)
 '''
-    module = FW / "station_registration.nim"
-    if module.exists():
-        for name in ["smRegistrationAllocate", "smRegistrationPublish", "smRegistrationOwnChannel"]:
-            if f"proc {name}(" in code:
-                declaration = {
-                    "smRegistrationAllocate": "proc smRegistrationAllocate(owner: SmTxBuildContext; indication: pointer): pointer\n",
-                    "smRegistrationPublish": "proc smRegistrationPublish(request: pointer): bool\n",
-                    "smRegistrationOwnChannel": "proc smRegistrationOwnChannel(request: pointer; lease: var ChanCtxtLease): bool\n",
-                }[name]
-                code = code.replace(procedure(code, name), declaration, 1)
-        code = code.replace("  smScanForget(p)\n", "  smRegistrationForget(p)\n  smScanForget(p)\n", 1)
-        code = code.replace("proc resetScanTracking()\n", "proc resetScanTracking()\nproc smRegistrationForget(header: pointer)\n", 1)
-        owner = (FW / "station_tx_build.nim").read_text()
-        support += procedure(owner, "smTxBindStation")
-        support += "\n{.pragma: wifiCtrl.}\n" + module.read_text()
-        support += r'''
-var chanTbttTimerOwner, chanConnlessTimerOwner: tuple[valid: bool, resetEpoch: uint32]
-var failChannelReset: bool
-proc mm_force_idle_req(): bool =
-  doAssert not enabled
-  inc txResetEpoch
-  not failChannelReset
-'''
-        support += procedure((FW / "channel_timer.nim").read_text(), "chanForceIdle")
+    support += (FW / "station_registration.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()
     code += support + procedure(tasks, "mm_sta_add_req_handler") + procedure(tasks, "mm_sta_add_cfm_handler")
     return code + r'''
@@ -116,24 +91,27 @@ proc issue(): pointer =
   doAssert state == 3 and queued.len == 1
   take()
 proc completeRegistration(request: pointer): pointer =
-  doAssert mm_sta_add_req_handler(request) == 0
-  release(request)
-  if queued.len != 0:
+  ## MM handles the request; returns the answer queued for SM, if any.
+  let handled = mm_sta_add_req_handler(request)
+  if handled == KeMsgNoFree:
     doAssert queued.len == 1
     result = take()
+    doAssert result == request, "SM's request was not answered in place"
+  else:
+    doAssert handled == KeMsgConsumed
+    release(request)
+    if queued.len != 0:
+      doAssert queued.len == 1
+      result = take()
 proc finishExchange() =
-  smRegistrationService()
   finish()
-  doAssert smRegistrationTags == nil and not smRegistrationNeedsService()
 proc resetExchange() =
-  doAssert smRegistrationTags == nil and not smRegistrationNeedsService()
   stations = default(typeof(stations))
   registrations = 0
   deletions = 0
   bssCalls = 0
   htCalls = 0
   registerStatus = 0
-  failChannelReset = false
   onRegister = nil
   onRegistered = nil
   onHt = nil
@@ -144,56 +122,53 @@ proc resetExchange() =
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_unrelated_registration_confirmation(tmp_path: Path, mode: str) -> None:
+    """An MM_STA_ADD_CFM that is not SM's live answer changes nothing; one
+    without the station epoch (the pinned three-byte form) deletes nothing."""
     run_program(tmp_path, mode, source() + r'''
 setup()
 state = 3
 stations[0] = Station(valid: 1, instNbr: conn.vifIdx)
 vifs[conn.vifIdx].staIdx = 0
-var unrelated = MmStaAddCfmPayload(status: 0, staIdx: 0, hwStaIdx: 8)
-doAssert mm_sta_add_cfm_handler(addr unrelated) == 0
-doAssert bssCalls == 0 and state == 3
+let unrelated = ke_msg_alloc(MM_STA_ADD_CFM, TASK_SM, TASK_MM, MmStaAddCfmPayloadSize)
+cast[ptr MmStaAddCfmPayload](unrelated)[] = MmStaAddCfmPayload(status: 0, staIdx: 0, hwStaIdx: 8)
+doAssert mm_sta_add_cfm_handler(unrelated) == 0
+doAssert bssCalls == 0 and state == 3 and deletions == 0 and stations[0].valid == 1
+release(unrelated)
 ''')
 
 
 CASES = {
-    "channel_reset_before_request_or_reply": r'''
+    "only_a_new_operation_ends_the_exchange": r'''
+# A TX reset or channel switch is not SM's operation; only SM changing state
+# makes the request or its answer stale.
 for beforeReply in [false, true]:
-  for resetKind in 0..4:
+  for replaced in [false, true]:
     resetExchange()
     let request = issue()
     var reply = if beforeReply: completeRegistration(request) else: nil
-    if beforeReply: doAssert reply != nil
-    case resetKind
-    of 0:
-      doAssert chanForceIdle()
-    of 1:
-      inc txResetEpoch
-    of 2:
-      inc txResetEpoch
-      doAssert chanForceIdle()
-    of 3:
-      failChannelReset = true
-      doAssert not chanForceIdle()
-    else:
-      replaceOwner()
-      doAssert chanForceIdle()
+    if replaced: replaceOwner()
     if not beforeReply: reply = completeRegistration(request)
     if reply != nil:
       doAssert mm_sta_add_cfm_handler(reply) == 0
       release(reply)
-    # Only a replaced owner (kind 4) ends the exchange; a TX reset does not.
-    doAssert bssCalls == (if resetKind != 4: 1 else: 0)
-    doAssert registrations == (if beforeReply or resetKind != 4: 1 else: 0)
+    doAssert bssCalls == (if replaced: 0 else: 1)
+    # A request SM no longer waits on is not applied; a station registered
+    # for an answer SM no longer waits on is deleted.
+    doAssert registrations == (if beforeReply or not replaced: 1 else: 0)
+    doAssert deletions == (if beforeReply and replaced: 1 else: 0)
+    doAssert failures.len == 0
     finishExchange()
 ''',
-    "reserved_completion": r'''
+    "answer_needs_no_allocation": r'''
 resetExchange()
 let request = issue()
 let count = allocations
 failAlloc = true
 let reply = completeRegistration(request)
-doAssert reply != nil and allocations == count and registrations == 1
-doAssert keMsgHdrFromPayload(reply).paramLen == 3
+doAssert reply == request and allocations == count and registrations == 1
+doAssert keMsgHdrFromPayload(reply).id == MM_STA_ADD_CFM
+doAssert keMsgHdrFromPayload(reply).srcId == TASK_MM and keMsgHdrFromPayload(reply).destId == TASK_SM
+doAssert keMsgHdrFromPayload(reply).paramLen == sizeof(SmStaAddAnswer).uint32
 doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 1 and state == 4
 release(reply)
 doAssert deletions == 0
@@ -207,54 +182,32 @@ doAssert completeRegistration(request) == nil
 doAssert registrations == 0 and failures.len == 0
 finishExchange()
 ''',
-    "replacement_during_registration": r'''
-resetExchange()
-let request = issue()
-onRegistered = replaceOwner
-doAssert completeRegistration(request) == nil
-doAssert registrations == 1 and bssCalls == 0
-smRegistrationService()
-doAssert deletions == 1 and failures.len == 0
-finishExchange()
-''',
     "stale_reply": r'''
-resetExchange()
-let reply = completeRegistration(issue())
-replaceOwner()
-doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0
-release(reply)
-smRegistrationService()
-doAssert deletions == 1 and failures.len == 0
-finishExchange()
+for status in [0'u8, 7'u8]:
+  resetExchange()
+  registerStatus = status
+  let reply = completeRegistration(issue())
+  replaceOwner()
+  doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0
+  release(reply)
+  doAssert deletions == (if status == 0: 1 else: 0) and failures.len == 0
+  finishExchange()
 ''',
     "recycled_station": r'''
-resetExchange()
-let reply = completeRegistration(issue())
-inc stationEpochs[0]
-stations[0].capabilityFlags = 0xABCD
-doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0
-release(reply)
-smRegistrationService()
-doAssert deletions == 0 and stations[0].valid == 1
-doAssert stations[0].capabilityFlags == 0xABCD
-finishExchange()
-''',
-    "lost_request": r'''
-resetExchange()
-release(issue())
-doAssert smRegistrationNeedsService()
-smRegistrationService()
-smRegistrationService()
-doAssert failures == @[(15'u16, 0xFFFF'u16)] and registrations == 0
-finishExchange()
-''',
-    "lost_reply": r'''
-resetExchange()
-release(completeRegistration(issue()))
-smRegistrationService()
-smRegistrationService()
-doAssert failures == @[(15'u16, 0xFFFF'u16)] and deletions == 1
-finishExchange()
+for live in [false, true]:
+  resetExchange()
+  let reply = completeRegistration(issue())
+  inc stationEpochs[0]
+  stations[0].capabilityFlags = 0xABCD
+  if not live: replaceOwner()
+  doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0
+  release(reply)
+  # The station is no longer the one MM registered: nothing is deleted, and
+  # the live attempt fails.
+  doAssert deletions == 0 and stations[0].valid == 1
+  doAssert stations[0].capabilityFlags == 0xABCD
+  doAssert failures == (if live: @[(15'u16, 0xFFFF'u16)] else: @[])
+  finishExchange()
 ''',
     "registration_failure": r'''
 resetExchange()
@@ -269,42 +222,27 @@ doAssert deletions == 0
 finishExchange()
 ''',
     "one_shot_reply": r'''
+# Taking the answer ends the wait (a message is delivered once).
 resetExchange()
 let reply = completeRegistration(issue())
+doAssert smAwaits(reply)
 doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 1
-state = 3
-doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 1
+doAssert not smAwaits(reply) and smOwn.request == nil
 release(reply)
 doAssert deletions == 0
 finishExchange()
 ''',
-    "reply_fields": r'''
-for mutation in 0 .. 5:
+    "answer_fields": r'''
+for mutation in 0 .. 1:
   resetExchange()
   let reply = completeRegistration(issue())
-  let header = keMsgHdrFromPayload(reply)
   case mutation
-  of 0: inc header.id
-  of 1: header.srcId = 2
-  of 2: header.destId = 9
-  of 3: header.paramLen = 2
-  of 4: cast[ptr MmStaAddCfmPayload](reply).staIdx = 255
-  else: cast[ptr MmStaAddCfmPayload](reply).hwStaIdx = 255
+  of 0: keMsgHdrFromPayload(reply).paramLen = MmStaAddCfmPayloadSize
+  else: cast[ptr MmStaAddCfmPayload](reply).staIdx = 255
   doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0
   release(reply)
-  smRegistrationService()
-  doAssert deletions == 1 and failures == @[(15'u16, 0xFFFF'u16)]
+  doAssert failures == @[(15'u16, 0xFFFF'u16)]
   finishExchange()
-''',
-    "ht_callback_replacement": r'''
-resetExchange()
-let reply = completeRegistration(issue())
-onHt = replaceOwner
-doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 0 and htCalls == 1
-release(reply)
-smRegistrationService()
-doAssert deletions == 1 and failures.len == 0
-finishExchange()
 ''',
     "handoff_callback": r'''
 resetExchange()
@@ -312,26 +250,7 @@ let reply = completeRegistration(issue())
 onBss = replaceOwner
 doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 1
 release(reply)
-doAssert not smRegistrationNeedsService() and deletions == 0
-finishExchange()
-''',
-    "reply_reservation_failure": r'''
-resetExchange()
-let reply = ready()
-onAlloc = proc() = failAlloc = true
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and registrations == 0 and contextAdds == 0
-doAssert failures == @[(14'u16, 0xFFFF'u16)]
-release(reply)
-finishExchange()
-''',
-    "reply_reservation_replacement": r'''
-resetExchange()
-let reply = ready()
-onAlloc = proc() = onAlloc = replaceOwner
-doAssert scanu_join_cfm_handler(reply) == 0
-doAssert queued.len == 0 and failures.len == 0 and contextAdds == 0
-release(reply)
+doAssert deletions == 0
 finishExchange()
 ''',
     "synchronous_exchange": r'''
@@ -354,6 +273,7 @@ cast[ptr MmStaAddReqPayload](request).vifIdx = conn.vifIdx
 keMsgHdrFromPayload(request).srcId = 9
 let reply = completeRegistration(request)
 doAssert keMsgHdrFromPayload(reply).destId == 9 and registrations == 1
+doAssert keMsgHdrFromPayload(reply).paramLen == MmStaAddCfmPayloadSize
 release(reply)
 doAssert deletions == 0
 finishExchange()
@@ -374,50 +294,20 @@ release(reply)
 doAssert deletions == 0
 finishExchange()
 ''',
-    "request_fields": r'''
-for mutation in 0 .. 4:
-  resetExchange()
-  let request = issue()
-  let header = keMsgHdrFromPayload(request)
-  case mutation
-  of 0: inc header.id
-  of 1: header.srcId = 9
-  of 2: header.destId = 9
-  of 3: header.paramLen = 2
-  else: cast[ptr MmStaAddReqPayload](request).vifIdx = 255
-  doAssert completeRegistration(request) == nil and registrations == 0
-  smRegistrationService()
-  doAssert failures == @[(15'u16, 0xFFFF'u16)]
-  finishExchange()
-''',
-    "duplicate_request": r'''
+    "host_request_allocation_failure": r'''
+# The blob allocates the host's confirmation first; without one nothing is applied.
 resetExchange()
-let request = issue()
-doAssert mm_sta_add_req_handler(request) == 0
-doAssert mm_sta_add_req_handler(request) == 0
-doAssert registrations == 1 and queued.len == 1
-release(request)
-let reply = take()
-doAssert mm_sta_add_cfm_handler(reply) == 0 and bssCalls == 1
-release(reply)
+setup()
+let request = ke_msg_alloc(MM_STA_ADD_REQ, TASK_MM, TASK_SM, MmStaAddReqPayloadSize)
+keMsgHdrFromPayload(request).srcId = 9
+failAlloc = true
+doAssert completeRegistration(request) == nil and registrations == 0
 finishExchange()
 ''',
-    "station_recycled_during_registration": r'''
-resetExchange()
-let request = issue()
-onRegistered = proc() =
-  inc stationEpochs[0]
-  stations[0].capabilityFlags = 0x1234
-let reply = completeRegistration(request)
-doAssert cast[ptr MmStaAddCfmPayload](reply).status != 0
-doAssert mm_sta_add_cfm_handler(reply) == 0
-release(reply)
-doAssert deletions == 0 and stations[0].capabilityFlags == 0x1234
-finishExchange()
-''',
-    "older_reply_does_not_replace_pending_cleanup": r'''
+    "older_reply_does_not_delete_a_newer_station": r'''
 resetExchange()
 let oldReply = completeRegistration(issue())
+# The cleanup of that attempt deleted its station; a new attempt joins.
 stations[0].valid = 0
 inc stationEpochs[0]
 vifs[conn.vifIdx].staIdx = 255
@@ -427,19 +317,13 @@ let scanReply = complete(take())
 doAssert scanu_join_cfm_handler(scanReply) == 0
 release(scanReply)
 let newReply = completeRegistration(take())
-release(newReply)
+doAssert stations[0].valid == 1
+doAssert mm_sta_add_cfm_handler(oldReply) == 0
 release(oldReply)
-smRegistrationService()
-doAssert deletions == 1 and stations[0].valid == 0
-doAssert failures == @[(15'u16, 0xFFFF'u16)]
-finishExchange()
-''',
-    "cleanup_callback_replaces_connection": r'''
-resetExchange()
-release(completeRegistration(issue()))
-onDelete = replaceOwner
-smRegistrationService()
-doAssert deletions == 1 and failures.len == 0 and state == 6
+doAssert deletions == 0 and stations[0].valid == 1 and bssCalls == 0
+doAssert mm_sta_add_cfm_handler(newReply) == 0 and bssCalls == 1
+release(newReply)
+doAssert failures.len == 0
 finishExchange()
 ''',
     "interrupt_state": r'''
@@ -463,39 +347,19 @@ def test_registration_exchange(tmp_path: Path, mode: str, case: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
 
 
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_main_loop_services_lost_registration(tmp_path: Path, mode: str) -> None:
-    code = source() + r'''
-proc wifiEventPendingWork(): bool = false
-proc wifiKernelTimerPendingWork(): bool = false
-proc wifiMmTimerPendingWork(): bool = false
-proc wifiMessagePendingWork(): bool = false
-proc wifiResetEventPending(): bool = false
-proc smBssNeedsService(): bool = false
-proc smCleanupNeedsService(): bool = false
-proc smActivationNeedsService(): bool = false
-proc smBssService() = discard
-proc smCleanupService() = discard
-proc smActivationService() = discard
-proc wifiDispatchScheduledEvent(): bool = false
-'''
-    runtime = (FW / "task_init_main.nim").read_text()
-    code += procedure(runtime, "wifiMainHasPendingWork") + procedure(runtime, "wifiDrainScheduledWork")
-    run_program(tmp_path, mode, code + r'''
-resetExchange()
-release(issue())
-doAssert wifiMainHasPendingWork()
-doAssert wifiDrainScheduledWork()
-doAssert not wifiMainHasPendingWork()
-doAssert failures == @[(15'u16, 0xFFFF'u16)]
-finishExchange()
-''')
-
-
-def test_registration_message_release_hooks() -> None:
+def test_registration_answer_replaces_the_loss_machinery() -> None:
+    """MM answers SM's request in place and checks SM only at handler
+    entry; nothing forgets, records or services a lost registration."""
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     sender = procedure(kernel, "ke_msg_send")
-    assert "smRegistrationForget(param)" in procedure(kernel, "ke_msg_free")
-    # A message delivered to the host is retired by ke_msg_free, which forgets it.
+    # A message delivered to the host is retired by ke_msg_free.
     assert "ke_msg_free(hdr)" in sender.split("bl_rx_e2a_handler(", 1)[1]
-    assert "smRegistrationAdmitRequest(param)" in procedure(kernel, "mm_sta_add")
+    assert "smRegistration" not in procedure(kernel, "ke_msg_free")
+    assert "smRegistration" not in procedure(kernel, "mm_sta_add")
+    handler = procedure((FW / "task_handlers.nim").read_text(), "mm_sta_add_req_handler")
+    assert "requester == TASK_SM and not smAwaits(param)" in handler
+    assert "smStaAddAnswer(param, status, staIdx, hwStaIdx)" in handler
+    sources = "".join(path.read_text() for path in FW.rglob("*.nim"))
+    for gone in ["smRegistrationForget", "smRegistrationNeedsService", "smRegistrationService",
+                 "smRegistrationTags", "smRegistrationLoss", "smRegistrationChannels"]:
+        assert gone not in sources, gone

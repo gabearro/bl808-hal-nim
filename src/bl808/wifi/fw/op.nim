@@ -11,7 +11,8 @@
 #
 # Requests and the replies reserved for them need no stamp: the machine
 # holds their pointers while the Op is live, and every replier answers with
-# the reserved reply, so a live operation always receives its completion.
+# the reserved reply (which may be the request itself, answered in place),
+# so a live operation always receives its completion.
 # Loss is never signalled.
 
 type Op = object

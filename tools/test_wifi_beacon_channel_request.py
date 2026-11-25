@@ -342,7 +342,7 @@ proc ke_evt_set(bits: uint32) =
 '''
     for name in ("mmTimCaptureMessage", "smAbortCaptureMessage", "chanUpdateCaptureMessage",
                  "mmTimForget", "mmConnLossForget", "rxMgtForget", "smCleanupForget", "smBssForget",
-                 "smActivationForget", "smScanForget", "smRegistrationForget",
+                 "smActivationForget",
                  "chanUpdateForget", "smRspTimerForget",
                  "smDeferredForget", "smAbortForget", "chanBcnRequestForget"):
         support += f"proc {name}(p: pointer) = discard\n"

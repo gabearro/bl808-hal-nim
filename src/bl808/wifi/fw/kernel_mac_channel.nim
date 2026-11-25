@@ -788,8 +788,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   smCleanupForget(param)
   smBssForget(param)
   smActivationForget(param)
-  smScanForget(param)
-  smRegistrationForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
   smDeferredForget(param)
@@ -3265,7 +3263,6 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   hwStaIdxOut[] = 0xFF
   let saved = irqSave()
   defer: irqRestore(saved)
-  if not smRegistrationAdmitRequest(param): return 1
   var request = mmStaAddReqView(param)[]
   let instNbr = request.vifIdx
   if instNbr >= MAX_VIFS.uint8:
@@ -3290,7 +3287,6 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   var keys: MmStaKeyPlan
   if not mmPrepareStaKeys(vif, request.quickConn, keys):
     return 1
-  if not smRegistrationAdmitRequest(param): return 1
 
   inc nimFwDbgPreauthStaAddEntry
   nimFwDbgPreauthStaAddMeta = instNbr.uint32 or (vif.staIdx.uint32 shl 8) or
@@ -3305,7 +3301,6 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   let stationEpoch = stationEpochs[staIdx.int]
   template current(): bool =
     mmStaAddCurrent(instNbr, vifEpoch, staIdx, stationEpoch) and
-      smRegistrationAdmitRequest(param) and
       (not keys.boundToConnection or smEnvView().connectInfo == keys.connection)
   template abortOwned(): uint8 =
     if mmStaAddCurrent(instNbr, vifEpoch, staIdx, stationEpoch):

@@ -53,8 +53,7 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
 proc smReqVifIdxOrZero(p: pointer): uint8 =
   if p == nil: 0'u8 else: cast[ptr uint8](p)[]
 proc scanuLowerCurrent(request: pointer): bool = request != nil and request == lowerExchange
-proc smScanOwnsRequest(request: pointer): bool = smOwnsUpper and request == addr upperScan
-proc smScanAdmitRequest(request: pointer): bool = smScanOwnsRequest(request)
+proc smAwaits(request: pointer): bool = smOwnsUpper and request == addr upperScan
 proc scan_terminate_channel_request() = inc scanTerminations
 proc scanu_cached_scanresult_clear() = inc cacheClears
 proc sm_connect_abort_deauth_cfm() = discard

@@ -17,6 +17,7 @@ FW = ROOT / "src/bl808/wifi/fw"
 def platform_source() -> str:
     source = BUILDER_PLATFORM.replace("type\n", """type
   Header = object
+    id: uint16
     srcId: uint8
     paramLen: uint32
   CachedEntry = object
@@ -39,6 +40,7 @@ const
   KeMsgConsumed = 0.cint
   KeMsgNoFree = 1.cint
   SCAN_STATUS_BUSY = 8'u8
+  TASK_SM = 4'u8
   SCANU_START_CFM = 0x801'u16
   StatusCfmPayloadSize = 1'u32
   SCAN_DONE_IND = 0x402'u16
@@ -61,11 +63,10 @@ var
   requestSnapshot: ScanuStartReqPayload
   childSnapshot: ScanStartReqPayload
   ieSnapshot: array[200, uint8]
-proc smScanCompleteCancelledStart(p: pointer): bool = false
 proc observe(point: string)
 proc statusCfmView(p: pointer): ptr tuple[status: uint8] =
   cast[ptr tuple[status: uint8]](p)
-proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dest, src: uint8) =
+proc scanuAnswer(p: pointer; id: uint16; dest, status: uint8) =
   doAssert false, "producer test unexpectedly rejected its scan as busy"
 proc scanProbeReqIeDataPtr""", 1)
     replacements = {
