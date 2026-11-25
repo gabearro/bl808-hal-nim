@@ -147,14 +147,8 @@ var
   # COMMON symbol; chan_env itself holds lists, timers, callbacks, and state.
   chan_env* {.exportc.}: array[33, uint32]  # 132 bytes = 33 words
   mmRssiReportUs {.wifiCtrl.}: uint32  # Vendor mm.o:.bss.last_us, not part of chan_env.
-  chanCtxtCount*: uint8
-  chanCtxtFlags*: uint8
-  chanCurrentCtxt*: pointer
-  chanPendingCtxt*: pointer
   chanConflictCount*: uint32
   chanSlotConfigCycles: uint8  # Vendor config_lasting_cycle.1, separate from flags.
-  chanConflictDetected*: bool
-  chanScanPending*: bool
   cde_evt_tmr_msg* {.exportc.}: uint8
   sm_reconn_dominant_flag* {.exportc.}: uint32
 

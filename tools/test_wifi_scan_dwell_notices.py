@@ -208,9 +208,7 @@ type ChanEnvView = object
   freeList, tbttSwitchCallback, cdeCallback, cdeArg, ctxtOpCallback, connLessDelayCallback: pointer
 var env: ChanEnvView
 var chanCtxtLinkEpochs: array[MAX_VIFS, uint32]
-var chanCtxtCount, chanCtxtFlags, chanConflictCount, chanSlotConfigCycles, cde_evt_tmr_msg: uint8
-var chanCurrentCtxt, chanPendingCtxt: pointer
-var chanConflictDetected, chanScanPending: bool
+var chanConflictCount, chanSlotConfigCycles, cde_evt_tmr_msg: uint8
 proc chanEnvView(): ptr ChanEnvView = addr env
 proc chanCtxtAt(p: uint): ptr ChanCtxtView = cast[ptr ChanCtxtView](p)
 proc chanCtxtHdr(ctxt: ptr ChanCtxtView): pointer = ctxt

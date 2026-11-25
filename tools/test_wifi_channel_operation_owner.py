@@ -36,10 +36,9 @@ var
   ps: tuple[statusFlags: uint32]
   txResetEpoch: uint32
   interrupts, incomingIrq: bool
-  chanScanPending: bool
   nimFwDbgChanScanChanMeta, nimFwDbgChanScanChanFreq: uint32
   actions: seq[string]
-  onPower, onNotify, onRetire, onClock, onForce, onCancel: proc()
+  onPower, onNotify, onRetire, onClock, onForce: proc()
   onTrace: proc()
   traceCalls: int
 proc irqSave(): uint32 =
@@ -59,7 +58,6 @@ proc chan_switch_start(p: pointer) =
   doAssert interrupts == incomingIrq
   actions.add("switch")
 proc chan_goto_idle_cb() = actions.add("goto")
-proc chanProtectionCancel(p: pointer): pointer = nil
 proc chan_get_dominant_chan(): pointer = env.dominantCtxt
 proc chan_get_next_chan(): pointer = addr contexts[1]
 proc blmac_pwr_mgt_setf(value: uint32) =
@@ -79,7 +77,6 @@ proc scanDwellPublish(id: uint16; slot: uint32) =
 proc chanSwitchRetire(p: pointer) =
   doAssert interrupts == incomingIrq
   actions.add("retire")
-  if env.scheduledCtxt == p: env.scheduledCtxt = nil
   invoke(onRetire)
 proc chan_conn_less_delay_prog() = actions.add("delay")
 proc chan_cde_evt(p: pointer) = actions.add("cde")
@@ -97,9 +94,6 @@ proc mmRemainOnChannelReqView(p: pointer): ptr MmRemainOnChannelReqPayload =
   cast[ptr MmRemainOnChannelReqPayload](p)
 template chanRocOverlay(): ptr ChanRocOverlay = addr roc
 template chanScanPoolOverlay(): ptr ChanScanPoolOverlay = addr scan
-proc chanSwitchCancel(p: pointer) =
-  actions.add("cancel")
-  invoke(onCancel)
 proc chanCtxtOpTimer(): pointer = nil
 proc mm_timer_clear(p: pointer) = discard
 proc assert_err(a, b: cstring; line: cint) = doAssert false
@@ -138,10 +132,8 @@ proc setup(index = 4; irq = true) =
   onRetire = nil
   onClock = nil
   onForce = nil
-  onCancel = nil
   onTrace = nil
   traceCalls = 0
-  chanScanPending = false
 '''
 
 

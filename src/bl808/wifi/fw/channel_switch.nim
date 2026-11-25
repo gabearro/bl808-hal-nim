@@ -1,9 +1,10 @@
 # One channel switch at a time, as in chan.o. chan_switch_start begins it and
 # chanSwitchFinish is its only end: chan_pre_switch_channel finishes it on
-# arrival, and every abandonment (retired destination, lost request) finishes
-# it too. A context is identified by its slot and chanCtxtEpochs[slot]; a
-# retired context ends its switch here, at retirement, so the callbacks below
-# need no other notion of identity.
+# arrival, and an abandonment (no context left to go to, lost request)
+# finishes it too. A context is identified by its slot and
+# chanCtxtEpochs[slot]. A switch to a context that leaves the pool is
+# redirected here, at retirement, as chan.o chan_ctxt_unlink does, so the
+# callbacks below need no other notion of identity.
 #
 # The switch's MM_FORCE_IDLE_REQ is a static kernel message that is never
 # freed. While it is queued or saved, a new switch reuses it instead of
@@ -79,7 +80,8 @@ proc chanSwitchFinish(arrived: bool) =
   ## The only end of a switch. On arrival chan_pre_switch_channel has already
   ## made the destination current. Otherwise the switch is abandoned: the
   ## destination goes back to waiting, an unentered scan/ROC dwell goes back
-  ## to its gate, MM leaves HW_ACTIVE and the PM bit set for the protection
+  ## to its gate, the departure-timeout flag (0x20) is cleared as arrival
+  ## clears it, MM leaves HW_ACTIVE and the PM bit set for the protection
   ## frames is cleared again on the context that stays current.
   let saved = irqSave()
   defer: irqRestore(saved)
@@ -93,6 +95,7 @@ proc chanSwitchFinish(arrived: bool) =
   env.connlessDelayCount = 0
   if arrived: return
   env.switchPending = 0
+  env.flags = env.flags and not 0x20'u8   # its departure deadline, if it passed
   let destination = env.scheduledCtxt
   env.scheduledCtxt = nil
   if destination != nil:
@@ -107,14 +110,28 @@ proc chanSwitchFinish(arrived: bool) =
       (ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0):
     blmac_pwr_mgt_setf(0)
 
+proc chanSwitchRedirect() =
+  ## The destination leaves the pool. As in chan.o chan_ctxt_unlink, the
+  ## switch goes on to another operating context: CDE picks it when several
+  ## remain, the only one is taken when one remains. With none left, or none
+  ## picked, the switch is abandoned.
+  let env = chanEnvView()
+  let gone = env.scheduledCtxt
+  if env.ctxtCount > 1:
+    var event = 1'u8
+    chan_cde_evt(addr event)
+  elif env.ctxtCount == 1:
+    env.scheduledCtxt = cast[pointer](env.activeList.first)
+  if env.scheduledCtxt in [gone, nil]: chanSwitchFinish(arrived = false)
+
 proc chanSwitchRetire(target: pointer) =
-  ## A context leaves the pool. A switch away from it carries on (vendor);
-  ## a switch to it is abandoned.
+  ## A context leaves the pool. A switch away from it carries on and a switch
+  ## to it is redirected (vendor).
   let saved = irqSave()
   defer: irqRestore(saved)
   let env = chanEnvView()
   if env.currentCtxt == target: env.currentCtxt = nil
-  if target != nil and env.scheduledCtxt == target: chanSwitchFinish(arrived = false)
+  if target != nil and env.scheduledCtxt == target: chanSwitchRedirect()
 
 proc chanSwitchReset() =
   ## Kernel and channel (re)initialisation: drop the switch and its request.

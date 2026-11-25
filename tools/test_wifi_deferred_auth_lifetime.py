@@ -145,7 +145,6 @@ proc ke_state_get(task: uint8): uint16 = currentState
 proc ke_state_set(task: uint8; state: uint16) =
   currentState = state
   invoke(stateHook)
-proc chanSwitchCallbackCurrent(): bool = true # The fixture activates a current switch.
 proc chan_ctxt_cnt(): uint8 = channelCount
 proc chan_ctxt_use_dominant_chan(): bool = dominant
 proc chan_ctxt_get_remaining_time_ms(vif: pointer): uint32 =

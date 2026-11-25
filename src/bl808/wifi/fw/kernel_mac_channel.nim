@@ -2799,12 +2799,13 @@ proc mm_env_max_ampdu_duration_set*(duration: uint32) {.exportc, cdecl.} =
   mm.edcaBcnDur = dVO
 
 proc mmEdcaOwner(): ptr VifChannelView =
-  ## The four registers belong to the current operating context, not a VIF.
+  ## The four registers belong to the current operating context, not a VIF,
+  ## while no switch is under way. Its status does not matter: after a lone
+  ## context's operation timer it is 1 (chan.o chan_ctxt_op_evt), still tuned.
   let env = chanEnvView()
   let current = env.currentCtxt
   if current == nil or env.scheduledCtxt != nil or
-      chanCtxtAt(current).contextIndexOrMarker > 2 or
-      chanCtxtAt(current).status notin {4'u8, 5'u8}:
+      chanCtxtAt(current).contextIndexOrMarker > 2:
     return nil
   var link = cast[pointer](vifMgmtEnvView().activeList.first)
   while link != nil:
@@ -5712,15 +5713,9 @@ proc chan_init*() {.exportc, cdecl.} =
   env.cdeArg = addr cde_evt_tmr_msg
   env.ctxtOpCallback = cast[pointer](chan_ctxt_op_evt)
   env.connLessDelayCallback = cast[pointer](chan_conn_less_delay_evt)
-  # Reset convenience state variables
-  chanCtxtCount = 0
-  chanCtxtFlags = 0
-  chanCurrentCtxt = nil
-  chanPendingCtxt = nil
+  # Vendor .bss counters outside chan_env.
   chanConflictCount = 0
   chanSlotConfigCycles = 0
-  chanConflictDetected = false
-  chanScanPending = false
   smDeferredCancel()
 
 proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
@@ -5759,7 +5754,9 @@ proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cde
 proc chan_ctxt_del*(ctxtIdx: uint8) {.exportc, cdecl.} =
   ## Delete a channel context (58 instrs in blob).
   ## Validates context is in use (offset 23 != 0xFF) and has no linked VIFs
-  ## (offset 24 == 0). Retires switch use before returning the cleared slot.
+  ## (offset 24 == 0). Port: a switch to the context is redirected (or, with
+  ## no context left, abandoned) before the cleared slot is returned; the blob
+  ## leaves chan_env+36 pointing at the freed slot.
   let saved = irqSave()
   defer: irqRestore(saved)
   if ctxtIdx >= MAX_CHAN_CTXT.uint8:
@@ -5775,7 +5772,7 @@ proc chan_ctxt_del*(ctxtIdx: uint8) {.exportc, cdecl.} =
   if ctxt.linkCount != 0:
     assert_err("chan.c", "chan.c", 0xAD2)
     return
-  # Hide the slot before cancellation can release a queued request.
+  # Hide the slot before the switch is redirected away from it.
   inc chanCtxtEpochs[ctxtIdx]
   let retiredEpoch = chanCtxtEpochs[ctxtIdx]
   ctxt.markInvalid()
@@ -5885,12 +5882,9 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
           ctxt.status = 4
           mm_timer_clear(chanCtxtOpTimer())
           chan_ctxt_op_evt(chanCtxtPtr)
-      elif schedCtxt == chanCtxtPtr:
-        if ctxtCount > 1:
-          var event = 1'u8
-          chan_cde_evt(addr event)
-        elif ctxtCount == 1:
-          env.scheduledCtxt = cast[pointer](env.activeList.first)
+      # The blob re-points a switch to this context here (count > 1: CDE
+      # event 1; count == 1: the remaining context). chan_ctxt_del below does
+      # it for every retirement (chanSwitchRetire -> chanSwitchRedirect).
       ctxt.status = 0
   # Check link count for deletion (both scan-linked and non-scan-linked paths)
   if ctxt.linkCount == 0:
@@ -6170,7 +6164,6 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
     outside:
       nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req flags ", chanFlags.uint32, env.flags.uint32)
     if not current(): return
-    chanScanPending = true
     when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.slot_admitted
     outside: chan_conn_less_delay_prog()
     return
@@ -6886,8 +6879,9 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
     env.flags = env.flags and not 0x08'u8
     outside: scanDwellPublish(MM_SCAN_CHANNEL_END_IND, allocation)
     if not current(): return
-  if expectedScheduled == ctxtPtr: expectedScheduled = nil
+  # A switch to the slot (none is expected while it is current) is redirected.
   outside: chanSwitchRetire(ctxtPtr)
+  expectedScheduled = env.scheduledCtxt
   if not current(): return
   ctxt.contextIndexOrMarker = 0xFF
   inc chanCtxtEpochs[index]

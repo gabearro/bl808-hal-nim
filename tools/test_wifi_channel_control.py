@@ -51,11 +51,8 @@ var
   deleted: array[5, bool]
   chan_env: array[256, uint8]
   chan_ctxt_pool: array[5, ChanCtxtView]
-  chanCtxtCount, chanCtxtFlags: uint8
-  chanCurrentCtxt, chanPendingCtxt: pointer
   chanConflictCount, chanEnvTimerTarget: uint32
   chanSlotConfigCycles: uint8
-  chanConflictDetected, chanScanPending: bool
   cde_evt_tmr_msg: uint8
   sm_reconn_dominant_flag: uint32
 const
@@ -190,8 +187,8 @@ for count in 1'u8 .. 3:
             if schedule == 0 and current == 1:
               expected.add(("clear", 76'u))
               expected.add(("op", cast[uint](retiring)))
-            elif schedule == 1 and remaining > 1:
-              expected.add(("cde", 1'u))
+            # A switch to the context is redirected by chan_ctxt_del
+            # (chanSwitchRetire), which this fixture stubs.
             expected.add(("delete", 0'u))
           expected.add(("tbtt", 0'u))
           expected.add(("power", cast[uint](retiring)))
@@ -203,8 +200,8 @@ for count in 1'u8 .. 3:
             doAssert env.dominantCtxt == (if dominant: nil else: addr contexts[2])
           else:
             doAssert env.cdeStarted == 1 and env.schedState == 1
-          if last and schedule == 1 and remaining == 1:
-            doAssert env.scheduledCtxt == addr contexts[1]
+          if schedule == 1:
+            doAssert env.scheduledCtxt == retiring
 
 for links in 1'u8 .. 2:
   reset()
@@ -369,7 +366,6 @@ for flag in [0'u32, 1, 0xFFFFFFFF'u32]:
     reset()
     sm_reconn_dominant_flag = flag
     env.dominantCtxt = dominant
-    chanCurrentCtxt = cast[pointer](addr contexts[4])
     doAssert chan_get_dominant_chan() == (if flag == 0: nil else: dominant)
 """
     run_nim(tmp_path, PLATFORM
@@ -389,7 +385,6 @@ proc irqRestore(mask: uint32) =
   events.add(("unlock", 0'u))
 proc blmac_pwr_mgt_setf(value: uint32) = events.add(("pm", value.uint))
 proc chan_goto_idle_cb() = events.add(("goto-idle", 0'u))
-proc chanProtectionCancel(p: pointer): pointer = nil
 proc chan_conn_less_delay_prog() = events.add(("delay", 0'u))
 const MM_SCAN_CHANNEL_END_IND = 77'u16
 proc scanDwellPublish(id: uint16; slot: uint32) =

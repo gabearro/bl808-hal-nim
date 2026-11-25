@@ -10,9 +10,10 @@ drive MM idle after each sequence, and chanCtxtOpEvent.
 
 The audit's defects are now fixed and the tests pass:
 
-MMCHAN-1  Unlinking the switch destination redirects the in-flight switch to
+MMCHAN-1  Retiring the switch destination redirects the in-flight switch to
           the remaining context (vendor chan_ctxt_unlink) instead of
-          orphaning scheduledCtxt.
+          orphaning scheduledCtxt; chan_ctxt_del of a destination does the
+          same.
 MMCHAN-2  Unlinking the departing (source) context while its PM null is
           pending no longer cancels the switch; the destination is entered.
 MMCHAN-3  Every end of a switch leaves MM out of HW_ACTIVE (hardening: the
@@ -23,6 +24,8 @@ MMCH-S1   A full MAC recovery during the protection wait completes the
           departure after the reset instead of cancelling it.
 MMCH-S2   In-place TPC/bandwidth edits of the source or destination do not
           cancel a committed departure: a context is its slot and epoch.
+MMCH-S6   The only operating context keeps the EDCA bank after its operation
+          timer leaves it at status 1.
 """
 
 from pathlib import Path
@@ -122,8 +125,10 @@ proc stageSwitch(target: pointer; phase: int) =
     doAssert mmState == MM_ACTIVE_STATE
 
 proc recoverMac() =
-  ## bl_reset_evt: txl_reset's drain retires every frame with 0x40000000,
-  ## then mm_reset reactivates an active MM and reschedules its saved work.
+  ## bl_reset_evt: hal_machw_reset leaves the MAC idle, txl_reset's drain
+  ## retires every frame with 0x40000000, then mm_reset reactivates an active
+  ## MM and reschedules its saved work.
+  macState = 0
   inc txResetEpoch
   txResetActive = true
   while delivered < frames.len:
@@ -222,8 +227,10 @@ if cause == 3:
   onIdle = retireTarget              # injected into the final confirmation's forced idle
   completeFrame(0)
 doAssert channelEnv.scheduledCtxt == nil and chanSw.phase == swNone
-# A retired source does not stop the switch (vendor); a retired target ends it.
-doAssert tuned == (if cause == 2: @[target] else: @[])
+# A retired source does not stop the switch (vendor). A retired target
+# redirects it to the remaining context (cause 3: the source) or, with none
+# left, ends it.
+doAssert tuned == (if cause == 2: @[target] elif cause == 3: @[source] else: @[])
 doAssert mmState != HW_ACTIVE, "switch ended while MM is host-bypassed"
 doAssert hostIdle(), "MM_SET_IDLE_REQ can no longer complete"
 finishSwitch()
@@ -300,6 +307,28 @@ doAssert channelEnv.currentCtxt == away and tuned == @[away] and idleSwitch()
 doAssert mmState == MM_ACTIVE_STATE
 finishSwitch()
 ''')
+
+
+def test_surviving_context_keeps_edca_after_its_operation_timer(tmp_path: Path) -> None:
+    """MMCH-S6: the AP stops, then the STA context's operation timer fires.
+
+    With one context left chanCtxtOpEvent sets the current context to status 1
+    and chan_switch_start(itself) does nothing (vendor). The STA still owns
+    the EDCA bank: MM_SET_EDCA_REQ and WMM refreshes must reach the hardware.
+    """
+    owner = "type VifChannelView = Vif\n" + procedure(KERNEL, "mmEdcaOwner")
+    run_program(tmp_path, "checked", source() + owner + "\nblock:\n" + indent(r'''
+let (home, away) = twoChannels()
+doAssert mmEdcaOwner() == addr vifs[0]
+chanCtxtAt(home).status = 4          # its operation timer runs while two contexts operate
+chan_ctxt_unlink(1)                  # the AP stops: neither current nor scheduled
+doAssert channelEnv.ctxtCount == 1 and channelEnv.scheduledCtxt == nil
+chanCtxtOpEvent(home, 0)             # the operation timer fires
+doAssert chanCtxtAt(home).status == 1 and channelEnv.currentCtxt == home
+doAssert channelEnv.scheduledCtxt == nil and not requestLinked()
+doAssert mmEdcaOwner() == addr vifs[0], "EDCA updates suppressed on the only operating context"
+finishSwitch()
+''', "  "))
 
 
 def test_definition_edit_then_abandoned_idle_wait_restores_mm(tmp_path: Path) -> None:

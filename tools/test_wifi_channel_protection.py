@@ -235,6 +235,6 @@ finishSwitch()
 
 
 @pytest.mark.parametrize("case", CASES)
-@pytest.mark.parametrize("mode", ["checked", "asan"])
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_protection_completion(tmp_path: Path, case: str, mode: str) -> None:
     run_case(tmp_path, CASES[case], mode, SETUP)

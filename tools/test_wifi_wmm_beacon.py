@@ -266,14 +266,13 @@ channel.scheduledCtxt = addr contexts[1]
 mmReplayEdca()
 doAssert bank == initial and refreshes == 2
 channel.scheduledCtxt = nil
-contexts[0].status = 6
-mmReplayEdca()
-doAssert bank == initial and refreshes == 2
-contexts[0].status = 5
 vifs[1].chanCtxt = addr contexts[0]
 mmReplayEdca() # A shared context cannot program a STA-only profile.
 doAssert bank == initial and refreshes == 2
 vifs[1].chanCtxt = addr contexts[1]
+# The context's status does not matter: a lone context is left at status 1
+# by its operation timer and still owns the bank (MMCH-S6).
+contexts[0].status = 1
 mmReplayEdca()
 doAssert bank == other and refreshes == 3
 channel.currentCtxt = addr contexts[1]

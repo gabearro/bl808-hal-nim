@@ -75,7 +75,6 @@ var
   onAssert: proc()
   clockValue, clockReads: uint32
   sm_reconn_dominant_flag: uint32
-  chanScanPending: bool
   nimFwDbgChanScanChanMeta, nimFwDbgChanScanChanFreq: uint32
 proc chanEnvView(): ptr Environment = addr env
 proc irqSave(): uint32 = 0
@@ -96,7 +95,6 @@ proc chan_tbtt_schedule(p: pointer) = actions.add("tbtt")
 proc chan_cde_evt(p: pointer) = actions.add("cde")
 proc chan_ctxt_op_evt(p: pointer) = actions.add("op")
 proc chan_ctxt_del(index: uint8) = actions.add("delete")
-proc chanSwitchCancel(p: pointer) = actions.add("cancel")
 proc chan_conn_less_delay_prog() = actions.add("delay")
 proc chan_switch_start(p: pointer) =
   actions.add(if p == (addr contexts[4]): "roc" else: "scan")
@@ -129,7 +127,6 @@ proc setup() =
   clockReads = 0
   clockValue = 1000
   sm_reconn_dominant_flag = 0
-  chanScanPending = false
 '''
 
 
@@ -263,11 +260,11 @@ for slot in 0'u8 .. 4'u8:
   scan.slot = slot
   scan.durationTicks = 987
   scan.requestVifIdx = 1
-  let state = (env, contexts, scan, chanScanPending)
+  let state = (env, contexts, scan)
   var request = ChanScanReqPayload(vifIdx: 0, duration: 8192, prim20Freq: 2437)
   chan_scan_req(addr request)
   doAssert assertions == @[0x9E5.cint] and actions.len == 0
-  doAssert (env, contexts, scan, chanScanPending) == state
+  doAssert (env, contexts, scan) == state
 ''',
     "scan_valid": r'''
 setup()
@@ -278,7 +275,7 @@ chan_scan_req(addr request)
 doAssert assertions.len == 0 and actions == @["delay"] # slot 3 was free: no switch to cancel
 doAssert scan.slot == 3 and scan.vifIdx == 255 and scan.requestVifIdx == 1
 doAssert scan.durationTicks == 8 and scan.active == 1 and scan.channel.primFreq == 2437
-doAssert scan.channel.txPower == 17 and env.flags == 2 and chanScanPending
+doAssert scan.channel.txPower == 17 and env.flags == 2
 doAssert request == original
 actions.setLen(0)
 request.reqType = 1

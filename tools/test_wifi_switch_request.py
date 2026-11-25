@@ -97,10 +97,11 @@ var
   frames: seq[Frame]
   tuned: seq[pointer]
   notices, wakes: seq[uint16]
+  cdeEvents: seq[uint8]
   nullResult, ctsResult: uint8
   synchronous, forceFailed: bool
   gates, forced, asserts, idleRequests, heapFrees, opClears: int
-  onIdle, onDrain, onMmState, onSend, onFrame, onStatus, onRx, onActive: proc()
+  onIdle, onDrain, onMmState, onSend, onFrame, onStatus, onRx, onActive, onCde: proc()
   nimFwDbgChanPreChanMeta, nimFwDbgChanPreChanFreq: uint32
 proc invoke(hook: proc()) =
   if hook != nil: hook()
@@ -138,7 +139,9 @@ proc chan_ctxt_trigger(ctxt: pointer) = discard
 proc chan_update_tx_power(ctxt: pointer) = discard
 proc chan_tbtt_schedule(entry: pointer) = discard
 proc smDeferredChannelUnlinked(vif: uint8) = discard
-proc chan_cde_evt(param: pointer) = discard
+proc chan_cde_evt(param: pointer) =
+  cdeEvents.add(cast[ptr uint8](param)[])
+  invoke(onCde)
 proc chan_ctxt_op_evt(ctxt: pointer) = channelEnv.currentCtxt = nil
 proc mmConfigCancelIdle() = discard
 proc hal_machw_idle_req() = inc idleRequests
@@ -320,6 +323,7 @@ proc resetSwitch() =
   tuned.setLen(0)
   notices.setLen(0)
   wakes.setLen(0)
+  cdeEvents.setLen(0)
   nullResult = 0
   ctsResult = 0
   synchronous = false
@@ -339,6 +343,7 @@ proc resetSwitch() =
   onStatus = nil
   onRx = nil
   onActive = nil
+  onCde = nil
 proc newTarget(freq = 2412'u16): pointer =
   var definition = ChanCtxtDefView(primFreq: freq, centerFreq1: freq)
   var index: uint8
@@ -446,15 +451,14 @@ finishSwitch()
 for hostIdle in [false, true]:
   for retireWhileSaved in [false, true]:
     resetSwitch()
-    let home = newTarget(2412)
-    linkHome(home, VIF_TYPE_STA)
+    let home = newTarget(2412)       # current but not linked: no operating context
     let away = newTarget(2437)
     operate(home)
     mm.idleFlag = hostIdle.uint8
     chan_switch_start(away)
     if retireWhileSaved:
       doAssert dispatch() and mmState == MM_GOING_TO_IDLE
-    chan_ctxt_del(slot(away))
+    chan_ctxt_del(slot(away))          # nowhere to redirect to: abandoned
     doAssert idleSwitch() and channelEnv.currentCtxt == home
     # The request stays queued; MM hands itself back when it runs.
     doAssert requestLinked()
@@ -466,7 +470,6 @@ for hostIdle in [false, true]:
     "new_switch_reuses_queued_request": r'''
 resetSwitch()
 let home = newTarget(2412)
-linkHome(home, VIF_TYPE_STA)
 let away = newTarget(2437)
 let other = newTarget(2462)
 operate(home)
@@ -588,11 +591,83 @@ settle()
 doAssert channelEnv.currentCtxt == home and idleSwitch() and mmState == MM_ACTIVE_STATE
 finishSwitch()
 ''',
+    "deleted_destination_redirects_to_remaining": r'''
+for phase in 0 .. 2:                 # queued, saved, protection wait
+  resetSwitch()
+  let home = newTarget(2412)
+  linkHome(home, VIF_TYPE_STA)
+  activateVifs(1)
+  let away = newTarget(2437)         # never linked: chan_ctxt_del retires it directly
+  operate(home)
+  chan_switch_start(away)
+  case phase
+  of 1: doAssert dispatch() and mmState == MM_GOING_TO_IDLE
+  of 2:
+    settle()
+    doAssert frames.len == 1 and chanSw.phase == swProtecting and (pmRegister and 4) != 0
+  else: discard
+  chan_ctxt_del(slot(away))
+  # Vendor chan_ctxt_unlink: one operating context left, the switch goes there.
+  doAssert channelEnv.scheduledCtxt == home and chanSw.phase != swNone
+  doAssert cdeEvents.len == 0
+  settle()
+  for index in 0 ..< frames.len: completeFrame(index)
+  settle()
+  doAssert tuned == @[home] and channelEnv.currentCtxt == home and idleSwitch()
+  doAssert mmState == MM_ACTIVE_STATE and (pmRegister and 4) == 0 and wakes == @[0'u16]
+  finishSwitch()
+''',
+    "abandoned_switch_clears_departure_timeout": r'''
+resetSwitch()
+let home = newTarget(2412)
+let away = newTarget(2437)
+operate(home)                        # current but not linked: nowhere to redirect to
+chan_switch_start(away)
+channelEnv.flags = channelEnv.flags or 0x20   # its departure deadline passed
+chan_ctxt_del(slot(away))
+doAssert idleSwitch() and (channelEnv.flags and 0x20) == 0
+# The next departure from an operating channel is protected again.
+linkHome(home, VIF_TYPE_STA)
+activateVifs(1)
+let next = newTarget(2462)
+chan_switch_start(next)
+settle()
+doAssert frames.len == 1 and chanSw.phase == swProtecting
+completeFrame(0)
+doAssert tuned == @[next] and idleSwitch()
+finishSwitch()
+''',
+    "deleted_destination_follows_cde": r'''
+for picked in [true, false]:
+  resetSwitch()
+  let home = newTarget(2412)
+  let other = newTarget(2462)
+  let away = newTarget(2437)
+  operate(home)
+  channelEnv.ctxtCount = 2           # two operating contexts remain
+  if picked:
+    onCde = proc() = channelEnv.scheduledCtxt = other
+  chan_switch_start(away)
+  chan_ctxt_del(slot(away))
+  doAssert cdeEvents == @[1'u8]
+  if picked:
+    # CDE event 1 chose the next context; the switch goes on there.
+    doAssert channelEnv.scheduledCtxt == other and chanSw.phase == swQueued
+    settle()
+    doAssert tuned == @[other] and channelEnv.currentCtxt == other and idleSwitch()
+  else:
+    # CDE chose nothing (it returns while a scan or ROC dwell is claimed).
+    doAssert idleSwitch() and chanCtxtAt(home).status == 5
+    settle()
+    doAssert tuned.len == 0
+  doAssert mmState == MM_ACTIVE_STATE
+  finishSwitch()
+''',
 }
 
 
 @pytest.mark.parametrize("case", CASES)
-@pytest.mark.parametrize("mode", ["checked", "asan"])
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_switch_request_lifetime(tmp_path: Path, case: str, mode: str) -> None:
     run_case(tmp_path, CASES[case], mode)
 

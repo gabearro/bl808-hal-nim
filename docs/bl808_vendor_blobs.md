@@ -7076,9 +7076,9 @@ none of this was flashed.
 (`channel_switch.nim`) is its only end: `chan_pre_switch_channel` calls it
 when it publishes the target, and every abandonment calls it too. A
 context is identified by its slot and `chanCtxtEpochs[slot]`; a retired
-context ends a switch to it at `chan_ctxt_del`, so the callbacks carry no
-other identity. This fixes audit items MMCHAN-1 to MMCHAN-4, MMCH-S1,
-MMCH-S2 and SCAN-N1. Differences from the archive:
+context redirects a switch to it at `chan_ctxt_del`, so the callbacks carry
+no other identity. This fixes audit items MMCHAN-1 to MMCHAN-4, MMCH-S1,
+MMCH-S2, MMCH-S6 and SCAN-N1. Differences from the archive:
 
 - The switch's `MM_FORCE_IDLE_REQ` is one static message, never freed:
   `mm_force_idle_req_handler` returns `KeMsgNoFree` for it and `ke_msg_free`
@@ -7107,14 +7107,29 @@ MMCH-S2 and SCAN-N1. Differences from the archive:
   posted. A MAC that is not idle in MM_IDLE still hits the 1013 assert, but
   the request stays saved instead of being dropped; `bl_reset_evt`
   reschedules MM's saved messages.
-- An abandoned switch (its destination retired with no context left, or
-  its message dropped) puts the destination back to status 1, clears the
-  operation timer, clears the PM bit that its protection set, and leaves
-  `HW_ACTIVE`. A scan or ROC dwell that was never entered goes from 0x08
-  back to 0x02 (0x04 to 0x01) and the connectionless gate is armed again,
-  so TASK_SCAN, waiting in state 2 for START, gets its dwell later. No END
-  is posted for a dwell that was never entered. The blob never abandons a
-  switch.
+- Retiring the destination redirects the switch with the rule of pinned
+  `chan_ctxt_unlink+0xb4..0x144`: with more than one operating context
+  left, CDE event 1 picks the next one; with one left, the switch goes to
+  it, even when it is the current context; with none left, the switch is
+  abandoned. The port applies the rule in `chan_ctxt_del`
+  (`chanSwitchRetire` -> `chanSwitchRedirect`) for every retirement, so
+  `chan_ctxt_unlink` no longer re-points `scheduledCtxt` itself and a
+  direct `chan_ctxt_del` of a destination redirects too. Pinned
+  `chan_ctxt_del` leaves `chan_env+36` pointing at the freed slot. If CDE
+  picks nothing (it returns while a scan or ROC dwell is claimed), the port
+  abandons the switch; the blob would keep the freed slot as the target.
+  The operation timer is not moved to the new destination, as in the blob;
+  a departure then waits for its protection frames, which always complete.
+- An abandoned switch (no context left to go to, or its message dropped)
+  puts the destination back to status 1, clears the operation timer and the
+  departure-timeout flag 0x20, clears the PM bit that its protection set,
+  and leaves `HW_ACTIVE`. A scan or ROC dwell that was never entered goes
+  from 0x08 back to 0x02 (0x04 to 0x01) and the connectionless gate is
+  armed again, so TASK_SCAN, waiting in state 2 for START, gets its dwell
+  later. No END is posted for a dwell that was never entered. The blob
+  never abandons a switch and clears 0x20 only in
+  `chan_pre_switch_channel`; a stale 0x20 would let the next departure skip
+  its PM=1 protection.
 - Retiring the source context only clears `currentCtxt`; the switch
   continues, as in the blob. The port used to cancel it.
 - `chan_pre_switch_channel` with no target ends the switch; the blob
@@ -7130,12 +7145,32 @@ MMCH-S2 and SCAN-N1. Differences from the archive:
   `chan_switch_start` directly (its allocation retry is gone), and MM no
   longer tracks the switch's idle wait: MM is restored when the message
   lands.
+- The per-VIF EDCA shadow is port-only; the hardware bank is written for
+  the VIF of the current operating context while no switch is in flight
+  (`mmEdcaOwner`). That predicate also required context status 4 or 5. A
+  lone context is left at status 1 by its operation timer (pinned
+  `chan_ctxt_op_evt` with one context: status 1, then a no-op
+  `chan_switch_start`), so after an AP stopped, every `MM_SET_EDCA_REQ` and
+  WMM refresh for the remaining STA stayed in the shadow until the next
+  switch (MMCH-S6). The status is no longer part of the predicate.
+
+The write-only `chan_*` shadows (`chanCtxtCount`, `chanCtxtFlags`,
+`chanCurrentCtxt`, `chanPendingCtxt`, `chanScanPending`,
+`chanConflictDetected`) were removed; nothing read them. The switch keeps
+its own serial and phase rather than the `Op` record of `op.nim`: its
+phase already says whether it is live, so an `Op` would only duplicate it.
 
 Host tests: `tools/test_wifi_switch_request.py`,
 `tools/test_wifi_channel_protection.py`,
-`tools/test_wifi_sm_audit_mm_chan.py` and
-`tools/test_wifi_sm_audit_scan.py`. The M0 HTTP server manifest built;
-none of this was flashed.
+`tools/test_wifi_sm_audit_mm_chan.py`, `tools/test_wifi_sm_audit_scan.py`
+and `tools/test_wifi_switch_table.py`, which drives a switch to an AP
+channel, the scan slot, the ROC slot and an AP channel with a scan claimed
+through each phase and each disturbance (protection confirmation with
+each status, unlink of destination, source, other or all contexts,
+operation deadline, MAC recovery) and checks that MM never stays
+`HW_ACTIVE`, that `scheduledCtxt` is set exactly while a switch is live,
+and that 0x08/0x04 are set only while their dwell is pending or running.
+The M0 HTTP server manifest built; none of this was flashed.
 
 #### Replies, message retirement and the firmware step
 
