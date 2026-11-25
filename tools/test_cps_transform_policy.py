@@ -17972,7 +17972,7 @@ def test_wifi_sm_handle_connection_uses_typed_frame_overlays():
         "let txDesc = hostTxHwDescAt(desc.hwDesc)",
         "txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32",
         "txDesc.frameLen = totalLen.uint32 + 4",
-        "desc.callbackArg = cast[pointer](vif)",
+        "desc.callbackArg = opStampEnv(stamp)",
         "if desc.hdrLen != 8 or desc.secTailLen != 8:",
         "if micLen != 18:",
         "cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)",
@@ -18026,15 +18026,15 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
         "c_memcpy(addr hdr.addr2[0],\n                   addr vif.macAddr[0], 6.csize_t)",
         "c_memcpy(addr hdr.addr3[0],",
         "hdr.seqCtrl = seqCtrl",
-        "desc.callback = cast[pointer](sm_supplicant_deauth_cfm)",
-        "desc.callbackArg = cast[pointer](vif)",
+        "let callback = cast[pointer](sm_supplicant_deauth_cfm)",
+        "desc.callbackArg = opStampEnv(stamp)",
         "desc.vifIdx = vifIdx",
         "desc.staInfoIdx = result_code",
         "let thd = hostTxHwDescAt(desc.hwDesc)",
         "thd.payloadEnd = payloadStart + 23 + bodyLen",
         "thd.frameLen = bodyLen + 28",
         "if txl_frame_push(frame, 3) == 0:",
-        "sm_connect_ind(9, reason)",
+        "smConnectEnd(9, reason)",
     ]:
         assert expected in body
 
@@ -21088,7 +21088,8 @@ def test_wifi_firmware_task_state_transitions_use_named_constants():
         assert forbidden not in wifi_code
 
     for expected in [
-        "ke_state_set(TASK_SM, SmDisconnectingState)",
+        "smGo(SmDisconnectingState, tdDeauthWait)",
+        "smGo(SmDisconnectingState, tdCleanup)",
         "ke_state_set(TASK_APM, ApmIdleState)",
         "ke_state_set(TASK_APM, ApmActiveState)",
         "ke_state_set(TASK_APM, ApmStartingState)",

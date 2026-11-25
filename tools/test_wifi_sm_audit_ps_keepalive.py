@@ -7,7 +7,8 @@ edges are modelled: the TX frame pool (with the same reset-epoch, station-epoch
 and PS-serial freshness rules as txlFrameIdentityCurrent), the MM timer list,
 the kernel message queue and the MAC PM register.
 
-Tests marked xfail(strict=True) demonstrate audit findings:
+The audit findings below were reproduced here and are now fixed; their tests
+check the fix:
 
 PSK-1  A dynamic-PS sleep transition that is in flight when a channel switch
        (chanForceIdle -> mm_force_idle_req -> txl_reset) or MAC recovery
@@ -15,8 +16,11 @@ PSK-1  A dynamic-PS sleep transition that is in flight when a channel switch
        suppressed by the reset epoch, ps_tx_null_timer_handle refuses the
        timeout because psTxNullOwner.resetEpoch was captured at arm time, and
        mmPsModeRetryAfterReset only rescues explicit MM requests.
-PSK-2  A connection-loss indication published before a channel-switch reset is
-       dropped by mmConnLossTagFor, although the VIF and station are current.
+PSK-2  A connection-loss indication published before a channel-switch reset was
+       dropped, although the VIF and station were current: its disconnect
+       handoff carried the publication's TX reset epoch, and the handler had
+       already set state 10, so SM stayed there. The teardown (station_sm.nim)
+       no longer carries an epoch and publishes state 10 only after its claim.
 """
 
 from pathlib import Path
@@ -574,7 +578,7 @@ var
   sent: seq[pointer]
   interruptsEnabled = true
   nimFwDbgConnLossInd, nimFwDbgDisconnectProcess: uint32
-  sm: tuple[connectInfo: pointer, saQueryActive: uint8]
+  sm: tuple[connectInfo, connectIndMsg: pointer, saQueryActive: uint8]
   smState, mmState: uint16
   disconnects, tlvCalls: int
   lastReason: uint16
@@ -613,11 +617,12 @@ proc mmEnvView(): ptr MmEnv = addr mm
 proc macTimeNow(): uint32 = 0x1234
 proc txlFrameCallbackCurrent(): bool = true
 proc keTimerClearLocked(id: uint16; task: uint8; saved: uint32) = irqRestore(saved)
-proc smCleanupBegin(vif: pointer; disconnected: bool; status, reason: uint16;
-                    handoff: SmDisconnectHandoff): bool =
-  doAssert disconnected and handoff.peer.vif == vif
+proc smCleanupBegin(vif: pointer; indication: pointer = nil; disconnected = false;
+                    status = 0'u16; reason = 0'u16): bool =
+  doAssert disconnected and indication == nil
   lastReason = status
   inc disconnects
+  ke_state_set(TASK_SM, SmDisconnectingState)
   true
 proc hal_machw_reset(): bool = true
 proc rxl_reset(): bool = true
@@ -632,7 +637,7 @@ proc smRegistrationPreserveAcrossChannelReset(previous: uint32) = discard
 
 def loss_source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    code = layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag", "SmDisconnectHandoff",
+    code = layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag",
                    "MmConnectionLossIndPayload")
     code += LOSS_PLATFORM
     for name in ["mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch",
@@ -648,9 +653,6 @@ def loss_source() -> str:
     return code
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PSK-2: mmConnLossTagFor drops a keepalive connection-loss indication when a "
-    "channel switch (chanForceIdle) advanced txResetEpoch before SM dispatch"))
 @pytest.mark.parametrize("mode", MODES)
 def test_keepalive_loss_survives_channel_switch_reset(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, loss_source() + r'''
@@ -677,4 +679,5 @@ doAssert mmVifCurrent(mmCaptureVif(addr vifs[1]))  # Same VIF and station.
 doAssert handler(pending) == KeMsgConsumed
 doAssert disconnects == 2 and lastReason == 22,
   "keepalive loss silently dropped after channel-switch reset"
+doAssert smState == SmDisconnectingState
 ''')

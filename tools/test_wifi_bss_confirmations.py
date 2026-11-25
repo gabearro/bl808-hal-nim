@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_message_allocation import run_program
 from test_wifi_sm_bss_allocation import PLATFORM
 
@@ -172,6 +172,7 @@ def source() -> str:
     code += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     code += platform + EXTRA
     owner = (FW / "station_tx_build.nim").read_text()
+    code += station_sm_source()
     for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     code += (FW / "station_bss.nim").read_text()

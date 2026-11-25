@@ -91,38 +91,36 @@ proc smSaQueryClaimTimeout(param: pointer): uint32 =
   smSaQuery.armed = false
   serial
 
-proc smReportApDisconnectLocked(peer: MmVifIdentity; reason: uint16; saved: uint32;
-                                evidence = default(SmPeerDisconnectEvidence);
-                                saQuerySerial = 0'u32) =
-  let handoff = SmDisconnectHandoff(peer: peer, connection: smEnvView().connectInfo,
-    resetEpoch: txResetEpoch, state: ke_state_get(TASK_SM), saQuerySerial: saQuerySerial)
-  irqRestore(saved)
-  template current(): bool =
-    smDisconnectHandoffCurrent(handoff) and vifChannelAt(peer.vif).state != 0
-  if not current(): return
+proc smSaQueryEnd() =
+  ## The link is being torn down: no SA Query outcome can matter any more.
+  smEnvView().saQueryActive = 0
+  smSaQuery.armed = false
+  ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
+
+proc smReportApDisconnect(peer: MmVifIdentity; reason: uint16;
+                          evidence = default(SmPeerDisconnectEvidence)) =
+  ## The AP ended the link (deauthentication, disassociation or an SA Query
+  ## that went unanswered). Log it as sm.o does, then end the link.
   let logFn = blOpsFunc(4)
   if logFn != nil:
     cast[proc(fmt: cstring) {.cdecl, varargs.}](logFn)(
       "Deauth/Disassociate by AP, Wlan802.11 reason code = %d\r\n", reason.cint)
-  if current():
-    when defined(bl808WifiDiagLinkDrop):
-      # This marks SM's teardown decision, not host delivery or cleanup completion.
-      let record = addr nimFwDbgPeerDisconnect
-      if volatileLoad(addr record[0]) == 0 and evidence.radio shr 24 != 0:
-        let evidenceIrq = irqSave()
-        defer: irqRestore(evidenceIrq)
-        if not current(): return
-        if volatileLoad(addr record[0]) == 0:
-          volatileStore(addr record[1], macTimeNow())
-          volatileStore(addr record[2], reason.uint32 or (peer.index.uint32 shl 16) or
-            (peer.station.uint32 shl 24))
-          volatileStore(addr record[3], evidence.header)
-          volatileStore(addr record[4], evidence.radio)
-          var provenance = evidence.submitted.uint32 or (evidence.rejected.uint32 shl 8)
-          when defined(bl808WifiDiagPeerRxAdmission):
-            provenance = provenance or (evidence.protection.uint32 shl 16)
-          volatileStore(addr record[5], provenance)
-          # Publish last, under the same IRQ lock as the probe history writer.
-          volatileStore(addr record[0], 0x50454552'u32) # PEER
-    # Only a cleanup which actually takes ownership may publish Disconnecting.
-    smDisconnectOwned(handoff, 7, reason)
+  when defined(bl808WifiDiagLinkDrop):
+    # This marks SM's teardown decision, not host delivery or cleanup completion.
+    let record = addr nimFwDbgPeerDisconnect
+    if volatileLoad(addr record[0]) == 0 and evidence.radio shr 24 != 0:
+      let evidenceIrq = irqSave()
+      defer: irqRestore(evidenceIrq)
+      if volatileLoad(addr record[0]) == 0:
+        volatileStore(addr record[1], macTimeNow())
+        volatileStore(addr record[2], reason.uint32 or (peer.index.uint32 shl 16) or
+          (peer.station.uint32 shl 24))
+        volatileStore(addr record[3], evidence.header)
+        volatileStore(addr record[4], evidence.radio)
+        var provenance = evidence.submitted.uint32 or (evidence.rejected.uint32 shl 8)
+        when defined(bl808WifiDiagPeerRxAdmission):
+          provenance = provenance or (evidence.protection.uint32 shl 16)
+        volatileStore(addr record[5], provenance)
+        # Publish last, under the same IRQ lock as the probe history writer.
+        volatileStore(addr record[0], 0x50454552'u32) # PEER
+  sm_disconnect_process(peer.vif, 7, reason)

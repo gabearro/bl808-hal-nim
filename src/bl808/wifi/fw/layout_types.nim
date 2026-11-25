@@ -89,10 +89,6 @@ type
     leased: bool
     vifEpochs: array[MAX_VIFS, uint32]
     stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
-    smConnection: pointer
-    smSerial: uint32
-    smState: uint16
-    smTracked: bool
     psTracked: bool
     psSerial: uint32
 
@@ -1579,17 +1575,11 @@ type
     serial, resetEpoch: uint32
     armed: bool
 
-  SmDisconnectHandoff = object
-    peer: MmVifIdentity
-    connection: pointer
-    resetEpoch, saQuerySerial: uint32
-    state: uint16
-
   MmConnLossTag = object
     next: ptr MmConnLossTag
     header: pointer
     identity: MmVifIdentity
-    resetEpoch, probeEpoch: uint32
+    probeEpoch: uint32
     reason: uint16
     consumed, tracksProbe: bool
 

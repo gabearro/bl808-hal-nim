@@ -3079,17 +3079,6 @@ proc txlFrameEndLease(desc: ptr HostTxDescView) =
   if index != InvalidFrameDescIndex:
     txFrameIdentities[index].leased = false
 
-proc txlFrameBindSmOwner(desc: ptr HostTxDescView; connection: pointer;
-                         serial: uint32; state: uint16): bool =
-  let index = txl_frame_desc_index(desc)
-  if index == InvalidFrameDescIndex or not txFrameIdentities[index].leased:
-    return false
-  txFrameIdentities[index].smConnection = connection
-  txFrameIdentities[index].smSerial = serial
-  txFrameIdentities[index].smState = state
-  txFrameIdentities[index].smTracked = true
-  true
-
 proc txlFrameLeaseToken(desc: ptr HostTxDescView): uint32 =
   let index = txl_frame_desc_index(cast[pointer](desc))
   if index != InvalidFrameDescIndex:

@@ -6,7 +6,7 @@ import re
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_message_allocation import run_program
 
 
@@ -364,6 +364,7 @@ def source(trace: bool = False) -> str:
     for name in ["co_list_pop_front", "co_list_push_back", "ke_queue_extract"]:
         code += procedure(kernel, name)
     owner = (FW / "station_tx_build.nim").read_text()
+    code += station_sm_source()
     for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()

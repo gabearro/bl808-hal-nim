@@ -15,7 +15,7 @@ import subprocess
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, ROOT, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure, station_sm_source
 
 
 class FindingReproduced(AssertionError):
@@ -217,7 +217,6 @@ def deauth_source() -> str:
     tasks = (FW / "task_handlers.nim").read_text()
     scan = (FW / "scan_station_ap_me.nim").read_text()
     return (code + SUPPLICANT_SUPPORT
-            + procedure((FW / "scan_station_ap_me.nim").read_text(), "smClaimFlushedSupplicantDeauth")
             + procedure(tasks, "sm_supplicant_deauth_cfm")
             + procedure(scan, "sm_handle_supplicant_result") + DEAUTH_HELPERS)
 
@@ -265,6 +264,102 @@ doAssert failures == 1 and failureStatus == 8, "[SMCONN-F4] flushed supplicant "
 ''', finding="SMCONN-F4")
 
 
+RETIREMENTS = r'''
+proc retire(kind: int) =
+  ## The frame ends once, whatever retired it: sent (ACK / no ACK), flushed
+  ## inside a TX reset, aged out of its station queue after one (KNOWN-TXRX-
+  ## F1-SM: no reset is active then), or released after its VIF session moved on.
+  let frame = activeFrame
+  let context = txlCaptureFrameCallback(frame)
+  let callback = frame.callback
+  let argument = frame.callbackArg
+  case kind
+  of 0: txlInvokeFrameCallback(callback, argument, 0x80800000'u32, context)
+  of 1: txlInvokeFrameCallback(callback, argument, 0x80000000'u32, context)
+  of 2:
+    inc txResetEpoch
+    txResetActive = true
+    txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+    txResetActive = false
+  of 3:
+    inc txResetEpoch
+    txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+  else:
+    inc rxVifEpochs[frame.vifIdx]
+    txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+  # A second completion of the same frame (or of an older one) is stale.
+  txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+'''
+
+
+def test_teardown_deauth_ends_its_wait_on_any_retirement(tmp_path: Path) -> None:
+    """SMCONN-F3/F4 by construction: the deauthentication frame carries the
+    teardown's stamp, so no TX reset or session check can strand state 10."""
+    run_nim(tmp_path, deauth_source() + RETIREMENTS + r'''
+for kind in 0 .. 4:
+  for waiting in [SmAuthenticatingState, SmAssocRspState, SM_ACTIVATING_STATE]:
+    prepare(0)
+    currentState = waiting
+    sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
+    doAssert currentState == SmDisconnectingState and smOwn.teardown == tdDeauthWait
+    retire(kind)
+    doAssert failures == 1 and failureStatus == 23 and failureReason == 3,
+      "abort from state " & $waiting & " not completed by retirement " & $kind
+    doAssert smOwn.teardown == tdCleanup and not smGuardArmed
+  startSupplicantFailure()
+  retire(kind)
+  doAssert failures == 1 and failureStatus == 8 and failureReason == 15,
+    "supplicant failure not completed by retirement " & $kind
+''')
+
+
+def test_unconfirmed_deauth_is_ended_by_its_guard(tmp_path: Path) -> None:
+    """Critique backstop for tdDeauthWait: a deauthentication frame postponed
+    on a context that never returns is not aged on a STA-only device. Its
+    guard timer ends the wait as a flush would; the frame's late confirmation
+    is then stale."""
+    run_nim(tmp_path, deauth_source() + RETIREMENTS + r'''
+proc expireGuard() =
+  doAssert smGuardArmed and smOwn.guard.callback == cast[pointer](smDeauthGuardExpired)
+  cast[proc(env: pointer) {.cdecl.}](smOwn.guard.callback)(cast[pointer](smOwn.guard.env.uint))
+for waiting in [SmAuthenticatingState, SmAssocRspState, SM_ACTIVATING_STATE]:
+  prepare(0)
+  currentState = waiting
+  sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
+  let late = activeFrame
+  let lateCallback = late.callback
+  let lateArgument = late.callbackArg
+  let context = txlCaptureFrameCallback(late)
+  expireGuard()
+  doAssert failures == 1 and failureStatus == 23 and not smGuardArmed
+  txlInvokeFrameCallback(lateCallback, lateArgument, 0x80800000'u32, context)
+  doAssert failures == 1
+  # The next attempt's abort waits for its own frame: the late confirmation
+  # of the earlier one is stale, even while the same kind of wait is live.
+  smGo(SmIdleState)
+  sm.connectInfo = addr conn
+  smGo(waiting)
+  sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
+  doAssert smOwn.teardown == tdDeauthWait
+  txlInvokeFrameCallback(lateCallback, lateArgument, 0x80800000'u32, context)
+  doAssert failures == 1 and smOwn.teardown == tdDeauthWait,
+    "an earlier wait's frame ended a later teardown"
+  retire(0)
+  doAssert failures == 2
+startSupplicantFailure()
+expireGuard()
+doAssert failures == 1 and failureStatus == 8 and failureReason == 15
+# Clearing the wait disarms the guard: the user disconnect path.
+prepare(0)
+sm.connectInfo = nil
+currentState = SmIdleState
+sm_handle_connection(1, 19, cast[pointer](sm_disconnect_deauth_cfm), cast[pointer](failed))
+doAssert smGuardArmed and smOwn.teardown == tdDeauthWait
+expireGuard()
+doAssert disconnects == 1 and not smGuardArmed and failures == 0
+''')
+
+
 # --- Re-initialisation with an attempt parked in SM ---------------------------
 
 def test_connect_admitted_after_sm_init(tmp_path: Path) -> None:
@@ -285,7 +380,7 @@ proc smDeferredCancel() = inc cancellations
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert task == TASK_SM
   currentState = state
-''' + procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init") + r'''
+''' + station_sm_source() + procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init") + r'''
 for waiting in 1'u16 .. 10'u16:
   resetAdmission()
   # MM_RESET_REQ -> me_init -> sm_init while an attempt still owns SM.

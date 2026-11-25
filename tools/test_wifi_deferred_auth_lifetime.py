@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from test_wifi_deferred_auth import source_parts
-from test_wifi_disconnect_tx import FW, ROOT, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure, station_sm_source
 
 
 PLATFORM = r'''
@@ -526,7 +526,7 @@ def program_source(mutation: str = "") -> str:
     # The production branch publishes for this VIF after activating its channel.
     activation = "\nproc activate(vif3: pointer) =\n  let vif = cast[ptr Vif](vif3)\n"
     activation += "\n".join("  " + line for line in fragment.splitlines()) + "\n"
-    source = (types + constants + PLATFORM + (FW / "deferred_auth.nim").read_text()
+    source = (types + constants + PLATFORM + station_sm_source() + (FW / "deferred_auth.nim").read_text()
             + procedure(kernel, "co_list_push_back") + procedure(kernel, "co_list_extract")
             + procedure(kernel, "chan_ctxt_link") + procedure(kernel, "chan_ctxt_unlink")
             + procedure(kernel, "chan_is_on_operational_channel")

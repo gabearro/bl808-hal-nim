@@ -5,15 +5,16 @@ import re
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_auth_frames import layouts
 from test_wifi_message_allocation import run_program
 
 
 def owned_disconnect_source() -> str:
+    """The real sm_disconnect_process and smTeardown over the fixture's smCleanupBegin."""
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    return "\nvar smSaQuery: tuple[serial: uint32]\n" + "".join(procedure(scan, name) for name in
-                   ("smDisconnectHandoffCurrent", "smDisconnectOwned"))
+    return (station_sm_source("smGo", "smTeardownUnclaimed", "smTeardown")
+            + procedure(scan, "sm_disconnect_process"))
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "firmware"])
@@ -145,7 +146,7 @@ const
   KeMsgSaved = 2.cint
   VIF_TYPE_STA = 0'u8
 """
-    source += layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag", "SmDisconnectHandoff",
+    source += layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag",
                       "MmConnectionLossIndPayload")
     source += """
 const MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
@@ -163,7 +164,7 @@ var
   onAlloc, onSmState: proc()
   interruptsEnabled = true
   nimFwDbgConnLossInd, nimFwDbgDisconnectProcess: uint32
-  sm: tuple[connectInfo: pointer, saQueryActive: uint8]
+  sm: tuple[connectInfo, connectIndMsg: pointer, saQueryActive: uint8]
   state: uint16
   disconnects, tlvCalls: int
   lastVif: pointer
@@ -205,14 +206,16 @@ proc sm_connection_tlv_set() =
   inc tlvCalls
 proc smEnvView(): ptr typeof(sm) = addr sm
 proc keTimerClearLocked(id: uint16; task: uint8; saved: uint32) = irqRestore(saved)
-proc smCleanupBegin(vif: pointer; disconnected: bool; status, reason: uint16;
-                    handoff: SmDisconnectHandoff): bool =
-  doAssert disconnected and handoff.peer.vif == vif
+proc smCleanupBegin(vif: pointer; indication: pointer = nil; disconnected = false;
+                    status = 0'u16; reason = 0'u16): bool =
+  doAssert disconnected and indication == nil
   # The firmware stores the MM loss reason in the status field.
-  doAssert state == SmDisconnectingState and reason == 0xFFFF
+  doAssert state == SmIdleState and reason == 0xFFFF
+  # The cleanup claims the link, then publishes state 10.
   lastVif = vif
   lastReason = status
   inc disconnects
+  ke_state_set(TASK_SM, SmDisconnectingState)
   true
 """
     kernel = (FW / "kernel_mac_channel.nim").read_text()
@@ -337,16 +340,15 @@ mmPublishConnectionLoss(addr vifs[1], 16, addr probe)
 doAssert sent.len == 0 and mmConnLossTags == nil
 onAlloc = nil
 
+# State 10 is published only after the cleanup has claimed the link.
 state = SmIdleState
-let staleAtTransition = nextIndication()
-let beforeTransition = disconnects
+let atTransition = nextIndication()
+lastVif = nil
 onSmState = proc() =
   doAssert state == SmDisconnectingState
-  inc rxVifEpochs[1]
-  state = 6
-doAssert handler(staleAtTransition) == KeMsgConsumed
-doAssert state == 6 and disconnects == beforeTransition
+  doAssert lastVif == cast[pointer](addr vifs[1]), "state 10 published before the claim"
+doAssert handler(atTransition) == KeMsgConsumed and state == SmDisconnectingState
 onSmState = nil
-release(staleAtTransition)
+release(atTransition)
 """
     run_program(tmp_path, mode, source)

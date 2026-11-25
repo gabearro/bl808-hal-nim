@@ -37,7 +37,7 @@ var
   rxVifEpochs, mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   stationEpochs: array[4, uint32]
   txResetEpoch, nimFwDbgConnLossInd, nimFwDbgDisconnectProcess: uint32
-  sm: tuple[connectInfo: pointer, saQueryActive: uint8]
+  sm: tuple[connectInfo, connectIndMsg: pointer, saQueryActive: uint8]
   mmConnLossTags: ptr MmConnLossTag
   allocations: seq[Allocation]
   publishingId, dispatchingId: int
@@ -96,12 +96,14 @@ proc smEnvView(): ptr typeof(sm) = addr sm
 proc keTimerClearLocked(id: uint16; task: uint8; saved: uint32) =
   doAssert id == SM_SA_QUERY_TIMEOUT_IND_MSG and task == TASK_SM
   irqRestore(saved)
-proc smCleanupBegin(vif: pointer; disconnected: bool; status, reason: uint16;
-                    handoff: SmDisconnectHandoff): bool =
-  doAssert states[TASK_SM] == SmDisconnectingState and vif == (addr vifs[1])
-  doAssert disconnected and handoff.peer.vif == vif
+proc smCleanupBegin(vif: pointer; indication: pointer = nil; disconnected = false;
+                    status = 0'u16; reason = 0'u16): bool =
+  # The cleanup claims the link, then publishes state 10.
+  doAssert states[TASK_SM] == SmIdleState and vif == (addr vifs[1])
+  doAssert disconnected and indication == nil
   doAssert status in [16'u16, 22] and reason == 0xFFFF
   actualDisconnects.add(dispatchingId)
+  ke_state_set(TASK_SM, SmDisconnectingState)
   true
 '''
 
@@ -277,8 +279,7 @@ def loss_firmware_source(mutation: bool = False) -> str:
                "          (tag.tracksProbe and mmConnLossProbeEpoch(tag.reason, tag.identity.index) != tag.probeEpoch):")
         assert old in tag_lookup
         tag_lookup = tag_lookup.replace(old, "not mmVifCurrent(tag.identity):")
-    source = fixture + layouts("MmVifIdentity", "MmConnLossTag", "MmConnectionLossIndPayload",
-                               "SmDisconnectHandoff") + PLATFORM
+    source = fixture + layouts("MmVifIdentity", "MmConnLossTag", "MmConnectionLossIndPayload") + PLATFORM
     source += "".join(procedure(kernel, name) for name in
                       ("mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch"))
     forget = kernel.index("proc mmConnLossForget(header: pointer) =")

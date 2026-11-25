@@ -7038,11 +7038,9 @@ hardware.
 epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
 auth/assoc response deadline, the expected auth response, the BSS
 parameter batch, the activation exchange and the SM scan/join exchange
-use the session check. `sm_connect_abort_deauth_cfm` and
-`sm_supplicant_deauth_cfm` accept a frame retired by the active reset
-drain, as `sm_disconnect_deauth_cfm` already did; pinned
-`sm.o:sm_connect_abort_deauth_cfm` and `sm_supplicant_deauth_cfm` call
-`sm_connect_ind` unconditionally. `bl_reset_evt` carries the TBTT,
+use the session check. The deauthentication confirmations end their wait
+with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm` and
+`sm_supplicant_deauth_cfm` do (see "SM teardown" below). `bl_reset_evt` carries the TBTT,
 connectionless and context deadlines and the scan and registration
 exchanges across its `txl_reset` through `chanPreserveAcrossRecovery`.
 
@@ -7225,6 +7223,76 @@ Host tests: `tools/test_wifi_mm_idle_readiness.py`,
 `tools/test_wifi_op.py`, `tools/test_wifi_sm_audit_sm_connect.py` and
 `tools/test_wifi_sm_audit_txrx_reset.py`. The M0 HTTP server manifest
 built, also with `-d:bl808WifiOpCheck`; none of this was flashed.
+
+#### SM teardown (state 10)
+
+`station_sm.nim` holds TASK_SM's state. `smGo` is its only `ke_state_set`,
+and each state it writes starts a new `Op` serial. Every end of an attempt
+or link goes through `smTeardown`, after `smDeauthWait` when a
+deauthentication is sent first. They are the only ways into state 10, which
+has two phases. In the deauthentication wait, the frame carries the current
+serial.
+In the cleanup, `station_cleanup.nim` runs unchanged and ends with
+`smGo(SmIdleState)`. The disconnect handoff (`SmDisconnectHandoff`,
+`smDisconnectOwned`), the flushed-frame claims, the SM owner fields of
+`TxFrameIdentity` and the lock passing of `smConnectIndLocked` and
+`smReportApDisconnectLocked` are gone. Differences from the archive:
+
+- `sm_handle_connection` and `sm_handle_supplicant_result` enter state 10
+  (`smDeauthWait`) once the frame is built, just before the push. The blob
+  sets it before `txl_frame_get`. A failure before the push therefore comes
+  from the original state, with the same failure function and status.
+- The frame's confirmation argument (frame+212) is the wait's serial, not
+  the VIF. As in `sm.o`, the three confirmations end the wait whatever the
+  status: sent, not acknowledged, flushed by `txl_reset`, aged out after a
+  reset, or released after the VIF session moved on (SMCONN-F3, SMCONN-F4,
+  KNOWN-TXRX-F1-SM). A confirmation whose serial is not the live wait's
+  changes nothing.
+- The deauthentication wait has a 3 s guard timer, which the blob does not
+  have. A postponed frame whose context never returns is not aged on a
+  STA-only device. On expiry the guard runs the frame's own callback with
+  `0x40000000`, as a flush would. The frame's later confirmation is stale.
+- `sm_connect_ind` does nothing once a teardown has started, so a late
+  activation reply or response timeout cannot end the attempt twice. A
+  deauthentication wait ends through its frame's confirmation
+  (`sm_connect_abort_deauth_cfm`, `sm_supplicant_deauth_cfm`, which in
+  `sm.o` tail-call `sm_connect_ind`, or `sm_disconnect_deauth_cfm`, which
+  tail-calls `sm_disconnect_process` as here), a refused push or the guard.
+  `smDeauthWait` refuses to start while a teardown is running.
+- Every teardown ends SA Query when it starts, the deauthentication wait
+  included. The blob clears it in `sm_disconnect_process`, after the
+  confirmation, so an SA Query timeout during the wait could start a second
+  teardown.
+- `sm_handle_connection` sends no second deauthentication while a teardown
+  is in progress. The blob would send another frame and set state 10 again.
+- `mm_connection_loss_ind_handler` publishes state 10 after the cleanup has
+  claimed the link (blob: before `sm_connection_tlv_set`). The handoff had
+  carried the loss's TX reset epoch. A loss queued across a channel switch
+  was dropped with state 10 already set, which left SM there (PSK-2).
+- If the cleanup finds no STA VIF (the slot was re-registered as another
+  type), the attempt ends unreported and SM goes idle (`smTeardownUnclaimed`).
+  The blob indexes the VIF regardless.
+- `me_set_active_cfm_handler_sm` no longer has the blob's state-10 "set
+  idle" branch. It was unreachable: only a state-4 batch reply gets that far,
+  and the cleanup goes idle by itself.
+- After the AP-disconnect log, the SA Query timer clear and the failed
+  attempt's scan-result removal, the handlers no longer re-check the peer or
+  the attempt. None of these calls can re-enter the firmware step (pump
+  guard), and the free hooks only forget tags.
+
+Host tests: `tools/test_wifi_sm_table.py` drives each teardown entry
+(failure in states 1-9, abort in 6/8/9, handshake failure, user disconnect,
+link loss) through each wait ending (confirmed, refused, guard, late) over
+the real cleanup. It calls `smDeauthWait` directly; the real frame builders
+and retirement kinds are driven by `test_wifi_sm_audit_sm_connect.py` and
+`test_wifi_deauth_lifetime.py`. It checks that state 10 always has its phase and
+carrier, that each end is reported exactly once, and that every serial is
+stale at quiescence. It also lints that `smGo` is the only TASK_SM state
+writer. Further tests: `tools/test_wifi_sm_audit_sm_connect.py`,
+`tools/test_wifi_sm_audit_ps_keepalive.py` (PSK-2 no longer xfail),
+`tools/test_wifi_sm_cleanup.py`, `tools/test_wifi_deauth_lifetime.py`,
+`tools/test_wifi_disconnect_tx.py` and `tools/test_wifi_supplicant_result.py`.
+The M0 HTTP server manifest built; none of this was flashed.
 
 ## BLE
 

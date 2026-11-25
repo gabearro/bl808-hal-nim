@@ -1,9 +1,6 @@
 var smTxSerials {.wifiCtrl.}: array[MAX_VIFS, uint32]
 var smAuthResponseExpectations {.wifiCtrl.}: array[MAX_VIFS, SmAuthResponseExpectation]
 
-proc smAdvanceTxSerial(vifIndex: uint8) {.inline.} =
-  inc smTxSerials[vifIndex]
-
 proc smTxCapture(connection: pointer): SmTxBuildContext =
   let saved = irqSave()
   defer: irqRestore(saved)
@@ -114,23 +111,12 @@ proc smTxFail(build: var SmTxBuildContext; status: uint16) =
 proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool =
   if not smTxOwnerCurrent(build): return false
   build.state = state
-  ke_state_set(TASK_SM, state)
+  smGo(state)
   smTxOwnerCurrent(build)
 
 proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool =
   if not smTxFrameCurrent(build) or not smTxSetOwnerState(build, state): return false
   smTxFrameCurrent(build)
-
-proc smTxCallbackCurrent(): bool =
-  let scope = txActiveFrameCallback
-  scope == nil or not scope.identity.smTracked or
-    (scope.vif < MAX_VIFS.uint8 and
-     smTxSerials[scope.vif] == scope.identity.smSerial and
-     smEnvView().connectInfo == scope.identity.smConnection and
-     vifChannelForIdx(scope.vif).vifIdx == scope.vif and
-     vifChannelForIdx(scope.vif).vifType == VIF_TYPE_STA and
-     vifChannelForIdx(scope.vif).staIdx == scope.station and
-     ke_state_get(TASK_SM) == scope.identity.smState)
 
 proc smTxTimerCurrent(context: pointer): bool =
   let build = cast[ptr SmTxBuildContext](context)
@@ -213,10 +199,6 @@ proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =
   let saved = irqSave()
   defer: irqRestore(saved)
   if not smTxFrameCurrent(build): return false
-  let desc = hostTxDescAt(build.frame)
-  if desc.callback != nil and
-      not txlFrameBindSmOwner(desc, build.connection, build.serial, build.state):
-    return false
   # The lower layer consumes the lease on both accepted and failed submission.
   build.ownsFrame = false
   if forced: txl_frame_try_push_force(build.frame, 3) != 0

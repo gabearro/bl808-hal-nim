@@ -84,6 +84,7 @@ include wifi/fw/channel_update
 include wifi/fw/channel_switch
 include wifi/fw/channel_protection
 include wifi/fw/station_sa_query
+include wifi/fw/station_sm
 include wifi/fw/scan_station_ap_me
 include wifi/fw/rate_control
 include wifi/fw/tx_layer

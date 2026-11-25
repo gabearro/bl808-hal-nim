@@ -325,8 +325,9 @@ channelSwitchReset()
 macTime = postponedAt + 0x1D4C1'u32
 discard sta_mgmt_postponed_desc_release(addr stas[1], 0)
 doAssert cbCalls == 1 and stas[1].postponedList.first == nil
-# sm_disconnect_deauth_cfm accepts only txlFrameCallbackCurrent() or a
-# completion delivered while txResetActive (smClaimFlushedDisconnect).
+# Session-owned callbacks (PS, probes) accept only txlFrameCallbackCurrent()
+# or a completion delivered while txResetActive. SM's deauthentication
+# confirmations need neither: they carry the teardown's stamp.
 doAssert cbInReset[0] or cbCurrent[0],
   "F1: aged postponed frame completed with stale scope outside reset window"
 ''', "F1: aged postponed frame completed with stale scope")

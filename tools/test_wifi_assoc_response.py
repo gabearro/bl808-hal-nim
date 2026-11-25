@@ -6,7 +6,7 @@ import re
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_message_allocation import run_program
 
 
@@ -244,6 +244,7 @@ def source(trace: bool = False) -> str:
                     "RxuMgtDispatchView", "MacIeView", "TimeoutIntervalIeView",
                     "SmConnectIndPayload", "MmSetVifStateReqPayload") + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
+    code += station_sm_source()
     for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     # Share the real response timer ownership check, including its TX serial.

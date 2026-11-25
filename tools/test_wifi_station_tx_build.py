@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, ROOT, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure, station_sm_source
 
 PLATFORM = r'''
 import bl808/wifi/fw_constants/states
@@ -82,10 +82,6 @@ type
     authTimeout: pointer
   TxFrameIdentity = object
     resetEpoch: uint32
-    smTracked: bool
-    smConnection: pointer
-    smSerial: uint32
-    smState: uint16
   TxFrameCallbackScope = object
     identity: TxFrameIdentity
     vif, station: uint8
@@ -171,8 +167,6 @@ proc frameIndex(p: pointer): int =
     if p == addr descriptors[i]: return i
   doAssert false
 proc txlFrameLeaseToken(p: ptr HostTxDescView): uint32 = generations[frameIndex(p)]
-proc txlFrameBindSmOwner(p: ptr HostTxDescView; connection: pointer;
-                         serial: uint32; state: uint16): bool = true
 proc txlFrameLeaseMatches(p: ptr HostTxDescView; generation: uint32): bool =
   let i = frameIndex(p)
   leased[i] and generations[i] == generation
@@ -322,9 +316,10 @@ proc observe(point: int) =
   hookFired = true
   case action
   of 1:
+    # A replacement attempt: SM's state changes only through smGo.
     sm.connectInfo = addr replacementConn
     inc rxVifEpochs[1]
-    currentState = 9
+    smGo(9)
     timerDelay = 12345
     smConnecting = false
   of 2:
@@ -353,6 +348,7 @@ proc observe(point: int) =
   else: discard
 proc setup(kind: int) =
   smRspTimerReset()
+  smOwn = default(typeof(smOwn))
   doAssert expiryMessage == nil and smRspTags == nil
   sm = SmEnv(connectInfo: addr conn, connectIndMsg: addr indication, authRetryLimit: 2)
   conn = Conn(vifIdx: 1, authType: 0)
@@ -737,6 +733,7 @@ def program_source() -> str:
     if helper.exists():
         layout = (FW / "layout_types.nim").read_text()
         code += "type\n  SmTxBuildContext" + layout.split("  SmTxBuildContext", 1)[1].split("\n\n  ", 1)[0] + "\n"
+        code += station_sm_source()
         code += helper.read_text()
         code += (FW / "station_response_timeout.nim").read_text()
         code += procedure(sm, "smTxSnapshotJoinPeer")

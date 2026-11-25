@@ -182,7 +182,7 @@ proc smCleanupService() =
     # Free/ME callbacks can install another owner before cancellation returns.
     if releaseState and smCleanupSerial == cancelledSerial and
         smEnvView().connectInfo == nil and ke_state_get(TASK_SM) == SmDisconnectingState:
-      ke_state_set(TASK_SM, SmIdleState)
+      smGo(SmIdleState)
     return
   if smCleanup.lost:
     # Whether the lost step took effect is unknown. Carry on with the next
@@ -217,7 +217,7 @@ proc smCleanupService() =
       let session = smCleanup.session
       smCleanup.indication = nil
       smCleanup.active = false
-      ke_state_set(TASK_SM, SmIdleState)
+      smGo(SmIdleState)
       if indication != nil:
         publishIndication(indication, session)
       return
@@ -325,15 +325,14 @@ proc smCleanupCfmHandler(reply: pointer): cint {.cdecl.} =
   KeMsgConsumed
 
 proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
-                    disconnected = false; status = 0'u16; reason = 0'u16;
-                    handoff = default(SmDisconnectHandoff)): bool =
+                    disconnected = false; status = 0'u16; reason = 0'u16): bool =
+  ## smTeardown's cleanup phase: claim the link, then publish state 10.
   let saved = irqSave()
   defer:
     irqRestore(saved)
     if result: smCleanupService()
   if smCleanup.active: return false
   let sm = smEnvView()
-  if handoff.peer.captured and not smDisconnectHandoffCurrent(handoff): return false
   var vif: ptr VifChannelView
   for index in 0'u8 ..< MAX_VIFS.uint8:
     let candidate = vifChannelForIdx(index)
@@ -374,7 +373,7 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
   sm.deauthPending = 0
   sm.scanResultIndex = 0xFFFFFFFF'u32
   smConnecting = false
-  ke_state_set(TASK_SM, SmDisconnectingState)
+  smGo(SmDisconnectingState, tdCleanup)
   smActivationCancelConnection(activationConnection)
   smBssCancel()
   smDeferredCancel()

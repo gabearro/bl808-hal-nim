@@ -13,9 +13,6 @@ from test_wifi_tx_session import PLATFORM as SESSION_PLATFORM
 ROOT = Path(__file__).resolve().parents[1]
 
 CALLBACKS = {
-    "sm_disconnect_deauth_cfm": "scan_station_ap_me.nim",
-    "sm_connect_abort_deauth_cfm": "scan_station_ap_me.nim",
-    "sm_supplicant_deauth_cfm": "task_handlers.nim",
     "ps_disable_cfm": "power_save.nim",
     "ps_enable_cfm": "power_save.nim",
     "mm_ap_traffic_probe_cfm": "power_save.nim",
@@ -23,9 +20,6 @@ CALLBACKS = {
 }
 
 PLATFORM = SESSION_PLATFORM + r"""
-proc smTxCallbackCurrent(): bool = true
-proc smClaimFlushedDisconnect(p: pointer): bool = false
-proc smClaimFlushedSupplicantDeauth(p: pointer): bool = false
 type
   Vif = object
     beaconTimeoutBase: uint32
@@ -40,8 +34,6 @@ var
   mm: tuple[keepAliveLimit: uint32]
   mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   onPoll, onIdle, onLog, onClear: proc()
-proc sm_disconnect_process(p: pointer; status, reason: uint16) = inc effects
-proc sm_connect_ind(status, reason: uint16) = inc effects
 proc logHook(level: uint32; tag, file: cstring; line: cint;
              message: cstring) {.cdecl, varargs.} =
   if onLog != nil: onLog()
@@ -94,8 +86,7 @@ proc resetProtocol() =
 
 CHECKS = r"""
 let protocolCallbacks = [
-  cast[pointer](sm_disconnect_deauth_cfm), cast[pointer](sm_connect_abort_deauth_cfm),
-  cast[pointer](sm_supplicant_deauth_cfm), cast[pointer](ps_disable_cfm),
+  cast[pointer](ps_disable_cfm),
   cast[pointer](ps_enable_cfm), cast[pointer](mm_ap_traffic_probe_cfm),
   cast[pointer](mm_ap_probe_cfm)]
 for callback in protocolCallbacks:
@@ -221,10 +212,6 @@ for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
   queueCallback(callback, 0x80800000'u32)
   doAssert ps.pendingCount == 0 and effects == 1,
     "retired confirmation finalized the replacement mode after timer clear"
-resetProtocol()
-onLog = proc() = discard rxInvalidateVif(0)
-queueCallback(cast[pointer](sm_supplicant_deauth_cfm))
-doAssert effects == 0, "logging hook restarted the VIF before the connect indication"
 
 proc cleanup(p: pointer; status: uint32) {.cdecl.} =
   inc cleanups
@@ -248,7 +235,7 @@ for path in 0 .. 1:
 proc inner(p: pointer; status: uint32) {.cdecl.} =
   doAssert txlFrameCallbackCurrent()
   inc nested
-  sm_connect_abort_deauth_cfm(addr vif, status)
+  mm_ap_traffic_probe_cfm(addr vif, 0x80800000'u32)
 proc outer(p: pointer; status: uint32) {.cdecl.} =
   doAssert txlFrameCallbackCurrent()
   discard rxInvalidateVif(0)
@@ -263,7 +250,7 @@ proc outer(p: pointer; status: uint32) {.cdecl.} =
   txl_frame_evt()
   doAssert not txlFrameCallbackCurrent(), "nested callback lost its parent's identity"
   let before = protocolState()
-  sm_connect_abort_deauth_cfm(addr vif, status)
+  mm_ap_traffic_probe_cfm(addr vif, 0x80800000'u32)
   doAssert protocolState() == before
 resetProtocol()
 let frame = hostTxDescAt(txl_frame_get(24))
@@ -273,7 +260,7 @@ frame.callback = cast[pointer](outer)
 txEnv.packetCounter = 1
 co_list_push_back(addr frameEnv.usedList, addr frame.link)
 txl_frame_evt()
-doAssert nested == 1 and effects == 1 and txActiveFrameCallback == nil
+doAssert nested == 1 and vif.beaconTimeoutBase == macTimeNow() and txActiveFrameCallback == nil
 doAssert co_list_cnt(addr frameEnv.freeList) == 4
 
 proc throwing(p: pointer; status: uint32) {.cdecl.} =
@@ -313,13 +300,8 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
         body = procedure((FW / filename).read_text(), name)
         if mutation == name:
             guard = "  if not txlFrameCallbackCurrent(): return\n"
-            if name in ["sm_disconnect_deauth_cfm", "sm_connect_abort_deauth_cfm"]:
-                guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return\n"
-            if name == "sm_supplicant_deauth_cfm":
-                guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return\n"
             assert body.count(guard) >= 1
-            body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\((?:frameEpoch)?\)"
-                          r"(?: and not smClaimFlushed(?:Disconnect|SupplicantDeauth)\(param\))?: return\n", "", body)
+            body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\((?:frameEpoch)?\): return\n", "", body)
         functions += body
     if mutation == "context":
         assignment = "  txActiveFrameCallback = addr scope\n"
@@ -354,3 +336,15 @@ def test_protection_callbacks_are_owned_by_their_switch_generation() -> None:
         body = procedure(tasks, name)
         assert "txlFrameCallbackCurrent" not in body
         assert "chanProtectionDone(param, " in body
+
+
+def test_deauth_callbacks_are_owned_by_their_teardown_wait() -> None:
+    """A teardown's deauthentication frame ends its wait with any status,
+    flushed by a TX reset or after its VIF session moved on included (sm.o).
+    The frame carries the wait's stamp, so the session veto does not apply."""
+    for filename, name in [("scan_station_ap_me.nim", "sm_disconnect_deauth_cfm"),
+                           ("scan_station_ap_me.nim", "sm_connect_abort_deauth_cfm"),
+                           ("task_handlers.nim", "sm_supplicant_deauth_cfm")]:
+        body = procedure((FW / filename).read_text(), name)
+        assert "txlFrameCallbackCurrent" not in body
+        assert "smDeauthConfirmed(param)" in body

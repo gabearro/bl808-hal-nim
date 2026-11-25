@@ -2322,7 +2322,7 @@ proc sm_init*() {.exportc, cdecl.} =
   sm.connectIndMsg = nil
   sm.deauthPending = 1
   sm.authRetryLimit = 4
-  ke_state_set(TASK_SM, SmIdleState)
+  smGo(SmIdleState)
   smDeferredCancel()
 
 proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer) {.exportc, cdecl.} =
@@ -2818,8 +2818,12 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   ##   mfp_protect_mgmt_frame, txu_cntrl_protect_mgmt_frame (conditional),
   ##   me_build_deauthenticate(bodyStart, 3), mfp_add_mgmt_mic (conditional),
   ##   txl_frame_push(frame, 3). On fail: failureFn(vifEntry, status, 3).
+  ## Here state 10 is entered by smDeauthWait once the frame is built, just
+  ## before the push, and the frame carries the wait's stamp, not the VIF.
   if vifIdx.int >= MAX_VIFS:
     return
+  # A teardown in progress already ends this link.
+  if smOwn.teardown != tdNone: return
   var build = smTxBeginForVif(vifIdx)
   if not build.identity.captured: return
   defer: smTxEnd(build)
@@ -2840,8 +2844,6 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   if staIdx.int < STA_INFO_TAB_ENTRIES:
     if not smTxBindStation(build, staIdx): return
 
-  # Set SM state to disconnecting (blob: ke_state_set(4, 10))
-  if not smTxSetOwnerState(build, SmDisconnectingState): return
   if staIdx.int >= STA_INFO_TAB_ENTRIES:
     notifyFailure()
     return
@@ -2888,9 +2890,6 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
     return
   hdr.seqCtrl = seqCtrl
 
-  # Store callback/ctx at frame+208/212 (blob: sw s6,208(s0); sw s3,212(s0))
-  desc.callback = callbackCtx
-  desc.callbackArg = cast[pointer](vif)
   # Store VIF/STA info (blob: sb s7,47(s0); sb zero,98,100; sb a5,49(s0))
   desc.vifIdx = vifIdx
   desc.hdrLen = 0
@@ -2955,104 +2954,60 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
     txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32
     txDesc.frameLen = totalLen.uint32 + 4
 
-  # Push frame to TX queue (blob: txl_frame_push(frame, 3))
+  # Enter the deauthentication wait, then push (blob: txl_frame_push(frame, 3)).
+  # The callback and its argument sit at frame+208/212 (blob: sw s6,208(s0)).
+  let stamp = smDeauthWait(vifIdx, callbackCtx)
+  if stamp == 0: return  # the deferred smTxEnd releases the frame
+  desc.callback = callbackCtx
+  desc.callbackArg = opStampEnv(stamp)
+  build.state = SmDisconnectingState
   if smTxSubmit(build, false):
     return
-  # A failed push has already consumed the descriptor. A successful one owns
-  # it until completion; only that completion may tear down station/key state.
-  notifyFailure()
-
-proc smDisconnectHandoffCurrent(handoff: SmDisconnectHandoff): bool =
-  txResetEpoch == handoff.resetEpoch and mmVifCurrent(handoff.peer) and
-    (handoff.saQuerySerial == 0 or handoff.saQuerySerial == smSaQuery.serial) and
-    smEnvView().connectInfo == handoff.connection and
-    ke_state_get(TASK_SM) == handoff.state
-
-proc smDisconnectOwned(handoff: SmDisconnectHandoff; statusCode, reasonCode: uint16) =
-  inc nimFwDbgDisconnectProcess
-  let saved = irqSave()
-  if not smDisconnectHandoffCurrent(handoff):
-    irqRestore(saved)
-    return
-  smEnvView().saQueryActive = 0
-  # Detach before unlocking so a replacement query cannot lose its timer.
-  keTimerClearLocked(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, saved)
-  discard smCleanupBegin(handoff.peer.vif, disconnected = true, status = statusCode,
-                         reason = reasonCode, handoff = handoff)
+  # A refused push has already consumed the descriptor and runs no callback,
+  # so the wait ends here. A successful push owns it until its confirmation.
+  smTxEnd(build)
+  if smDeauthConfirmed(opStampEnv(stamp)) and failureFn != nil:
+    cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)(
+      cast[pointer](vif), status, 3'u16)
 
 proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
-  ## Keep the vendor callback ABI and order: clear SA Query, then tear down.
-  let handoff = block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    let peer = mmCaptureVif(param)
-    if not mmVifCurrent(peer) or vifChannelAt(param).vifType != VIF_TYPE_STA: return
-    SmDisconnectHandoff(peer: peer, connection: smEnvView().connectInfo,
-      resetEpoch: txResetEpoch, state: ke_state_get(TASK_SM))
-  smDisconnectOwned(handoff, statusCode, reasonCode)
-
-proc smClaimFlushedDisconnect(param: pointer): bool =
-  # Reset retires the frame, not the disconnect that owned it. Only accept
-  # retirement from the active reset drain, with the original SM/peer owner.
-  let scope = txActiveFrameCallback
-  if not txResetActive or scope == nil or not scope.tracked or
-      not scope.identity.smTracked or scope.identity.resetEpoch == txResetEpoch or
-      scope.identity.smState != SmDisconnectingState or
-      not txlFrameCallbackCurrent(scope.identity.resetEpoch) or
-      param != vifChannelForIdx(scope.vif):
-    return false
-  smAdvanceTxSerial(scope.vif)
-  true
-
-proc smClaimFlushedSupplicantDeauth(param: pointer): bool =
-  ## The deauth sent after a failed handshake carries no SM owner tag. Accept
-  ## its retirement only from the active reset drain, while SM still waits.
-  let scope = txActiveFrameCallback
-  txResetActive and scope != nil and scope.tracked and
-    scope.identity.resetEpoch != txResetEpoch and
-    txlFrameCallbackCurrent(scope.identity.resetEpoch) and
-    ke_state_get(TASK_SM) == SmDisconnectingState and
-    param == vifChannelForIdx(scope.vif)
+  ## End the link on this VIF; SM_DISCONNECT_IND follows the cleanup. The
+  ## vendor clears SA Query here, then deletes the resources; smTeardown
+  ## does both. Also the end of a disconnect's deauthentication wait.
+  inc nimFwDbgDisconnectProcess
+  smTeardown(param, disconnected = true, status = statusCode, reason = reasonCode)
 
 proc sm_disconnect_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, cdecl.} =
   ## Confirmation that deauth frame was sent during disconnect.
   ## From blob (5 instrs): li a2,3; li a1,19; jr sm_disconnect_process
   ## Tail-calls sm_disconnect_process(param, WLAN_FW_DISCONNECT_BY_USER_WITH_DEAUTH, 3).
-  if not smTxCallbackCurrent(): return
-  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return
+  ## Any status ends the wait, as in the blob; param is the wait's stamp.
   discard txStatus
-  sm_disconnect_process(param, 19, 3)
+  if smDeauthConfirmed(param): sm_disconnect_process(smDeauthVif(), 19, 3)
 
-proc smConnectIndLocked(statusCode, reasonCode: uint16; saved: uint32) =
-  ## Send connect indication to host.
-  ## From blob (131 instrs): loads sm_env[0] and vif_info_tab to build a full
-  ## SM_CONNECT_IND message with BSSID, aid, channel info, VHT capabilities,
-  ## then sends to host. Also notifies the AP via chan_bcn_detect_start if needed.
+proc smConnectEnd(statusCode, reasonCode: uint16) =
+  ## End the attempt and send its connect indication to host (the body of
+  ## the blob's sm_connect_ind, 131 instrs): loads sm_env[0] and vif_info_tab
+  ## to build a full SM_CONNECT_IND message with BSSID, aid, channel info and
+  ## VHT capabilities. A failure tears the attempt down first, and the
+  ## indication is sent when the cleanup completes.
   ##
   ## a0=statusCode(->s8), a1=reasonCode(->s9)
-  var locked = true
-  defer:
-    if locked: irqRestore(saved)
   let sm = smEnvView()
   let connInfo = sm.connectInfo
-  if connInfo == nil: return
-  let ci = connectInfoView(connInfo)
-
-  let vifIdx = ci.vifIdx
-  if vifIdx >= MAX_VIFS.uint8: return
-  let vif = vifChannelForIdx(vifIdx)
-  let vifEpoch = rxVifEpochs[vifIdx]
-
-  # Get sm_env secondary fields.
   # Blob re-uses the 860-byte message that sm_connect_req_handler parked at
   # sm_env[4] — it is NOT a fresh ke_msg_alloc here. Nim was allocating a
   # new buffer, which leaked the prior one AND sent an uninitialised msg
   # downstream. The blob's smEnvSecond pointer and the "msg" pointer are
   # the same object.
-  let smEnvSecond = sm.connectIndMsg
-  let msg = smEnvSecond
-  if msg == nil:
+  let msg = sm.connectIndMsg
+  if connInfo == nil or msg == nil or connectInfoView(connInfo).vifIdx >= MAX_VIFS.uint8:
+    # No attempt is left to report on; a deauthentication wait still ends.
+    if smOwn.teardown == tdDeauthWait: smTeardown(smDeauthVif())
     return
+  let vifIdx = connectInfoView(connInfo).vifIdx
+  let vif = vifChannelForIdx(vifIdx)
+  let vifEpoch = rxVifEpochs[vifIdx]
   let ind = smConnectIndPayloadAt(msg)
   let msgHdr = keMsgHdrFromPayload(msg)
   msgHdr.id = SM_CONNECT_IND_MSG
@@ -3096,35 +3051,21 @@ proc smConnectIndLocked(statusCode, reasonCode: uint16; saved: uint32) =
   ind.statusCode = statusCode
   ind.reasonCode = reasonCode
 
-  template current(): bool =
-    rxVifEpochs[vifIdx] == vifEpoch and sm.connectInfo == connInfo and
-      sm.connectIndMsg == msg
   if chanPtr != nil:
     sm.primaryFreq = ind.chanPrimFreq
     sm.centerFreq = ind.chanCenterFreq1.uint16
   if statusCode != 0:
-    let handoff = SmDisconnectHandoff(peer: mmCaptureVif(vif), connection: connInfo,
-      resetEpoch: txResetEpoch, state: SmDisconnectingState)
-    ke_state_set(TASK_SM, SmDisconnectingState)
-    if not current() or not smDisconnectHandoffCurrent(handoff): return
     let bssIdx = cast[int32](sm.scanResultIndex)
     if bssIdx >= 0:
       sm.scanResultIndex = 0xFFFFFFFF'u32
-    locked = false
-    irqRestore(saved)
-    if not current() or not smDisconnectHandoffCurrent(handoff): return
-    if bssIdx >= 0:
       scanu_rm_exist_ssid(connInfo, cast[uint8](bssIdx and 0xFF))
-      if not current() or not smDisconnectHandoffCurrent(handoff): return
-    discard smCleanupBegin(vif, msg, handoff = handoff)
+    smTeardown(vif, msg)
     return
 
   # Detach the completed attempt before allocator or host callbacks run.
   sm.connectInfo = nil
   sm.connectIndMsg = nil
-  ke_state_set(TASK_SM, SmIdleState)
-  locked = false
-  irqRestore(saved)
+  smGo(SmIdleState)
   ke_msg_free(keMsgHdrFromPayload(connInfo))
   if rxVifEpochs[vifIdx] != vifEpoch or sm.connectInfo != nil or
       sm.connectIndMsg != nil or ke_state_get(TASK_SM) != SmIdleState:
@@ -3133,21 +3074,23 @@ proc smConnectIndLocked(statusCode, reasonCode: uint16; saved: uint32) =
   ke_msg_send(msg)
 
 proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, noinline.} =
-  smConnectIndLocked(statusCode, reasonCode, irqSave())
+  ## The end of the connection attempt. An attempt is live from its admission
+  ## until its teardown starts; any other call does nothing.
+  if smOwn.teardown == tdNone: smConnectEnd(statusCode, reasonCode)
 
 proc sm_connect_abort_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
   ## Process a connect abort request.
   ## From blob (5 instrs): shuffles args (a0=a1, a1=a2) and tail-calls sm_connect_ind.
-  sm_connect_ind(statusCode, reasonCode)
+  ## It ends an abort's deauthentication wait, so it calls smConnectEnd.
+  smConnectEnd(statusCode, reasonCode)
 
 proc sm_connect_abort_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, cdecl.} =
   ## Confirmation of deauth during connect abort.
   ## From blob (5 instrs): li a1,3; li a0,23; jr sm_connect_ind
   ## Tail-calls sm_connect_ind(WLAN_FW_CONNECT_ABORT_BY_USER_WITH_DEAUTH=23, 3).
-  if not smTxCallbackCurrent(): return
-  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return
+  ## Any status ends the wait, as in the blob; param is the wait's stamp.
   discard txStatus
-  sm_connect_ind(23, 3)
+  if smDeauthConfirmed(param): smConnectEnd(23, 3)
 
 proc smDeauthSend(build: var SmTxBuildContext) =
   ## Send a deauthentication frame.
@@ -4217,7 +4160,8 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
       return KeMsgSaved
     # VIF matches: send connect indication with status=6 (deauth by AP)
     locked = false
-    smConnectIndLocked(6, reason, saved)
+    irqRestore(saved)
+    sm_connect_ind(6, reason)
     return KeMsgConsumed
 
   # state == 0 (idle): check VIF connection flag at vif[88]
@@ -4246,10 +4190,11 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
     sm_issue_sa_query_request()
     return KeMsgConsumed
   locked = false
+  irqRestore(saved)
   when defined(bl808WifiDiagLinkDrop):
-    smReportApDisconnectLocked(peer, reason, saved, peerEvidence(false))
+    smReportApDisconnect(peer, reason, peerEvidence(false))
   else:
-    smReportApDisconnectLocked(peer, reason, saved)
+    smReportApDisconnect(peer, reason)
   return KeMsgConsumed
 
 proc sm_get_set_machwkey_index*(getFlag: bool, vifIdx: uint8,
@@ -4343,26 +4288,18 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
       inc nimFwDbgEapolCbNull
 
 proc smRetireEstablishedSupplicantLink(staIdx: uint8; reason: uint16) =
-  let handoff = block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if txlResetting() or smEnvView().connectInfo != nil or
-        ke_state_get(TASK_SM) != SmIdleState:
-      return
-    let sta = staInfoForIdx(staIdx)
-    if sta.valid == 0 or sta.instNbr >= MAX_VIFS.uint8: return
-    let vif = vifChannelForIdx(sta.instNbr)
-    let peer = mmCaptureVif(vif)
-    if not mmVifCurrent(peer) or peer.station != staIdx or
-        vif.vifType != VIF_TYPE_STA or vif.state == 0:
-      return
-    let owner = SmDisconnectHandoff(peer: peer, resetEpoch: txResetEpoch,
-      state: SmDisconnectingState)
-    ke_state_set(TASK_SM, SmDisconnectingState)
-    owner
+  if txlResetting() or smEnvView().connectInfo != nil or
+      ke_state_get(TASK_SM) != SmIdleState:
+    return
+  let sta = staInfoForIdx(staIdx)
+  if sta.valid == 0 or sta.instNbr >= MAX_VIFS.uint8: return
+  let vif = vifChannelForIdx(sta.instNbr)
+  if vif.vifIdx != sta.instNbr or vif.staIdx != staIdx or
+      vif.vifType != VIF_TYPE_STA or vif.state == 0:
+    return
   # No pending connect indication exists after association. Retire the live
   # link even if key failure makes another management transmission unreliable.
-  smDisconnectOwned(handoff, WLAN_FW_4WAY_HANDSHAKE_ERROR_PSK_TIMEOUT_FAILURE.uint16, reason)
+  sm_disconnect_process(vif, WLAN_FW_4WAY_HANDSHAKE_ERROR_PSK_TIMEOUT_FAILURE.uint16, reason)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_handle_supplicant_result(unsigned char,unsigned short);".}
 proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc, cdecl.} =
@@ -4413,9 +4350,8 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
         "4-way handshake timeout failure, wlan 802.11 reason code = %u,                try to transmit deauth frame\r\n",
         reason.cuint)
 
-  # Transition SM state to disconnecting.
-  ke_state_set(TASK_SM, SmDisconnectingState)
-
+  # The blob enters state 10 here; this port does so once the frame is built
+  # (smDeauthWait), so a failure below still ends a live attempt.
   # Allocate TX frame for deauth (512 bytes)
   let frame = txl_frame_get(512)
   if frame == nil:
@@ -4449,11 +4385,6 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
   let seqCtrl = txl_get_seq_ctrl()
   hdr.seqCtrl = seqCtrl
 
-  # Register TX-completion callback. Blob: `addi a5, s1, 128; sw &cfm, 80(a5);
-  # sw vif, 84(a5)` — i.e. frame+208 = &sm_supplicant_deauth_cfm,
-  # frame+212 = &vif_entry.
-  desc.callback = cast[pointer](sm_supplicant_deauth_cfm)
-  desc.callbackArg = cast[pointer](vif)
   desc.vifIdx = vifIdx
   desc.staInfoIdx = result_code
   desc.hdrLen = 0
@@ -4477,10 +4408,22 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
   thd.payloadEnd = payloadStart + 23 + bodyLen
   thd.frameLen = bodyLen + 28
 
+  # Enter the deauthentication wait and register the TX-completion callback.
+  # Blob: `addi a5, s1, 128; sw &cfm, 80(a5); sw vif, 84(a5)`, i.e. frame+208 =
+  # &sm_supplicant_deauth_cfm, frame+212 = &vif_entry; here frame+212 holds
+  # the wait's stamp.
+  let callback = cast[pointer](sm_supplicant_deauth_cfm)
+  let stamp = smDeauthWait(vifIdx, callback)
+  if stamp == 0:
+    txl_frame_release(frame, false)
+    return
+  desc.callback = callback
+  desc.callbackArg = opStampEnv(stamp)
   # The queue consumes the descriptor even on failure. Completion owns the
-  # success path; a rejected push must report the distinct vendor status 9.
+  # success path; a rejected push runs no callback and reports the distinct
+  # vendor status 9.
   if txl_frame_push(frame, 3) == 0:
-    sm_connect_ind(9, reason)
+    smConnectEnd(9, reason)
 
 proc smTrySubmitSaQuery(staIdx: uint8, action: uint8, transId: uint16;
                         querySerial: ptr uint32 = nil): SmSaQueryTxResult =

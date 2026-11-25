@@ -67,7 +67,8 @@ proc chan_update_tx_power(p: pointer) = invoke(onLink)
 proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chan_tbtt_schedule(p: pointer) = discard
 proc chanCtxtOpTimer(): pointer = nil
-proc mm_timer_clear(p: pointer) = discard
+when not declared(mm_timer_clear):  # station_sm.nim's fixture platform has one
+  proc mm_timer_clear(p: pointer) = discard
 proc chan_ctxt_op_evt(p: pointer) = channelEnv.currentCtxt = nil
 proc chan_cde_evt(p: pointer) = discard
 '''

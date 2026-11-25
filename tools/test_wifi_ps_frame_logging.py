@@ -9,6 +9,8 @@ from test_wifi_message_allocation import run_program
 
 
 PLATFORM = r'''
+proc irqSave(): uint32 = 0
+proc irqRestore(saved: uint32) = discard
 const
   TASK_API = 9'u8
   VIF_TYPE_STA = 0'u8

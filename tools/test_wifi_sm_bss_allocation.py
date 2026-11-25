@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from test_wifi_disconnect_tx import procedure
+from test_wifi_disconnect_tx import procedure, station_sm_source
 from test_wifi_message_allocation import FW, run_program
 
 
@@ -264,6 +264,7 @@ def source(types: str, scan: str) -> str:
         from test_wifi_auth_frames import layouts
         code += layouts("TxSessionIdentity", "SmTxBuildContext")
         helper = (FW / "station_tx_build.nim").read_text()
+        code += station_sm_source()
         for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
             code += procedure(helper, name)
     code += (FW / "station_bss.nim").read_text()

@@ -39,7 +39,7 @@ proc sm_scan_bss(mac, bss, channel: pointer) =
   if channel != nil: handedChannel = cast[ptr ScanChannelEntry](channel).prim20Freq
 ''', 1)
     code += r'''
-proc smCleanupBegin(p: pointer): bool = false
+proc smTeardown(p: pointer): bool = false
 '''
     rx = (FW / "rx_layer.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()

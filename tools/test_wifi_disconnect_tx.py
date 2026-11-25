@@ -13,13 +13,12 @@ FW = ROOT / "src/bl808/wifi/fw"
 
 PLATFORM = r"""
 proc txlFrameCallbackCurrent(): bool = true
-proc smTxCallbackCurrent(): bool = true
-proc smClaimFlushedDisconnect(p: pointer): bool = false
 const
   MAX_VIFS = 2
   STA_INFO_TAB_ENTRIES = 7
   TASK_SM = 4'u8
-  SmDisconnectingState = 10'u8
+  SmIdleState = 0'u16
+  SmDisconnectingState = 10'u16
 type
   Header {.packed.} = object
     frameControl, duration: uint16
@@ -38,6 +37,7 @@ type
   SmTxBuildContext = object
     identity: tuple[captured: bool, vif: uint8]
     frame: pointer
+    state: uint16
     ownsFrame: bool
   Vif = object
     vifType, state, staIdx, vifIdx, probeCount: uint8
@@ -84,9 +84,9 @@ proc managementReasonBodyAt(p: pointer): ptr ManagementReasonBodyView =
 proc c_memcpy(dst, src: pointer; size: csize_t): pointer =
   copyMem(dst, src, size.int)
   dst
-proc ke_state_set(task, state: uint8) =
-  doAssert task == TASK_SM and state == SmDisconnectingState
-  events.add(("state", nil, 0'u16, 0'u16))
+proc ke_state_set(task: uint8; state: uint16) =
+  doAssert task == TASK_SM
+  events.add(("state", nil, state, 0'u16))
 proc txl_get_seq_ctrl(): uint16 = 0x4560
 proc tpc_update_frame_tx_power(vif, frame: pointer) =
   doAssert frame == addr desc
@@ -114,9 +114,6 @@ proc smTxBeginForVif(vif: uint8): SmTxBuildContext =
 proc smTxBegin(connection: pointer): SmTxBuildContext =
   if connection != nil: result = smTxBeginForVif(connectInfoView(connection).vifIdx)
 proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool = true
-proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint8): bool =
-  ke_state_set(TASK_SM, state)
-  true
 proc smTxOwnerCurrent(build: SmTxBuildContext): bool = true
 proc smTxAdopt(build: var SmTxBuildContext; frame: pointer): bool =
   build.frame = frame
@@ -133,8 +130,11 @@ proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =
   txl_frame_push(build.frame, 3) != 0
 proc sm_disconnect_process(vif: pointer; status, reason: uint16) {.cdecl.} =
   events.add(("disconnect", vif, status, reason))
-proc sm_connect_ind(status, reason: uint16) =
+proc smConnectEnd(status, reason: uint16) =
   events.add(("abort", nil, status, reason))
+proc smTeardown(vif: pointer; indication: pointer = nil; disconnected = false;
+                status = 0'u16; reason = 0'u16): bool {.discardable.} =
+  events.add(("teardown", vif, status, reason))
 proc failed(vif: pointer; status, reason: uint16) {.cdecl.} =
   events.add(("failure", vif, status, reason))
 proc mfp_protect_mgmt_frame(frame: pointer; fc: uint32; category: uint32 = 0): uint32 =
@@ -195,11 +195,15 @@ proc reset(vifIndex, staIndex: uint8) =
 """
 
 CHECKS = r"""
+proc resetAll(vif, station: uint8) =
+  reset(vif, station)
+  smOwn = default(typeof(smOwn))
+
 for vif in 0'u8 .. 1'u8:
   for station in 0'u8 .. 6'u8:
     for requestedMode in 0'u32 .. 2'u32:
       for direct in [false, true]:
-        reset(vif, station)
+        resetAll(vif, station)
         mode = requestedMode
         if direct:
           sm_disconnect(vif)
@@ -207,10 +211,14 @@ for vif in 0'u8 .. 1'u8:
           sm_handle_connection(vif, 0x1234'u16,
             cast[pointer](sm_disconnect_deauth_cfm), cast[pointer](failed))
         doAssert getCalls == 1 and pushCalls == 1 and releases == 0
-        doAssert events.len == 2 and events[0].kind == "state" and events[1].kind == "power",
+        # State 10 is entered once the frame is built, just before the push.
+        doAssert events.len == 2 and events[0].kind == "power" and
+          events[1] == ("state", nil, SmDisconnectingState, 0'u16),
           "cleanup happened before TX confirmation"
         doAssert desc.vifIdx == vif and desc.staInfoIdx == station
-        doAssert desc.callbackArg == addr vifs[vif]
+        # The frame carries the deauthentication wait's stamp, not the VIF.
+        doAssert smOwn.teardown == tdDeauthWait and smDeauthConfirmed(desc.callbackArg)
+        doAssert smGuardArmed
         let header = hostTxDataHeader(addr desc)
         doAssert header.seqCtrl == 0x4560
         let bodyOffset = if requestedMode == 1: 32 else: 24
@@ -230,10 +238,15 @@ for vif in 0'u8 .. 1'u8:
         callback(desc.callbackArg, 0x80000001'u32)
         doAssert events.len == 3
         doAssert events[2] == ("disconnect", cast[pointer](addr vifs[vif]), 19'u16, 3'u16)
+        # A confirmation of an earlier wait is stale once SM moved on.
+        smGo(SmIdleState)
+        doAssert not smGuardArmed
+        callback(desc.callbackArg, 0x80000001'u32)
+        doAssert events.len == 4 and events[3].kind == "state"
 
 for failure in 0 .. 5:
   for direct in [false, true]:
-    reset(1, 4)
+    resetAll(1, 4)
     mode = if failure == 2: 1 else: 2
     case failure
     of 0: allocFail = true
@@ -255,11 +268,11 @@ for failure in 0 .. 5:
     doAssert notifications == 1
 
 for invalid in [2'u8, 255'u8]:
-  reset(0, 0)
+  resetAll(0, 0)
   sm_disconnect(invalid)
   doAssert getCalls == 0 and events.len == 0
 for kind in 0 .. 2:
-  reset(0, 0)
+  resetAll(0, 0)
   case kind
   of 0: vifs[0].state = 0
   of 1: vifs[0].vifType = 2
@@ -267,8 +280,23 @@ for kind in 0 .. 2:
   sm_disconnect(0)
   doAssert getCalls == 0 and pushCalls == 0
 
+# A teardown in progress already ends the link: no second deauthentication.
+resetAll(1, 4)
+sm_disconnect(1)
+doAssert pushCalls == 1
+sm_disconnect(1)
+doAssert pushCalls == 1 and getCalls == 1
+
+# The guard ends a wait whose frame never confirms, as a flush would.
+resetAll(1, 4)
+sm_disconnect(1)
+smDeauthGuardExpired(desc.callbackArg)
+doAssert events[^1] == ("disconnect", cast[pointer](addr vifs[1]), 19'u16, 3'u16)
+smDeauthGuardExpired(desc.callbackArg)
+doAssert events[^1].kind == "disconnect"
+
 # The shared abort path can still queue deauth while connection is incomplete.
-reset(1, 3)
+resetAll(1, 3)
 vifs[1].state = 0
 mode = 0
 sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
@@ -286,13 +314,69 @@ def procedure(source: str, name: str) -> str:
     return source[start.start():start.end() + end.start() if end else len(source)]
 
 
+# The platform station_sm.nim needs, for fixtures that do not model it.
+SM_TIMER = r'''
+when not declared(MmTimerView):
+  type MmTimerView = object
+    link, callback: pointer
+    env, expiry: uint32
+when not declared(mm_timer_clear):
+  var smGuardArmed: bool
+  proc mm_timer_clear(timer: pointer) = smGuardArmed = false
+'''
+SM_WAIT = r'''
+when not declared(mm_timer_set):
+  proc mm_timer_set(timer: pointer; target: uint32) = smGuardArmed = true
+when not declared(macTimeNow):
+  proc macTimeNow(): uint32 = 0
+'''
+SM_SA_QUERY = r'''
+when not declared(smSaQueryEnd):
+  proc smSaQueryEnd() = discard
+'''
+SM_RELEASE = r'''
+when not declared(smActivationCancelConnection):
+  proc smActivationCancelConnection(connection: pointer) = discard
+when not declared(smBssCancel):
+  proc smBssCancel() = discard
+when not declared(smDeferredCancel):
+  proc smDeferredCancel() = discard
+when not declared(ke_msg_free):
+  proc ke_msg_free(p: pointer) = doAssert false, "an unclaimed teardown released a message"
+'''
+
+SM_TEARDOWN = ("smGo", "smDeauthConfirmed", "smDeauthVif", "smTeardownUnclaimed",
+               "smTeardown", "smDeauthGuardExpired", "smDeauthWait")
+
+
+def station_sm_source(*names: str, record: bool = True) -> str:
+    """op.nim, station_sm.nim's record and its named procs (default: smGo).
+
+    The fixture supplies TASK_SM, the SM states, ke_state_set and, for the
+    teardown procs, smCleanupBegin and what smTeardownUnclaimed releases."""
+    names = names or ("smGo",)
+    sm = (FW / "station_sm.nim").read_text().replace(" {.wifiCtrl.}", "")
+    code = ""
+    if record:
+        code += (FW / "op.nim").read_text() + SM_TIMER + sm[sm.index("type\n"):sm.index("proc smGo(")]
+    if "smDeauthWait" in names:
+        code += SM_WAIT
+    if "smDeauthWait" in names or "smTeardown" in names:
+        code += SM_SA_QUERY
+    if "smTeardownUnclaimed" in names:
+        code += SM_RELEASE
+    return code + "".join(procedure(sm, name) for name in names)
+
+
 def test_disconnect_frame_and_completion(tmp_path: Path) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("nim is not installed")
     sm = (FW / "scan_station_ap_me.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()
-    source = PLATFORM + procedure(sm, "me_build_deauthenticate")
+    source = PLATFORM + station_sm_source(
+        "smGo", "smDeauthConfirmed", "smDeauthVif", "smDeauthGuardExpired", "smDeauthWait")
+    source += procedure(sm, "me_build_deauthenticate")
     source += procedure(sm, "sm_disconnect_deauth_cfm")
     source += procedure(sm, "sm_connect_abort_deauth_cfm")
     source += procedure(sm, "sm_handle_connection")

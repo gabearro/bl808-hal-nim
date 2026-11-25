@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, ROOT, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure, station_sm_source
 from test_wifi_station_tx_build import program_source as station_source
 
 SUPPORT = r'''
@@ -36,16 +36,26 @@ proc mfp_protect_mgmt_frame(p: pointer; fc: uint32): uint32 =
 proc mfp_add_mgmt_mic(p, bytes: pointer; length: uint32): uint32 =
   observe(10)
   if badMic: 0'u32 else: 18'u32
-proc sm_disconnect_process(p: pointer; status, reason: uint16) {.cdecl.} =
-  inc disconnects
-  sm.connectInfo = nil
-  currentState = 0
 proc failed(p: pointer; status, reason: uint16) {.cdecl.} =
   inc failures
   failureStatus = status
 proc smCleanupConsumeReply(p: pointer): bool = false
 proc smBssConsumeReply(p: pointer): bool = true
 proc sm_auth_start() = inc authStarts
+'''
+
+TEARDOWN = r'''
+proc sm_disconnect_process(p: pointer; status, reason: uint16) {.cdecl.} =
+  # The real one enters the cleanup, a new SM state.
+  inc disconnects
+  sm.connectInfo = nil
+  smGo(0)
+proc smConnectEnd(status, reason: uint16) =
+  # The real one tears the attempt down: a new SM state.
+  sm_connect_ind(status, reason)
+  smGo(SmDisconnectingState, tdCleanup)
+proc smTeardown(vif: pointer; indication: pointer = nil; disconnected = false;
+                status = 0'u16; reason = 0'u16): bool {.discardable.} = doAssert false
 '''
 
 CHECKS = r'''
@@ -127,17 +137,20 @@ for kind in 0..1:
   action = 6
   sendDeauth(kind)
   doAssert hookFired and pushes == 0 and failures == 0 and vifs[1].staIdx == 3
+# Once queued, the frame's confirmation ends the wait whatever the VIF now
+# holds; the cleanup decides what is left to release.
 prepare(0)
 sendDeauth(0)
 vifs[1].staIdx = 3
 complete()
-doAssert disconnects == 0
+doAssert disconnects == 1
 ''',
     "completion_replacement": r'''
 prepare(0)
 sendDeauth(0)
 doAssert pushes == 1
 sm.connectInfo = addr replacementConn
+smGo(6)
 complete()
 doAssert disconnects == 0 and sm.connectInfo == addr replacementConn,
   "older completion disconnected a replacement attempt"
@@ -179,6 +192,7 @@ for enabled in [false, true]:
   doAssert interruptsEnabled == enabled
 ''',
     "completion_newer_build": r'''
+# A second deauthentication is not sent while the first one's wait is live.
 prepare(0)
 sendDeauth(0)
 let oldFrame = activeFrame
@@ -186,20 +200,23 @@ let oldScope = txlCaptureFrameCallback(oldFrame)
 let callback = oldFrame.callback
 let argument = oldFrame.callbackArg
 sendDeauth(0)
-doAssert pushes == 2
+doAssert pushes == 1 and activeFrame == oldFrame
 txlInvokeFrameCallback(callback, argument, 0, oldScope)
-doAssert disconnects == 0 and sm.connectInfo == addr conn
-complete()
+doAssert disconnects == 1
+txlInvokeFrameCallback(callback, argument, 0, oldScope)
 doAssert disconnects == 1
 ''',
     "completion_state_change": r'''
 prepare(0)
 sendDeauth(0)
-currentState = 9
+smGo(9)
 complete()
 doAssert disconnects == 0 and currentState == 9
 ''',
     "completion_reset_retirement": r'''
+# A frame retired by a TX reset (or aged out after one: disruption 1) still
+# ends the wait it carries; only an argument that is not the wait's stamp
+# (disruption 6, the vendor's VIF pointer) is ignored. Exactly once.
 for disruption in 0 .. 6:
   prepare(0)
   sendDeauth(0)
@@ -216,12 +233,9 @@ for disruption in 0 .. 6:
   of 5: sm.connectInfo = addr replacementConn
   else: discard
   txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
-  doAssert disconnects == (if disruption == 0: 1 else: 0)
-  if disruption == 0:
-    sm.connectInfo = addr conn
-    currentState = SmDisconnectingState
+  doAssert disconnects == (if disruption == 6: 0 else: 1)
   txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
-  doAssert disconnects == (if disruption == 0: 1 else: 0)
+  doAssert disconnects == (if disruption == 6: 0 else: 1)
   txResetActive = false
 ''',
     "connected_without_attempt": r'''
@@ -236,7 +250,9 @@ doAssert disconnects == 1
 for replace in [false, true]:
   prepare(0)
   sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
-  if replace: sm.connectInfo = addr replacementConn
+  if replace:
+    sm.connectInfo = addr replacementConn
+    smGo(6)
   complete()
   doAssert failures == (if replace: 0 else: 1)
   if not replace: doAssert failureStatus == 23
@@ -256,7 +272,8 @@ for mode in 0'u32..2:
   mfpMode = mode
   sendDeauth(0)
   doAssert pushes == 1 and failures == 0 and disconnects == 0
-  doAssert currentState == 10 and activeFrame.callbackArg == addr vifs[1]
+  doAssert currentState == 10 and smOwn.teardown == tdDeauthWait
+  doAssert smDeauthConfirmed(activeFrame.callbackArg)
   let expected = if mode == 1: 42'u16 elif mode == 2: 44'u16 else: 26'u16
   doAssert activeFrame.frameLen == expected and activeFrame.seqPassthrough == expected
   complete()
@@ -341,7 +358,10 @@ def source() -> str:
     extras = rest[extra_start:extra_end]
     rest = rest[:extra_start] + rest[extra_end:]
     code = first + extras + "\n" + marker + rest
-    for name in ["me_build_deauthenticate", "smClaimFlushedDisconnect", "sm_disconnect_deauth_cfm",
+    code += TEARDOWN
+    code += station_sm_source("smDeauthConfirmed", "smDeauthVif", "smDeauthGuardExpired",
+                              "smDeauthWait", record=False)
+    for name in ["me_build_deauthenticate", "sm_disconnect_deauth_cfm",
                  "sm_connect_abort_deauth_cfm", "sm_handle_connection", "smDeauthSend", "sm_deauth_send"]:
         if not re.search(rf"^proc {name}\*?\(", sm, re.M):
             continue

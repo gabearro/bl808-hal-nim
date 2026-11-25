@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from test_wifi_ap_start import program_source
-from test_wifi_disconnect_tx import FW, ROOT, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure, station_sm_source
 
 PREFIX = r'''
 {.pragma: wifiCtrl.}
@@ -34,7 +34,7 @@ var
   fakeMacState: uint32
   allocationHook, disconnectedHook, indicationHook, freeHook, scanRemoveHook, timerClearHook: proc()
   smStateHook: proc()
-  smSaQuery: tuple[serial: uint32]
+  smSaQuery: tuple[serial: uint32, armed: bool]
   onIrqRestore: proc()
   recycleOnFree, recycledHeader: pointer
 proc smCleanupForget(header: pointer)
@@ -296,69 +296,15 @@ doAssert finishedInside and notifications.len == 1
 doAssert not smCleanupServicing and rxHostStationIndicationTop == nil
 completed()
 ''',
-    "disconnect_timer_replacement": r'''
-let connection = sm.connectInfo
+    "disconnect_ends_sa_query": r'''
+# Every teardown ends SA Query first: the link it probes is going away.
 sm.saQueryActive = 1
+smSaQuery.armed = true
 sm_reconn_dominant_flag = 1
-timerClearHook = proc() =
-  doAssert sm.saQueryActive == 0
-  doAssert sm_reconn_dominant_flag == 1
-  inc rxVifEpochs[0]
-  sm.saQueryActive = 1
 sm_disconnect_process(addr vifs[0], 7, 7)
 doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
-doAssert sm.saQueryActive == 1 and sm.connectInfo == connection
-doAssert sm_reconn_dominant_flag == 1
-doAssert not smCleanup.active and notifications.len == 0 and callbackCalls == 0
-doAssert vifs[0].state == 1 and vifs[0].staIdx == 2
-doAssert vifs[0].chanCtxt == (addr cleanupChannel) and interruptsEnabled
-timerClearHook = nil
-sm_disconnect_process(addr vifs[0], 7, 7)
-doAssert sm_reconn_dominant_flag == 0
-drain()
-completed()
-doAssert notifications.len == 1 and notifications[0].status == 7 and notifications[0].reason == 7
-''',
-    "disconnect_detaches_timer_before_unlock": r'''
-let owner = SmDisconnectHandoff(peer: mmCaptureVif(addr vifs[0]),
-  connection: sm.connectInfo, resetEpoch: txResetEpoch, state: SmDisconnectingState)
-sm.saQueryActive = 1
-var replacementArmed = false
-onIrqRestore = proc() =
-  doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
-  inc rxVifEpochs[0]
-  sm.saQueryActive = 1
-  replacementArmed = true
-smDisconnectOwned(owner, 7, 7)
-doAssert replacementArmed and interruptsEnabled and sm.saQueryActive == 1
-doAssert not smCleanup.active and callbackCalls == 0 and notifications.len == 0
-doAssert sm.connectInfo == owner.connection and vifs[0].state == 1
-ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
-doAssert allocated.len == 0
-''',
-    "query_serial_owns_cleanup_across_timer_clear": r'''
-smSaQuery.serial = 41
-let stale = SmDisconnectHandoff(peer: mmCaptureVif(addr vifs[0]),
-  connection: sm.connectInfo, resetEpoch: txResetEpoch, state: SmDisconnectingState,
-  saQuerySerial: 40)
-sm.saQueryActive = 1
-smDisconnectOwned(stale, 7, 7)
-doAssert timerClears.len == 0 and sm.saQueryActive == 1 and not smCleanup.active
-
-var current = stale
-current.saQuerySerial = 41
-timerClearHook = proc() =
-  doAssert interruptsEnabled and sm.saQueryActive == 0
-  inc smSaQuery.serial
-  sm.saQueryActive = 1
-smDisconnectOwned(current, 7, 7)
-doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
-doAssert sm.saQueryActive == 1 and smSaQuery.serial == 42
-doAssert not smCleanup.active and callbackCalls == 0 and notifications.len == 0
-
-timerClearHook = nil
-current.saQuerySerial = 42
-smDisconnectOwned(current, 7, 7)
+doAssert sm.saQueryActive == 0 and not smSaQuery.armed
+doAssert sm_reconn_dominant_flag == 0 and smCleanup.active and smState == 10
 drain()
 completed()
 doAssert notifications.len == 1 and notifications[0].status == 7 and notifications[0].reason == 7
@@ -846,48 +792,40 @@ doAssert controlReplies.len == 0 and allocated.len == 2
 ke_msg_free(keMsgHdrFromPayload(replacementConnection))
 ke_msg_free(keMsgHdrFromPayload(replacementIndication))
 ''',
-    "failure_scan_replacement": r'''
+    "failure_removes_scan_result_before_claim": r'''
+# The failed attempt's scan result is dropped while SM still holds the
+# attempt; the cleanup then claims it. The removal only frees a cached frame.
 sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
 sm.scanResultIndex = 0
-var replacementConnection, replacementIndication: pointer
+let attempt = sm.connectInfo
 scanRemoveHook = proc() =
-  ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
-  ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
-  replacementConnection = newMessage(0x1000, TASK_SM, TASK_API, 32)
-  replacementIndication = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
-  sm.connectInfo = replacementConnection
-  sm.connectIndMsg = replacementIndication
-  sm.scanResultIndex = 42
-  inc rxVifEpochs[0]
-  smState = 4
+  doAssert sm.connectInfo == attempt and not smCleanup.active and smState == SmSettingBssState
+smState = SmSettingBssState
 sm_connect_ind(8, 15)
-doAssert sm.connectInfo == replacementConnection and sm.connectIndMsg == replacementIndication
-doAssert sm.scanResultIndex == 42 and smState == 4 and not smCleanup.active
-ke_msg_free(keMsgHdrFromPayload(replacementConnection))
-ke_msg_free(keMsgHdrFromPayload(replacementIndication))
+doAssert sm.scanResultIndex == 0xFFFFFFFF'u32 and sm.connectInfo == nil
+doAssert smCleanup.active and smState == SmDisconnectingState
+drain()
+completed()
+doAssert controlReplies.len == 1 and controlReplies[0].id == SM_CONNECT_IND_MSG
 ''',
-    "failure_state_replacement": r'''
+    "failure_publishes_state_after_claim": r'''
+# State 10 becomes visible only once the cleanup owns the attempt.
 smState = SmSettingBssState
 sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
-var replacementConnection, replacementIndication: pointer
+var observed = false
 smStateHook = proc() =
-  doAssert smState == SmDisconnectingState
   smStateHook = nil
-  ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
-  ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
-  replacementConnection = newMessage(0x1000, TASK_SM, TASK_API, 32)
-  replacementIndication = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
-  sm.connectInfo = replacementConnection
-  sm.connectIndMsg = replacementIndication
-  sm.scanResultIndex = 42
-  inc rxVifEpochs[0]
-  smState = SmSettingBssState
+  doAssert smState == SmDisconnectingState
+  doAssert smCleanup.active and sm.connectInfo == nil and sm.connectIndMsg == nil,
+    "state 10 published before the cleanup claimed the attempt"
+  observed = true
 sm_connect_ind(8, 15)
-doAssert sm.connectInfo == replacementConnection and sm.connectIndMsg == replacementIndication
-doAssert sm.scanResultIndex == 42 and smState == SmSettingBssState and not smCleanup.active
-doAssert allocated.len == 2 and callbackCalls == 0
-ke_msg_free(keMsgHdrFromPayload(replacementConnection))
-ke_msg_free(keMsgHdrFromPayload(replacementIndication))
+doAssert observed
+sm_connect_ind(9, 15)
+doAssert smCleanup.active, "a second end of the attempt restarted the teardown"
+drain()
+completed()
+doAssert controlReplies.len == 1
 ''',
     "reply_callback_replacement": r'''
 sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
@@ -1057,7 +995,7 @@ def program(case: str, mutation: str | None = None) -> str:
                         "  timerClears.add(id)\n  if timerClearHook != nil: timerClearHook()\n")
     layout = (FW / "layout_types.nim").read_text()
     payload = "type\n  SmConnectIndPayload" + layout.split("  SmConnectIndPayload", 1)[1].split("\n\n  ", 1)[0] + "\n"
-    for name in ("MmVifIdentity", "SmDisconnectHandoff"):
+    for name in ("MmVifIdentity",):
         payload += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     code = PREFIX + "proc captureNotification(p: pointer)\n" + code + payload + PLATFORM
     code += """
@@ -1081,7 +1019,6 @@ template rxHostIrqRestore(saved: uint32) = irqRestore(saved)
         code += procedure((FW / "kernel_mac_channel.nim").read_text(), name)
     cleanup = (FW / "station_cleanup.nim").read_text()
     station = (FW / "scan_station_ap_me.nim").read_text()
-    code += procedure(station, "smDisconnectHandoffCurrent")
     if mutation:
         before, after = {
             "power_save": ("needed: [true, vif.state != 0,", "needed: [false, vif.state != 0,"),
@@ -1094,12 +1031,17 @@ template rxHostIrqRestore(saved: uint32) = irqRestore(saved)
         }[mutation]
         assert before in cleanup, mutation
         cleanup = cleanup.replace(before, after)
+    code += ("proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;\n"
+             "                    disconnected = false; status = 0'u16; reason = 0'u16): bool\n")
+    code += procedure((FW / "station_sa_query.nim").read_text(), "smSaQueryEnd")
+    code += station_sm_source("smGo", "smDeauthConfirmed", "smDeauthVif",
+                              "smTeardownUnclaimed", "smTeardown")
     code += cleanup
     tasks = (FW / "task_handlers.nim").read_text()
     for name in ["smSetActiveCfmStateAllowed", "me_set_active_cfm_handler_sm",
                  "me_set_ps_disable_cfm_handler_sm", "mm_sta_del_req_handler", "sm_delete_resources"]:
         code += procedure(tasks, name)
-    for name in ("smDisconnectOwned", "sm_disconnect_process", "smConnectIndLocked", "sm_connect_ind"):
+    for name in ("sm_disconnect_process", "smConnectEnd", "sm_connect_ind"):
         code += procedure(station, name)
     if case == "established_supplicant_failure":
         code += "\nconst WLAN_FW_4WAY_HANDSHAKE_ERROR_PSK_TIMEOUT_FAILURE = 8\n"

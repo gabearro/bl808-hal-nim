@@ -15,7 +15,7 @@ def admission_source() -> str:
 var cleanupStarts = 0
 var cleanupAllowed = true
 var cleanupImmediate, cleanupReplaced, cleanupVifChanged: bool
-proc smCleanupBegin(p: pointer): bool =
+proc smTeardown(p: pointer): bool =
   inc cleanupStarts
   doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
   if not cleanupAllowed: return false

@@ -109,7 +109,8 @@ for enabled in [false, true]:
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_handshake_timeout_before_transmission(tmp_path: Path, mode: str) -> None:
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    code = "import strutils\n" + with_printf(supplicant.SUPPLICANT_PLATFORM + supplicant.EXTENSION)
+    code = "import strutils\n" + with_printf(supplicant.SUPPLICANT_PLATFORM + supplicant.DEAUTH_WAIT +
+                                              supplicant.EXTENSION)
     code += "proc sm_supplicant_deauth_cfm(p: pointer; status: uint32) {.cdecl.} = discard\n"
     code += procedure(scan, "me_build_deauthenticate")
     code += supplicant.established_path(scan)

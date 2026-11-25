@@ -962,6 +962,8 @@ proc mm_connection_loss_ind_handler*(param: pointer): cint {.exportc, cdecl, dis
   ## Handle connection loss indication (116 bytes in blob, sm_task.o).
   ## Blob: ke_state_get(SM), check VIF type/active, ke_state_set(SM,10),
   ## sm_connection_tlv_set, sm_disconnect_process(vif, reason, 0xFFFF).
+  ## Here sm_disconnect_process enters state 10 once its cleanup has claimed
+  ## the link.
   if param == nil: return KeMsgConsumed
   let saved = irqSave()
   let tag = mmConnLossTagFor(param)
@@ -973,20 +975,14 @@ proc mm_connection_loss_ind_handler*(param: pointer): cint {.exportc, cdecl, dis
   if ke_state_get(TASK_SM) != SmIdleState:
     irqRestore(saved)
     return KeMsgSaved
-  let identity = tag.identity
-  let vif = vifChannelAt(identity.vif)
-  if vif.vifType != VIF_TYPE_STA or vif.state == 0:
-    tag.consumed = true
-    irqRestore(saved)
-    return KeMsgConsumed
+  let vif = tag.identity.vif
   let reason = tag.reason
-  let handoff = SmDisconnectHandoff(peer: identity, connection: smEnvView().connectInfo,
-    resetEpoch: tag.resetEpoch, state: SmDisconnectingState)
   tag.consumed = true
-  ke_state_set(TASK_SM, SmDisconnectingState)
   irqRestore(saved)
+  if vifChannelAt(vif).vifType != VIF_TYPE_STA or vifChannelAt(vif).state == 0:
+    return KeMsgConsumed
   sm_connection_tlv_set()
-  smDisconnectOwned(handoff, reason, 0xFFFF'u16)
+  sm_disconnect_process(vif, reason, 0xFFFF'u16)
   return 0
 
 proc mm_bss_param_setting_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
@@ -2168,7 +2164,7 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       earlyExit = true
     elif vif.staIdx != 0xFF or vif.chanCtxt != nil:
       # Retain the request in the saved queue until normal cleanup finishes.
-      let started = smCleanupBegin(cast[pointer](vif))
+      let started = smTeardown(cast[pointer](vif))
       if started and ke_state_get(TASK_SM) != SmIdleState:
         return KeMsgSaved
       if not started or sm.connectInfo != nil or sm.connectIndMsg != nil or
@@ -2454,10 +2450,11 @@ proc sm_sa_query_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, di
     return 0
   sm.saQueryActive = 0
   locked = false
+  irqRestore(saved)
   when defined(bl808WifiDiagLinkDrop):
-    smReportApDisconnectLocked(smSaQuery.peer, sm.saQueryReason, saved, smSaQuery.evidence, serial)
+    smReportApDisconnect(smSaQuery.peer, sm.saQueryReason, smSaQuery.evidence)
   else:
-    smReportApDisconnectLocked(smSaQuery.peer, sm.saQueryReason, saved, saQuerySerial = serial)
+    smReportApDisconnect(smSaQuery.peer, sm.saQueryReason)
   return 0
 
 proc sm_disconnect*(vifIdx: uint8) {.exportc, cdecl.} =
@@ -2472,7 +2469,7 @@ proc sm_disconnect*(vifIdx: uint8) {.exportc, cdecl.} =
 
 proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
   ## Retire STA state through the vendor's ME/MM cleanup exchange.
-  discard smCleanupBegin(param)
+  smTeardown(param)
 
 proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uint16 = 0, challenge: pointer = nil) {.exportc, cdecl.} =
   ## Send auth/assoc on appropriate channel (226 bytes in blob, 57 instrs).
@@ -2549,17 +2546,16 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uin
                             nextState.uint32, cast[uint32](cast[uint](msg)))
     chan_ctxt_set_auth_assoc_req(msg)
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_supplicant_deauth_cfm(void*,unsigned long);".}
 proc sm_supplicant_deauth_cfm*(param: pointer; status: uint32) {.exportc, cdecl.} =
-  ## Report supplicant deauth completion; bit 23 records the MAC ACK.
-  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return
+  ## Report supplicant deauth completion; bit 23 records the MAC ACK. Any
+  ## status ends the wait, as in the blob; param is the wait's stamp.
+  if not smDeauthConfirmed(param): return
   if (status and 0x00800000'u32) == 0:
     let logFn = getLogFunc(204)
     if logFn != nil:
       logFn(3, nil, "sm.c", 1717,
             cstring("sm deauth frame transmit failure\r\n"))
-  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return
-  sm_connect_ind(8, 15)
+  smConnectEnd(8, 15)
 
 # --- APM Task Handlers (apm_task.o) ---
 
@@ -3286,9 +3282,8 @@ proc me_set_active_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_acti
     inc nimFwDbgActiveCfmBadState
     nimFwDbgActiveCfmLastState = ke_state_get(TASK_SM).uint32
     return 0
-  if ke_state_get(TASK_SM) == SmDisconnectingState:
-    ke_state_set(TASK_SM, SmIdleState)
-    return 0
+  # The blob's state-10 branch (set idle) is station_cleanup's last step
+  # here: smBssConsumeReply above only accepts a reply in state 4.
   let sm = smEnvView()
   let connection = sm.connectInfo
   if connection == nil: return 0

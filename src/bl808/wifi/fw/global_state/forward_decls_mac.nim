@@ -212,11 +212,7 @@ proc smTxEnd(build: var SmTxBuildContext)
 proc smTxFail(build: var SmTxBuildContext; status: uint16)
 proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool
 proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool
-proc smTxCallbackCurrent(): bool
-proc smAdvanceTxSerial(vifIndex: uint8) {.inline.}
 proc smDeauthSend(build: var SmTxBuildContext)
-proc txlFrameBindSmOwner(desc: ptr HostTxDescView; connection: pointer;
-                         serial: uint32; state: uint16): bool
 proc smTxArmResponse(build: var SmTxBuildContext; delay: uint32): bool
 proc smAuthRecordResponse(build: var SmTxBuildContext; algorithm: uint8;
                           txSequence: uint16): bool
@@ -234,8 +230,6 @@ proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
 proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
                         bodyLenOut, connInfo: pointer; build: ptr SmTxBuildContext): uint32
 proc txl_frame_try_push_force(param: pointer; ac: uint8): uint8
-proc smDisconnectHandoffCurrent(handoff: SmDisconnectHandoff): bool
-proc smDisconnectOwned(handoff: SmDisconnectHandoff; statusCode, reasonCode: uint16)
 proc smCleanupOwnsRequest(request: pointer): bool
 proc smCleanupAdmitRequest(request: pointer): bool
 proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer
@@ -244,8 +238,7 @@ proc smCleanupCancel()
 proc smCleanupNeedsService(): bool
 proc smCleanupService()
 proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
-                    disconnected = false; status = 0'u16; reason = 0'u16;
-                    handoff = default(SmDisconnectHandoff)): bool
+                    disconnected = false; status = 0'u16; reason = 0'u16): bool
 proc mmPsModeCancel()
 proc mmPsModeComplete()
 proc mmPsModeRetryAfterReset()

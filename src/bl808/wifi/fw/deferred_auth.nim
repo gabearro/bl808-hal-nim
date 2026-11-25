@@ -144,8 +144,8 @@ proc smDeferredPark(payload: pointer) =
     return
   tag.location = smDeferredParked
   chanEnvView().deferredMsg = payload
-  # Make state visible before ke_state_set can make saved work runnable.
-  ke_state_set(TASK_SM, tag.state)
+  # Make state visible before the state change can make saved work runnable.
+  smGo(tag.state)
   irqRestore(saved)
 
 proc smDeferredWake(vifEntry: pointer; unlinked: bool) =

@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_message_allocation import run_program
 
 
@@ -179,6 +179,7 @@ def source() -> str:
     code += "\nproc sm_join_bss*(bssid, ssid, joinInfo: pointer; flag: bool) {.exportc, cdecl.}\n"
     code += "proc sm_scan_bss*(bssid, ssid, chanInfo: pointer) {.exportc, cdecl.}\n" + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
+    code += station_sm_source()
     for name in ["smTxCapture", "smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     for name in ["connectInfoSsidLen", "connectInfoFillSsidSlot"]:

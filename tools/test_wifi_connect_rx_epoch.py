@@ -234,7 +234,7 @@ doAssert sm.cancelRequested == 1 and sm.connectModeFlags == 0
 def test_connect_rx_epoch(tmp_path: Path, mode: str) -> None:
     tasks = (FW / "task_handlers.nim").read_text()
     source = PLATFORM + r'''
-proc smCleanupBegin(p: pointer): bool =
+proc smTeardown(p: pointer): bool =
   doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
   inc cleanups
   currentState = 10

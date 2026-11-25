@@ -2982,7 +2982,7 @@ proc mmPublishConnectionLoss(vifEntry: pointer; reason: uint16;
   ind.vifIdx = identity.index
   let tag = mmConnLossTagAt(ind)
   tag[] = MmConnLossTag(next: mmConnLossTags, header: cast[pointer](header),
-    identity: identity, resetEpoch: resetEpoch, reason: reason,
+    identity: identity, reason: reason,
     tracksProbe: tracksProbe, probeEpoch: expectedProbe)
   mmConnLossTags = tag
   outside: ke_msg_send(ind)

@@ -25,7 +25,6 @@ const
   RC_PRNG_MULT = 1103515245'u32
   RC_PRNG_INCR = 12345'u32
   SM_SA_QUERY_TIMEOUT_IND_MSG = 0x1009'u16
-  SmIdleState = 0'u8
   KeMsgConsumed = 0.cint
   KeMsgSaved = 2.cint
   VIF_TYPE_STA = 0'u8
@@ -53,7 +52,7 @@ var
   timers: seq[TimerCall]
   smQueryPrngState = 1'u32
   rcPrngCalls, printfCalls: int
-  currentState: uint8
+  currentState: uint16
   macNow: uint32
   timerAllocFails: bool
   onTimerClear, onPrintf: proc()
@@ -69,8 +68,8 @@ proc rxuMgtIndMsgAt(p: pointer): ptr MgtPrefix = cast[ptr MgtPrefix](p)
 proc macDataFrameAt(p: pointer): ptr Header = cast[ptr Header](p)
 proc setFrameLen(p: pointer; length: uint16) = rxuMgtIndMsgAt(p).frameLen = length
 proc KE_FIRST_MSG(task: uint16): uint16 = task shl 10
-proc ke_state_get(task: uint8): uint8 = currentState
-proc ke_state_set(task, state: uint8) =
+proc ke_state_get(task: uint8): uint16 = currentState
+proc ke_state_set(task: uint8; state: uint16) =
   doAssert task == TASK_SM and state == SmDisconnectingState
   currentState = state
   events.add(("state", nil, 0'u16, 0'u16))
@@ -353,11 +352,14 @@ sm_issue_sa_query_request()
 doAssert env.saQueryActive == 0 and not smSaQuery.armed
 doAssert printfCalls == 0
 
+# The log precedes the teardown, as in sm.o. A host callback cannot re-enter
+# the firmware step, so nothing re-checks the peer after it.
 setupSA(1, 4)
 seedSaQuery(1, armed = true)
-onPrintf = proc() = inc rxVifEpochs[1]
+onPrintf = proc() = doAssert events.len == 0
 deliverSaExpiry()
-doAssert printfCalls == 1 and events.len == 0 and currentState == SmIdleState
+doAssert printfCalls == 1
+doAssert events[^1] == ("disconnect", cast[pointer](addr vifs[1]), 7'u16, 7'u16)
 """
 
 
@@ -391,7 +393,7 @@ def ownership_source(*, real_rx: bool = True, tx_path: bool = True) -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     tx = (FW / "tx_layer.nim").read_text()
     identity = "type\n"
-    for name in ("MmVifIdentity", "SmDisconnectHandoff"):
+    for name in ("MmVifIdentity",):
         identity += "  " + name + layout.split("  " + name, 1)[1].split("\n\n", 1)[0] + "\n"
     if tx_path:
         identity += "  TxSessionIdentity" + layout.split("  TxSessionIdentity", 1)[1].split("\n\n", 1)[0] + "\n"
@@ -410,9 +412,8 @@ proc irqRestore(saved: uint32) =
     let action = onIrqRestore
     onIrqRestore = nil
     action()
-proc smConnectIndLocked(status, reason: uint16; saved: uint32) =
-  irqRestore(saved)
-  sm_connect_ind(status, reason)
+when not declared(sm_connect_ind):
+  proc sm_connect_ind(status, reason: uint16) = smConnectEnd(status, reason)
 var
   queuedSaExpiry: seq[uint32]
   saExpiryStorage: uint32
@@ -437,17 +438,9 @@ proc txlFrameSessionCurrent(p: ptr HostTxDescView): bool = frameLeased
 proc txlFrameLeaseMatches(p: ptr HostTxDescView; generation: uint32): bool =
   frameLeased and generation == frameGeneration
 ''' + "".join(procedure(tx, name) for name in ("txlSessionCurrent", "txlStationAdmits", "txlFramePreparationCurrent"))
-    return (code + procedure(kernel, "mmCaptureVif") + procedure(kernel, "mmVifCurrent") + r'''
-proc smDisconnectHandoffCurrent(handoff: SmDisconnectHandoff): bool
-proc smDisconnectOwned(handoff: SmDisconnectHandoff; status, reason: uint16) =
-  doAssert smDisconnectHandoffCurrent(handoff)
-  teardownInterruptsEnabled = interruptsEnabled
-  ke_state_set(TASK_SM, SmDisconnectingState)
-  sm_disconnect_process(handoff.peer.vif, status, reason)
-''' +
+    return (code + procedure(kernel, "mmCaptureVif") + procedure(kernel, "mmVifCurrent") +
         (rx_ownership_source() if real_rx else "") +
-        (FW / "station_sa_query.nim").read_text().replace(" {.wifiCtrl.}", "") + "\n" +
-        procedure((FW / "scan_station_ap_me.nim").read_text(), "smDisconnectHandoffCurrent"))
+        (FW / "station_sa_query.nim").read_text().replace(" {.wifiCtrl.}", "") + "\n")
 
 
 def platform() -> str:
@@ -457,7 +450,11 @@ def platform() -> str:
         declarations += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     source = (FW / "scan_station_ap_me.nim").read_text()
     base = PLATFORM.replace(procedure(PLATFORM, "ke_state_set"),
-                            "proc ke_state_set(task, state: uint8)\n")
+                            "proc ke_state_set(task: uint8; state: uint16)\n")
+    # The teardown (smTeardown) runs with the caller's interrupt state.
+    teardown = "proc sm_disconnect_process(vif: pointer; status, reason: uint16) {.cdecl.} =\n"
+    assert base.count(teardown) == 1
+    base = base.replace(teardown, teardown + "  teardownInterruptsEnabled = interruptsEnabled\n")
     base = r'''
 var
   frameGeneration, txResetEpoch: uint32
@@ -548,17 +545,13 @@ doAssert pushCalls == 1 and env.saQueryRetryCount == 1 and smSaQuery.armed
 deliverSaExpiry(replacement)
 doAssert pushCalls == 1 and env.saQueryRetryCount == 1
 
-for completeInLogger in [false, true]:
-  setupSA(1, 4)
-  seedSaQuery(1, armed = true)
-  onPrintf = proc() =
-    seedSaQuery(1, armed = true)
-    if completeInLogger:
-      env.saQueryActive = 0
-      smSaQuery.armed = false
-  deliverSaExpiry()
-  doAssert printfCalls == 1 and events.len == 0 and currentState == SmIdleState
-  doAssert (env.saQueryActive != 0) == not completeInLogger
+# The exhausted query reports its peer's disconnect once.
+setupSA(1, 4)
+seedSaQuery(1, armed = true)
+deliverSaExpiry()
+doAssert printfCalls == 1 and events.len == 1 and env.saQueryActive == 0
+deliverSaExpiry()
+doAssert printfCalls == 1 and events.len == 1
 ''')
 
 
@@ -584,6 +577,10 @@ def reset_boundary_source() -> str:
     platform = (FW / "platform_bl.nim").read_text()
     forwards = (FW / "global_state/forward_decls_mac.nim").read_text()
     source = exchange_source().replace("  doAssert offset == 4\n", "  if offset == 188: return nil\n  doAssert offset == 4\n")
+    sm_state = "  doAssert task == TASK_SM and state == SmDisconnectingState\n"
+    assert source.count(sm_state) == 1
+    # MM's recovery sets HW_ACTIVE (3) on TASK_MM (0).
+    source = source.replace(sm_state, "  if task == 0'u8:\n    doAssert state == 3\n    return\n" + sm_state)
     scope = forwards[forwards.index("template smSaQueryResetScope()"):].split("\n\n", 1)[0]
     source += "\n" + scope + "\n"
     source += r'''
@@ -631,7 +628,6 @@ proc txl_reset(): bool =
   inc txResetEpoch
   true
 proc mmEnvView(): ptr typeof(mm) = addr mm
-proc ke_state_set(task: uint8; state: uint16) = doAssert task == TASK_MM and state == HW_ACTIVE
 proc mm_reset() = discard
 proc vif_mgmt_reset() = discard
 proc apmResumeHaltRollback() = discard
@@ -729,14 +725,6 @@ for timeout in [false, true]:
     doAssert teardownInterruptsEnabled == incoming
     doAssert events[^1] == ("disconnect", cast[pointer](addr vifs[1]), 7'u16, 7'u16)
     doAssert interruptsEnabled == incoming
-
-  setupSA(1, 4)
-  onIrqRestore = proc() =
-    inc rxVifEpochs[1]
-    env.saQueryActive = 1
-  trigger(timeout)
-  doAssert printfCalls == 0 and events.len == 0 and interruptsEnabled
-  doAssert currentState == SmIdleState and env.saQueryActive == 1
 ''')
 
 
@@ -853,12 +841,6 @@ sm_deauth_handler(addr incoming)
 doAssert nimFwDbgPeerDisconnect[1] == 123, "late event overwrote the first decision"
 
 nimFwDbgPeerDisconnect = default(typeof(nimFwDbgPeerDisconnect))
-incoming = prepareFrame(false)
-onPrintf = proc() = inc rxVifEpochs[1]
-sm_deauth_handler(addr incoming)
-doAssert nimFwDbgPeerDisconnect[0] == 0
-doAssert events.len == 0 and currentState == SmIdleState, "a retired peer reached teardown"
-
 incoming = prepareFrame(true)
 allocFail = true
 sm_deauth_handler(addr incoming)
@@ -910,42 +892,33 @@ for protection in [rxMgtProtectionUnknown, rxMgtVerifiedCcmp, rxMgtVerifiedBip, 
 
 def test_peer_disconnect_freezes_keepalive_history_at_commit(tmp_path: Path) -> None:
     run_nim(tmp_path, exchange_source() + history_source() + r'''
-for retireBeforeDecision in [false, true]:
-  setupSA(1, 4)
-  nimFwDbgPeerDisconnect = default(typeof(nimFwDbgPeerDisconnect))
-  nimFwDbgTrafficProbeHistory = default(typeof(nimFwDbgTrafficProbeHistory))
-  macNow = 90
-  mmRecordTrafficProbeCompletion(0x80800000'u32)
-  var msg = SmDeauthFrameView(vifIdx: 1, staIdx: 4,
-    sa: vifs[1].macAddr, bssid: vifs[1].bssid, reason: 7)
-  setFrameLen(addr msg, 26)
-  var observedCommit = false
-  onPrintf = proc() =
-    macNow = 100
-    mmRecordTrafficProbeCompletion(0x80010700'u32)
-    if retireBeforeDecision:
-      inc rxVifEpochs[1]
-    else:
-      onIrqRestore = proc() =
-        observedCommit = true
-        doAssert nimFwDbgPeerDisconnect[0..1] == [0x50454552'u32, 100]
-        macNow = 110
-        mmRecordTrafficProbeCompletion(0x40000000'u32)
-  sm_deauth_handler(addr msg)
-  doAssert observedCommit == not retireBeforeDecision
-  doAssert nimFwDbgTrafficProbeHistory[0..6] ==
-    [4'u32, 1, 0, 90, 0x80800000'u32, 100, 0x80010700'u32]
-
-  # A replacement association must not overwrite the first valid trace.
-  setupSA(1, 4)
-  macNow = 200
-  mmRecordTrafficProbeCompletion(0x80800000'u32)
-  if retireBeforeDecision:
-    doAssert nimFwDbgPeerDisconnect[0] == 0
-    doAssert nimFwDbgTrafficProbeHistory[0] == 6
-    doAssert nimFwDbgTrafficProbeHistory[7..8] == [200'u32, 0x80800000'u32]
-  else:
+setupSA(1, 4)
+nimFwDbgPeerDisconnect = default(typeof(nimFwDbgPeerDisconnect))
+nimFwDbgTrafficProbeHistory = default(typeof(nimFwDbgTrafficProbeHistory))
+macNow = 90
+mmRecordTrafficProbeCompletion(0x80800000'u32)
+var msg = SmDeauthFrameView(vifIdx: 1, staIdx: 4,
+  sa: vifs[1].macAddr, bssid: vifs[1].bssid, reason: 7)
+setFrameLen(addr msg, 26)
+var observedCommit = false
+onPrintf = proc() =
+  macNow = 100
+  mmRecordTrafficProbeCompletion(0x80010700'u32)
+  onIrqRestore = proc() =
+    observedCommit = true
     doAssert nimFwDbgPeerDisconnect[0..1] == [0x50454552'u32, 100]
-    doAssert nimFwDbgTrafficProbeHistory[0] == 4
-  doAssert interruptsEnabled
+    macNow = 110
+    mmRecordTrafficProbeCompletion(0x40000000'u32)
+sm_deauth_handler(addr msg)
+doAssert observedCommit
+doAssert nimFwDbgTrafficProbeHistory[0..6] ==
+  [4'u32, 1, 0, 90, 0x80800000'u32, 100, 0x80010700'u32]
+
+# A replacement association must not overwrite the first valid trace.
+setupSA(1, 4)
+macNow = 200
+mmRecordTrafficProbeCompletion(0x80800000'u32)
+doAssert nimFwDbgPeerDisconnect[0..1] == [0x50454552'u32, 100]
+doAssert nimFwDbgTrafficProbeHistory[0] == 4
+doAssert interruptsEnabled
 ''', "bl808WifiDiagLinkDrop", "bl808WifiDiagTrafficProbeHistory")
