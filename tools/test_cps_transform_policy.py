@@ -6138,7 +6138,9 @@ def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
     assert "if keTimerScheduling: return" in timer_body
     assert "id == SCAN_PROBE_TIMER and dest == TASK_SCAN" in timer_body
     assert "ke_msg_try_alloc(id, dest, 0xFF, 0)" in timer_body
-    assert "ke_msg_alloc(id, dest, 0xFF, 0)" in timer_body
+    # An expiry that cannot be allocated is retried, not asserted.
+    assert "ke_msg_alloc(id, dest, 0xFF, 0)" not in timer_body
+    assert "keTimerRequeue(expiredTimerEntry, 1000, false)" in timer_body
     assert "if keTimerExpiryCurrent:" in timer_body
     assert "ke_msg_free(keMsgHdrFromPayload(message))" in timer_body
     assert "platformFree(cast[pointer](expiredTimerEntry))" in timer_body

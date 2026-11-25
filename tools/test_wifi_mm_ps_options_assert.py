@@ -1,4 +1,5 @@
-"""Check MM PS-option assertion provenance and fail-closed behavior."""
+"""Check MM PS-option assertion provenance: a rejected request changes
+nothing but is still answered, so its requester is not left waiting."""
 
 from pathlib import Path
 
@@ -65,6 +66,12 @@ for vifType in [0'u8, 1, 2]:
     doAssert vifs[0].listenInterval == 42 and vifs[0].psOptions == 5
   else:
     doAssert assertions == @[("vif_entry->type == VIF_STA", "module", 1680.cint)]
-    doAssert replies == 0
+    doAssert replies == 1
     doAssert vifs[0].listenInterval == 77 and vifs[0].psOptions == 88
+# An out-of-range VIF index is answered without touching any VIF.
+request.payload.vifIdx = MAX_VIFS
+assertions.setLen(0)
+replies = 0
+doAssert mm_set_ps_options_req_handler(addr request.payload) == KeMsgConsumed
+doAssert assertions.len == 0 and replies == 1
 ''')

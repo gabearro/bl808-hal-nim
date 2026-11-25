@@ -496,5 +496,6 @@ def test_registration_message_release_hooks() -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     sender = procedure(kernel, "ke_msg_send")
     assert "smRegistrationForget(param)" in procedure(kernel, "ke_msg_free")
-    assert sender.index("smRegistrationForget(cast[pointer](hdr))") < sender.index("opsFn(cast[pointer](hdr))")
+    # A message delivered to the host is retired by ke_msg_free, which forgets it.
+    assert "ke_msg_free(hdr)" in sender.split("bl_rx_e2a_handler(", 1)[1]
     assert "smRegistrationAdmitRequest(param)" in procedure(kernel, "mm_sta_add")

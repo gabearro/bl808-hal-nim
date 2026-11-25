@@ -337,9 +337,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let hwMode = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
     if not smActivationAdmitRequest(param) or not smCleanupAdmitRequest(param):
       return KeMsgConsumed
-    let epoch = mmConfigTrackIdle(hdr, hwMode.uint8, curState.uint8)
+    discard mmConfigTrackIdle(hdr, hwMode.uint8, curState.uint8)
     hal_machw_idle_req()
-    if mmConfigIdle.epoch != epoch: return KeMsgConsumed
     ke_state_set(srcId, TaskGoingIdleState)
     if not smActivationAdmitRequest(param) or not smCleanupAdmitRequest(param):
       return KeMsgConsumed
@@ -354,8 +353,11 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
   let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
   if not smActivationAdmitRequest(param): return KeMsgConsumed
   if hwState != 0:
+    # The blob halts here. The assert posts a MAC recovery, which leaves the
+    # MAC idle and reschedules MM's saved messages: the request then runs
+    # and is confirmed.
     assert_err("blmac_current_state_getf() == HW_IDLE", "module", 1527)
-    return KeMsgConsumed
+    return KeMsgSaved
 
   # Blob tail-merges all ke_msg_send_basic error/ack paths into a
   # single shared call site. Collect the CFM msg ID here; branches
@@ -476,7 +478,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
             mm_env_max_ampdu_duration_set(0)
         if vif.vifType == VIF_TYPE_STA:
           ps_uapsd_set(cast[pointer](vifU), hwQueue, req.uapsdAc.uint32)
-        cfmBasicId = MM_SET_EDCA_CFM
+      # An out-of-range queue or VIF changes nothing but is still answered.
+      cfmBasicId = MM_SET_EDCA_CFM
 
   of 24:  # MM_SET_VIF_STATE_REQ -> full VIF state transition
     let req = cast[ptr MmSetVifStateReqPayload](msgBody)
@@ -611,8 +614,10 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       # Already idle - verify HW idle, then send cfm
       let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
       if hwState != 0:
+        # As in mm_hw_config_handler: kept until the posted recovery idles
+        # the MAC and reschedules it.
         assert_err("blmac_current_state_getf() == HW_IDLE", "module", 946)
-        return KeMsgConsumed
+        return KeMsgSaved
       mmConfigCancelIdle()
       mm.previousState = 0
       mm.hardwareMode = 0
@@ -779,19 +784,18 @@ proc mm_set_ps_options_req_handler*(param: pointer): cint {.exportc, cdecl, disc
   ## and ps_options(msg[4]) to VIF, sends CFM with src/dest from original msg.
   if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetPsOptionsReqPayloadSize or
       not smActivationAdmitRequest(param): return KeMsgConsumed
-  let msgBody = param
-  let req = cast[ptr MmSetPsOptionsReqPayload](msgBody)
+  let req = cast[ptr MmSetPsOptionsReqPayload](param)
   let vifIdx = req.vifIdx
-  if vifIdx >= MAX_VIFS.uint8: return KeMsgConsumed
-  let vif = vifChannelForIdx(vifIdx)
-  # Assert VIF type is STA (0)
-  let vifType = vif.vifType
-  if vifType != 0:
-    assert_err("vif_entry->type == VIF_STA", "module", 1680)
-    return KeMsgConsumed
-  # Store listen interval and PS options from msg body
-  vif.listenInterval = req.listenInterval
-  vif.psOptions = req.options
+  # The blob indexes the VIF unchecked and halts on a VIF that is not a
+  # station. Here such a request changes nothing but is still answered.
+  if vifIdx < MAX_VIFS.uint8:
+    let vif = vifChannelForIdx(vifIdx)
+    if vif.vifType != 0:
+      assert_err("vif_entry->type == VIF_STA", "module", 1680)
+    else:
+      # Store listen interval and PS options from msg body
+      vif.listenInterval = req.listenInterval
+      vif.psOptions = req.options
   # Send confirmation with original src/dest routing
   ke_msg_send_basic_reply(param, MM_SET_PS_OPTIONS_CFM)
   KeMsgConsumed

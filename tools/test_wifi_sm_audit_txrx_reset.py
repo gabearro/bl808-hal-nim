@@ -371,3 +371,22 @@ doAssert state == SmAuthenticatingState
 doAssert authRetries + failures == 1 or ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM),
   "F2: response deadline discarded; SM remains authenticating with no timer"
 '''), "F2: response deadline discarded")
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_host_delivery_retires_message_like_free(tmp_path: Path, mode: str) -> None:
+    """KTX-5: ke_msg_send's external branch kept its own copy of ke_msg_free's
+    owner hooks, which had lost scanDwellForget, mmEdcaForget and
+    mmConfigForgetIdleOwner. A message delivered to the host is now retired
+    by ke_msg_free itself, so every owner forgets it before the release."""
+    from test_wifi_message_routing import source as routing_source
+    send = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_send")
+    assert "Forget(" not in send and "ke_msg_free(hdr)" in send
+    run_program(tmp_path, mode, routing_source() + r'''
+for destination in [TASK_API, 10'u8]:
+  setup(destination)
+  ke_msg_send(payload())
+  # heapFree checks that every owner hook ran before the release.
+  doAssert deliveries == 1 and frees == 1 and not active and assertions == 0
+  for value in metadata: doAssert not value
+''')

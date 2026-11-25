@@ -318,3 +318,33 @@ doAssert connected == 1 or failures.len == 1, "[SMCONN-F6] activation cancelled 
   " (applied=" & $applied.len & ")"
 finish()
 ''', finding="SMCONN-F6")
+
+
+# --- Requests consumed without their reply ----------------------------------
+
+def test_request_on_busy_mac_is_answered_after_recovery(tmp_path: Path) -> None:
+    """SMSTRUCT-N1: with TASK_MM idle but the MAC not idle, the real
+    mm_hw_config_handler (BSS steps 1-7, cleanup step 1) and
+    mm_set_idle_req_handler (the ME_SET_ACTIVE forward of BSS step 8 and
+    cleanup step 3) assert. The assert posts a MAC recovery; the request used
+    to be consumed without its reply, leaving the BSS batch or the cleanup
+    waiting for good. It is now kept and answered once the recovery has
+    idled the MAC and rescheduled MM's saved work."""
+    from test_wifi_message_allocation import run_program
+    from test_wifi_mm_idle_readiness import source as readiness_source
+    run_program(tmp_path, "checked", readiness_source() + r'''
+for idle in [false, true]:
+  prepareReadiness(false)
+  doAssert hardwareMode != 0 and mmState == 0     # MM idle, MAC not idle
+  let p = if idle: idleRequest(1) else: issue()
+  ke_msg_send(p)
+  doAssert dispatchOne() == KeMsgSaved and assertions == 1 and replies == 0
+  doAssert keMsgQueueSaved.first == keMsgHdrFromPayload(p)
+  # bl_reset_evt: hal_machw_reset idles the MAC, then MM's saved work runs.
+  hardwareMode = 0
+  resumeSaved()
+  doAssert dispatchOne() == KeMsgConsumed
+  doAssert replies == 1 and assertions == 1,
+    "[SMSTRUCT-N1] an owned request was consumed without its reply"
+  finish()
+''')

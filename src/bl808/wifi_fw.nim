@@ -68,6 +68,7 @@ include wifi/fw/register_constants
 include wifi/fw/layout_types
 include wifi/fw/global_state
 include wifi/fw/runtime_helpers
+include wifi/fw/op
 when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
   include wifi/fw/tx_policy_trace
 when defined(bl808WifiDiagMacState):

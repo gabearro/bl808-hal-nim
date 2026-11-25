@@ -20,6 +20,8 @@ var
   keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE
   keSavedReschedMask* {.wifiCtrl.}: uint16
   keSavedReschedRemaining {.wifiCtrl.}: array[TASK_API.int, uint32]
+  # A firmware step is running (wifiStepEnter in task_init_main.nim).
+  wifiStepActive {.wifiCtrl.}: bool
 
   # Task state array (per task)
   keTaskStates* {.wifiCtrl.}: array[TASK_MAX.int, uint16]

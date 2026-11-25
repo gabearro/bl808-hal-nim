@@ -7137,6 +7137,60 @@ Host tests: `tools/test_wifi_switch_request.py`,
 `tools/test_wifi_sm_audit_scan.py`. The M0 HTTP server manifest built;
 none of this was flashed.
 
+#### Replies, message retirement and the firmware step
+
+The blob's MM handlers answer every request they run; an `assert_err`
+there halts. Here an assert posts a MAC recovery and returns, and the port had
+consumed some requests without their reply, which left an SM BSS batch or
+cleanup waiting for good (audit SMSTRUCT-N1). Differences from the archive:
+
+- With TASK_MM idle but the MAC not idle, `mm_hw_config_handler` (line
+  1527) and `mm_set_idle_req_handler` (line 946) assert as in `mm_task.o`
+  and keep the request saved. The recovery leaves the MAC idle and
+  `bl_reset_evt` reschedules MM's saved messages, so the request then runs
+  and is confirmed. `mm_force_idle_req_handler` already did this (1013).
+- `mm_set_ps_options_req_handler` answers a request for a VIF that is out
+  of range or not a station (assert 1680) without changing any VIF; the
+  blob indexes the VIF unchecked and halts on the assert.
+- `MM_SET_EDCA_REQ` with a queue above 3 or a VIF out of range is answered
+  without effect. The blob writes the unchecked index and answers.
+- A kernel timer expiry whose message cannot be allocated is retried on the
+  same entry 1 ms later. The blob's `ke_timer_schedule` uses `ke_msg_alloc`,
+  which halts; the port had posted a recovery and dropped the expiry. The
+  optional scan probe repeat is still dropped.
+
+`ke_msg_send` now retires a message it delivered to the host with
+`ke_msg_free`, as the blob's tail call to `g_bl_ops_funcs[0xBC]` does. The
+port's own copy of the owner hooks there had lost three of them (KTX-5).
+
+The blob's firmware is its own task and is never reentered. Here a host
+callback runs synchronously inside a handler and can poll the firmware
+again through `osSleepUs` or an OS wait. `wifiMainServiceStep` and the
+facade's TX service are firmware steps: the facade now calls
+`wifi_nimfw_service_tx` instead of `wifi_nimfw_service_sta_postponed`,
+`txl_transmit_trigger` and `txl_frame_evt`. While a step runs, a poll
+(`vendorPollOnce`) still services MAC interrupts and OS timers, but it
+neither dispatches firmware work nor drains the host queue until the step
+returns. The blocking idle wait (`wifi_main`) releases the step. Built with
+`-d:bl808WifiOpCheck`, `nimfw_dbg_nested_pump` counts refused entries. A
+host callback that waits inside a step for the firmware to answer now
+waits until its own timeout; the counter is there to show whether that
+happens. `examples/m0_allcore_wasm_cps_live_test.nim` still calls the
+three TX entries directly.
+
+`op.nim` adds the operation serial (`Op`) that later state-machine work
+stamps into timers, frames and indications. The Nim tail of a kernel timer
+entry is now its stamp (`KeTimerEntry.stamp`); SA Query keeps storing its
+serial there.
+
+Host tests: `tools/test_wifi_mm_idle_readiness.py`,
+`tools/test_wifi_mm_ps_options_assert.py`,
+`tools/test_wifi_message_routing.py`, `tools/test_wifi_timer_lifetime.py`,
+`tools/test_wifi_pump_guard.py`,
+`tools/test_wifi_op.py`, `tools/test_wifi_sm_audit_sm_connect.py` and
+`tools/test_wifi_sm_audit_txrx_reset.py`. The M0 HTTP server manifest
+built, also with `-d:bl808WifiOpCheck`; none of this was flashed.
+
 ## BLE
 
 - Local controller path: `src/bl808/libbtblecontroller_bl808_ble1m0s1bredr0.a`

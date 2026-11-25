@@ -595,7 +595,8 @@ def test_reset_and_release_hooks() -> None:
     for name in ["ke_flush", "chan_init"]:
         assert "smDeferredCancel()" in procedure(kernel, name)
     assert "smDeferredForget(param)" in procedure(kernel, "ke_msg_free")
-    assert "smDeferredForget(cast[pointer](hdr))" in procedure(kernel, "ke_msg_send")
+    # A message delivered to the host is retired by ke_msg_free, which forgets it.
+    assert "ke_msg_free(hdr)" in procedure(kernel, "ke_msg_send").split("bl_rx_e2a_handler(", 1)[1]
     sm = (FW / "scan_station_ap_me.nim").read_text()
     assert "smDeferredCancel()" in procedure(sm, "sm_init")
     assert "smDeferredCancel()" in procedure((FW / "station_cleanup.nim").read_text(), "smCleanupBegin")

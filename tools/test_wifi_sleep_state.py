@@ -229,8 +229,9 @@ proc wifiDrainScheduledWork(): bool =
   result = queued
   queued = false
 '''
-    code += procedure(main, "wifiWaitForWorkIfIdle")
-    code += procedure(main, "wifiMainServiceStep")
+    code += "var wifiStepActive: bool\n"
+    for name in ("wifiStepEnter", "wifiStepLeave", "wifiWaitForWorkIfIdle", "wifiMainServiceStep"):
+        code += procedure(main, name)
     run_program(tmp_path, mode, code + r'''
 setup()
 oneActive(true, 0)
@@ -307,7 +308,9 @@ proc osTimerPoll() = discard
 proc aosPollEvents() = discard
 proc aosPollDelayedActions() = discard
 '''
-    for name in ("wifiUpdateMacPlCtrl", "wifiWaitForWorkIfIdle", "wifiMainServiceStep",
+    code += "var wifiStepActive: bool\n"
+    for name in ("wifiUpdateMacPlCtrl", "wifiStepEnter", "wifiStepLeave", "wifi_nimfw_step_active",
+                 "wifiWaitForWorkIfIdle", "wifiMainServiceStep",
                  "wifiMainServiceNonblocking", "wifi_main_poll_once"):
         code += procedure(main, name)
     if "proc bl808WifiBackendDriveRfStatus(" in backend:

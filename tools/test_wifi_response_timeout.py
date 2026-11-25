@@ -40,7 +40,7 @@ type
     id: uint16
     taskId: uint8
     time: uint32
-    saQuerySerial: uint32
+    stamp: uint32
   KeTimerMutation = object
     previous: ptr KeTimerMutation
     id: uint16
@@ -137,7 +137,7 @@ proc smRspTimerForget(header: pointer)
 proc smSaQueryQueueTimeout(serial: uint32) = doAssert false
 proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
                       guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0; saQuerySerial: uint32 = 0): bool
+                      continuationUs: uint64 = 0; stamp: uint32 = 0): bool
 proc ke_msg_free(p: pointer) =
   smRspTimerForget(p)
   heapFree(p)

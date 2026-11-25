@@ -584,4 +584,5 @@ def test_abort_message_hooks() -> None:
     assert sender.index("smAbortCaptureMessage(hdr)") < sender.index("co_list_push_back")
     assert "smAbortRegister(hdr)" in procedure(kernel, "ke_msg_try_alloc")
     assert "smAbortForget(param)" in procedure(kernel, "ke_msg_free")
-    assert sender.index("smAbortForget(cast[pointer](hdr))") < sender.index("opsFn(cast[pointer](hdr))")
+    # A message delivered to the host is retired by ke_msg_free, which forgets it.
+    assert "ke_msg_free(hdr)" in sender.split("bl_rx_e2a_handler(", 1)[1]

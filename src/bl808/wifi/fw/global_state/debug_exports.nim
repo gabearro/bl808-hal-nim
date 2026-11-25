@@ -458,6 +458,9 @@ var nimFwDbgNullFramePostponed* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_postpo
 var nimFwDbgNullFrameQueued* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_queued".}: uint32
 var nimFwDbgPostponedServiceCalls* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_calls".}: uint32
 var nimFwDbgPostponedServiceSent* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_sent".}: uint32
+when defined(bl808WifiOpCheck):
+  # Firmware entries refused because a firmware step was already running.
+  var nimFwDbgNestedPump* {.wifiCtrl, exportc: "nimfw_dbg_nested_pump", volatile.}: uint32
 var nimFwDbgNullFrameTxIntSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_seen".}: uint32
 var nimFwDbgNullFrameTxIntFc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_fc".}: uint32
 var nimFwDbgNullFrameTxIntBuf* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_buf".}: uint32

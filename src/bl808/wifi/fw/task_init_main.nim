@@ -91,10 +91,34 @@ proc wifiUpdateMacPlCtrl() {.inline.} =
     ctrl = ctrl and not 0x01'u32
   regWrite(MAC_PL_CTRL_REG, ctrl)
 
+proc wifiStepEnter(): bool =
+  ## The firmware is one thread in the blob and is never reentered. Here a
+  ## host callback that a handler runs synchronously (a confirmation to
+  ## TASK_API, a log or OS hook) can poll the firmware again through
+  ## osSleepUs or an OS wait. A step is one firmware entry from the host
+  ## side: the main service step or the facade's TX service. While one runs,
+  ## no other starts; the refused poll still services MAC interrupts
+  ## (bl808WifiBackendPollMacIrq), as the trap would.
+  if wifiStepActive:
+    when defined(bl808WifiOpCheck): inc nimFwDbgNestedPump
+    return false
+  wifiStepActive = true
+  true
+
+proc wifiStepLeave() = wifiStepActive = false
+
+proc wifi_nimfw_step_active*(): bool {.exportc, cdecl.} =
+  ## The host poll skips firmware dispatch while this is true.
+  wifiStepActive
+
 proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool =
   result = hasWork
   if blockWhenIdle and not result:
+    # No handler is running while the step waits for the host, so the
+    # host's wait may poll the firmware.
+    wifiStepLeave()
     ipc_emb_wait()
+    discard wifiStepEnter()
     result = wifiMainHasPendingWork()
 
 proc wifiDispatchScheduledEvent(): bool =
@@ -132,6 +156,16 @@ proc wifiDrainScheduledWork(): bool =
   serviceWhen(smCleanupNeedsService(), smCleanupService())
   if wifiDispatchScheduledEvent(): result = true
 
+proc wifi_nimfw_service_tx*(count: uint32) {.exportc, cdecl.} =
+  ## The facade's TX service: postponed STA frames, then `count` rounds of
+  ## the TX trigger and the frame confirmation event, as one step.
+  if not wifiStepEnter(): return
+  defer: wifiStepLeave()
+  discard wifi_nimfw_service_sta_postponed(count)
+  for _ in 0'u32 ..< count:
+    txl_transmit_trigger()
+    txl_frame_evt()
+
 proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## Run one WiFi firmware service iteration.
   ##
@@ -139,6 +173,8 @@ proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## embedded firmware run independently. In this pure Nim port, CPS callers can
   ## drive WiFi and BLE from one scheduler, so they must use the nonblocking
   ## form and let the scheduler decide when to sleep.
+  if not wifiStepEnter(): return false
+  defer: wifiStepLeave()
   wifiUpdateMacPlCtrl()
   bl_sleep_schedule()
   if napScheduleState == BlNapWaking: return false

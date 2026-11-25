@@ -5197,7 +5197,7 @@ type
     id*: uint16             # task_id in bits [15:10], msg in bits [9:0]
     taskId*: uint8          # target task
     time*: uint32           # absolute expiry in MAC ticks
-    saQuerySerial: uint32   # Nim-owned tail, not part of the BL808 timer prefix
+    stamp: uint32           # Op stamp; Nim-owned tail, not part of the BL808 timer prefix
 
   KeTimerMutation = object
     previous: ptr KeTimerMutation

@@ -80,7 +80,8 @@ for irq in [false, true]:
             contexts = expectedContexts
             mmState = 3
         ke_msg_send(p)
-        doAssert dispatchOne() == KeMsgConsumed
+        # The request is kept, not dropped: the assert posted a recovery.
+        doAssert dispatchOne() == KeMsgSaved
         doAssert assertions == 1
         doAssert assertionDetails.len == 1
         doAssert assertionDetails[0] ==
@@ -92,8 +93,16 @@ for irq in [false, true]:
         doAssert registerReads == 1 and registerWrites.len == 0
         doAssert stateWrites.len == 0 and idleRequests == 0 and replies == 0,
           "reported successful configuration after idle failure"
-        doAssert live.len == 0 and keMsgQueueSent.first == nil
-        doAssert keMsgQueueSaved.first == nil
+        doAssert live.len == 1 and keMsgQueueSent.first == nil
+        doAssert keMsgQueueSaved.first == keMsgHdrFromPayload(p)
+        if not reenter:
+          # The recovery leaves the MAC idle and reschedules MM's saved work;
+          # the request then runs and is confirmed.
+          hardwareMode = 0
+          resumeSaved()
+          doAssert dispatchOne() == KeMsgConsumed
+          doAssert assertions == 1 and replies == 1 and live.len == 0
+          if not idle: doAssert contexts[1].channel == definition(request(1))
         finish()
 '''
 

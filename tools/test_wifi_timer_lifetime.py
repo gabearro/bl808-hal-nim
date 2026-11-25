@@ -27,7 +27,7 @@ type
     id: uint16
     taskId: uint8
     time: uint32
-    saQuerySerial: uint32
+    stamp: uint32
   KeTimerMutation = object
     previous: ptr KeTimerMutation
     id: uint16
@@ -222,10 +222,10 @@ doAssert queueIds() == @[1'u16, 1] and live.len == 2
 doAssert deadline(1, 4) == 100 and deadline(1, 3) == 200
 ''',
     "sa_query_keeps_serial_when_rearmed": r'''
-doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 100, saQuerySerial = 29)
+doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 100, stamp = 29)
 onFree = proc() =
   doAssert saExpiries == @[29'u32]
-  doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 200, saQuerySerial = 30)
+  doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 200, stamp = 30)
 now = 100
 ke_timer_schedule()
 doAssert saExpiries == @[29'u32] and delivered.len == 0
@@ -507,7 +507,13 @@ ke_timer_set(2, TASK_SM, 100)
 failExpiryId = 2
 now = 100
 ke_timer_schedule()
-doAssert assertions == 1 and delivered.len == 0 and live.len == 0
+# Retried on the same entry 1 ms later; no recovery, and the expiry is kept.
+doAssert assertions == 0 and delivered.len == 0 and live.len == 1
+doAssert cast[ptr KeTimerEntry](keTimerQueue.first).time == 1100
+failExpiryId = 0
+now = 1100
+ke_timer_schedule()
+doAssert delivered == @[(2'u16, TASK_SM)] and live.len == 0 and assertions == 0
 ''',
 }
 

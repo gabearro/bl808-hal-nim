@@ -1157,4 +1157,6 @@ def test_cleanup_guards(tmp_path: Path, mutation: str, case: str) -> None:
 
 def test_external_message_release_forgets_cleanup_metadata() -> None:
     sender = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_send")
-    assert sender.index("smCleanupForget(cast[pointer](hdr))") < sender.index("opsFn(cast[pointer](hdr))")
+    # A message delivered to the host is retired by ke_msg_free, which forgets it.
+    assert "ke_msg_free(hdr)" in sender.split("bl_rx_e2a_handler(", 1)[1]
+    assert "smCleanupForget(param)" in procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_free")

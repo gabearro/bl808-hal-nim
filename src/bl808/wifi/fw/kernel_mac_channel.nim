@@ -570,22 +570,9 @@ proc ke_msg_send*(param: pointer) {.exportc, cdecl, noinline.} =
     nimFwTrace("[WIFI-NIMFW] ke_msg_send external")
     bl_rx_e2a_handler(keMsgExternalPayload(param))
     nimFwTrace("[WIFI-NIMFW] ke_msg_send external done")
-    # Tail-call through ops function table for message free/schedule
-    mmTimForget(cast[pointer](hdr))
-    mmConnLossForget(cast[pointer](hdr))
-    rxMgtForget(cast[pointer](hdr))
-    smCleanupForget(cast[pointer](hdr))
-    smBssForget(cast[pointer](hdr))
-    smActivationForget(cast[pointer](hdr))
-    smScanForget(cast[pointer](hdr))
-    smRegistrationForget(cast[pointer](hdr))
-    chanUpdateForget(cast[pointer](hdr))
-    chanBcnRequestForget(cast[pointer](hdr))
-    smRspTimerForget(cast[pointer](hdr))
-    smDeferredForget(cast[pointer](hdr))
-    smAbortForget(cast[pointer](hdr))
-    let opsFn = cast[proc(p: pointer){.cdecl.}](blOpsFunc(0xBC))
-    opsFn(cast[pointer](hdr))
+    # The blob tail-calls g_bl_ops_funcs[0xBC], which is ke_msg_free's body.
+    # The message is retired exactly as a consumed internal one is.
+    ke_msg_free(hdr)
 
 proc ke_msg_send_basic*(id: uint16, destId: uint8, srcId: uint8) {.exportc, cdecl, noinline.} =
   ## Allocate and send a zero-length kernel message.
@@ -790,7 +777,8 @@ proc mmEdcaForget(header: pointer) =
 proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   ## Free a kernel message. Blob: tail-calls `g_bl_ops_funcs[0xBC](param)`
   ## — param is already the HEADER pointer (callers subtract 12 before
-  ## calling).
+  ## calling). Every message is retired here, including one ke_msg_send has
+  ## delivered to the host, so its owners forget it exactly once.
   # The channel switch's static request is never freed.
   if chanSwitchForget(param): return
   scanDwellForget(param)
@@ -1400,9 +1388,11 @@ proc keTimerEndMutation(operation: var KeTimerMutation) =
 
 proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
                       guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0; saQuerySerial: uint32 = 0): bool =
+                      continuationUs: uint64 = 0; stamp: uint32 = 0): bool =
   ## False reports rejection/allocation failure; a newer nested mutation wins
   ## without being treated as an allocation failure by the public wrapper.
+  ## `stamp` is the owner's Op stamp, kept on the entry. Only the SA Query
+  ## expiry copies it into its message today; other expiries carry no payload.
   if delay == 0 or delay > KE_TIMER_MAX_DELAY: return false
   let saved = irqSave()
   if guard != nil and not guard(context):
@@ -1452,7 +1442,7 @@ proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
   owned.id = taskId
   owned.taskId = instId
   owned.time = expiry
-  owned.saQuerySerial = saQuerySerial
+  owned.stamp = stamp
   let entry = owned
   co_list_insert(addr keTimerQueue, cast[ptr CoListHdr](entry), cmp_abs_time)
   owned = nil
@@ -1573,7 +1563,7 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
       keTimerExpiryCurrent = true
       entry
     if expiredTimerEntry.id == SM_SA_QUERY_TIMEOUT_IND_MSG and expiredTimerEntry.taskId == TASK_SM:
-      smSaQueryQueueTimeout(expiredTimerEntry.saQuerySerial)
+      smSaQueryQueueTimeout(expiredTimerEntry.stamp)
     elif smRspTimerDispatch(expiredTimerEntry):
       # Out of memory for the expiry: retry with the same entry in 1 ms.
       let requeue = smRspTimerTakeRequeue()
@@ -1583,12 +1573,15 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
     else:
       let id = expiredTimerEntry.id
       let dest = expiredTimerEntry.taskId
-      # The repeat probe is optional; the channel timer owns dwell progress.
-      let message =
-        if id == SCAN_PROBE_TIMER and dest == TASK_SCAN:
-          ke_msg_try_alloc(id, dest, 0xFF, 0)
-        else:
-          ke_msg_alloc(id, dest, 0xFF, 0)
+      # The blob's ke_msg_alloc halts when the heap is exhausted. Here an
+      # expiry that cannot be posted is retried on the same entry in 1 ms,
+      # so it is late but never lost. The repeat probe is optional; the
+      # channel timer owns dwell progress.
+      let message = ke_msg_try_alloc(id, dest, 0xFF, 0)
+      if message == nil and not (id == SCAN_PROBE_TIMER and dest == TASK_SCAN) and
+          keTimerRequeue(expiredTimerEntry, 1000, false):
+        inc drained
+        continue
       if message != nil:
         let saved = irqSave()
         if keTimerExpiryCurrent:

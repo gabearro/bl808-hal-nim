@@ -56,8 +56,9 @@ proc wifiDrainScheduledWork(): bool =
   pendingEvents = 0
 '''
     main = (FW / "task_init_main.nim").read_text()
-    for name in ["wifiWaitForWorkIfIdle", "wifiMainServiceStep", "wifiMainServiceNonblocking",
-                 "wifi_main_poll_once"]:
+    code += "var wifiStepActive: bool\n"
+    for name in ["wifiStepEnter", "wifiStepLeave", "wifiWaitForWorkIfIdle", "wifiMainServiceStep",
+                 "wifiMainServiceNonblocking", "wifi_main_poll_once"]:
         code += procedure(main, name)
     return code
 

@@ -47,7 +47,9 @@ proc bl_reset_evt*() {.exportc, cdecl.} =
   apmResumeHaltRollback()
   ke_evt_clear(0x04000000'u32)
   mmPsModeRetryAfterReset()
-  # A timed-out MM reset request may be saved even when MM was already idle.
+  # Load-bearing: the only release for MM requests saved while MM was already
+  # idle - a timed-out reset request, and requests kept after the busy-MAC
+  # asserts 1013 (force idle), 1527 (config) and 946 (set idle).
   discard ke_reschedule_saved_messages(TASK_MM)
 
 proc bl_irq_handler*() {.exportc, cdecl.} =

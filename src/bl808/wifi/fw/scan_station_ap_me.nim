@@ -4639,7 +4639,7 @@ proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   smSaQuery.deadline = deadline
   smSaQuery.armed = true
   if not ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, delay,
-      smSaQueryArmCurrent, addr serial, saQuerySerial = serial) and smSaQueryCurrent(serial):
+      smSaQueryArmCurrent, addr serial, stamp = serial) and smSaQueryCurrent(serial):
     # Timer allocation failure is not evidence that the AP stopped responding.
     sm.saQueryActive = 0
     smSaQuery.armed = false

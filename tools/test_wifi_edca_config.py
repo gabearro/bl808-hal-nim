@@ -93,7 +93,9 @@ for bad in 0..2:
   if bad == 0: request.vifIdx = 2
   elif bad == 1: request.acmFlag = 4
   else: header.paramLen = 7
-  doAssert applyEdca(addr request) == 0
+  # An out-of-range VIF or queue changes nothing but is answered; a short
+  # payload is not a request.
+  doAssert applyEdca(addr request) == (if bad == 2: 0 else: 23)
   doAssert writes.len == 0 and powerCalls.len == 0 and durationCalls == 0
 '''
 

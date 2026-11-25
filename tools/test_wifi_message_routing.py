@@ -1,4 +1,7 @@
-"""Consume invalid destinations without forwarding or retaining metadata."""
+"""Consume invalid destinations without forwarding or retaining metadata.
+
+A message delivered to the host is retired by ke_msg_free, like a consumed
+internal one, so every owner hook runs on both paths (audit KTX-5)."""
 
 from pathlib import Path
 
@@ -22,7 +25,7 @@ type
 var
   storage: array[40, uint64]
   active: bool
-  metadata: array[13, bool]
+  metadata: array[16, bool]
   keMsgQueueSent: CoList
   frees, deliveries, assertions, events, traces: int
   interrupts = true
@@ -69,9 +72,6 @@ proc nimFwTrace2U32(message: string; first, second: uint32) = inc traces
 proc mmTimCaptureMessage(p: ptr KeMsgHdr) = discard
 proc smAbortCaptureMessage(p: ptr KeMsgHdr) = discard
 proc chanUpdateCaptureMessage(p: ptr KeMsgHdr) = discard
-proc scanDwellForget(p: pointer) = discard
-proc mmEdcaForget(p: pointer) = discard
-proc mmConfigForgetIdleOwner(p: pointer): bool = false
 # The channel switch's request is static and carries no per-message metadata.
 proc chanSwitchForget(p: pointer): bool = false
 proc setup(destination: uint8) =
@@ -96,8 +96,10 @@ def source() -> str:
              "smScanForget", "smRegistrationForget", "smRspTimerForget",
              "smDeferredForget", "smAbortForget", "chanUpdateForget", "mmConnLossForget",
              "chanBcnRequestForget"]
+    hooks += ["scanDwellForget", "mmEdcaForget"]
     for index, name in enumerate(hooks):
         code += f"\nproc {name}(p: pointer) =\n  doAssert p == header\n  metadata[{index}] = false\n"
+    code += f"\nproc mmConfigForgetIdleOwner(p: pointer): bool =\n  doAssert p == header\n  metadata[{len(hooks)}] = false\n"
     start = kernel.index("template platformFree(")
     code += kernel[start:kernel.index("\n\n", start)] + "\n"
     return code + procedure(kernel, "ke_msg_free") + procedure(kernel, "ke_msg_send")
