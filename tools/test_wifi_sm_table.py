@@ -23,7 +23,9 @@ The static part is generated from dispatch_tables.nim: no SM handler writes
 TASK_SM's state itself, and smGo is the only ke_state_set(TASK_SM, ...).
 
 A second table (test_request_answer_table, below) drives the scan, join
-and registration states 1 to 3 through each fate of their one request.
+and registration states 1 to 3 through each fate of their one request. A
+third (test_series_table) drives the BSS parameter batch (state 4) and the
+activation (state 9) through each fate of each of their requests.
 """
 
 from pathlib import Path
@@ -445,3 +447,160 @@ def test_request_answer_states_have_one_exit() -> None:
     assert sorted(senders) == ["scan_station_ap_me.nim", "station_sm.nim", "task_handlers.nim"], senders
     main = _code(FW / "task_init_main.nim")
     assert "smScanNeedsService" not in main and "smRegistrationNeedsService" not in main
+
+
+# --------------------------------------------------------------------------
+# The request series: BSS parameter batch (4) and activation (9)
+# --------------------------------------------------------------------------
+#
+# The harnesses are test_wifi_bss_confirmations' (state 4: the real
+# station_bss.nim, ME's control exchange and SM's handlers over a model MM)
+# and test_wifi_activation_exchange's (state 9: the real
+# station_activation.nim, ME's exchange, mm_set_ps_options_req_handler and
+# SM's handlers). Each row stops the series at one request and applies one
+# fate. After every dispatch: SM holds an answer to wait for exactly while
+# the series is live, a reserved reply only together with its request, and
+# the attempt is reported at most once. At quiescence nothing is allocated
+# and ME is idle.
+
+SERIES_FATES = {
+    # The series runs to its end.
+    "answered": "advanceTo(step)\nrun(\"answered\")\n",
+    # A TX reset (channel switch, MAC recovery) changes nothing.
+    "tx_reset": "advanceTo(step)\ninc txResetEpoch\nrun(\"reset\")\n",
+    # The attempt ends before the replier ran: the request is dropped, or
+    # ME finishes a forward it started.
+    "ended_before_reply": "advanceTo(step)\nendAttempt()\ncheck(\"ended\")\nrun(\"ended\")\n",
+    # The attempt ends with the answer queued: SM ignores it.
+    "ended_after_reply": "let answer = answerAt(step)\nendAttempt()\nconsumeReply(answer)\n"
+                         "ke_msg_free(keMsgHdrFromPayload(answer))\ncheck(\"stale\")\nrun(\"stale\")\n",
+    # An answer delivered twice counts once.
+    "duplicate": "let answer = answerAt(step)\nconsumeReply(answer)\nconsumeReply(answer)\n"
+                 "ke_msg_free(keMsgHdrFromPayload(answer))\ncheck(\"duplicate\")\nrun(\"duplicate\")\n",
+}
+
+BSS_SERIES = r'''
+var txResetEpoch: uint32
+proc check(where: string) =
+  doAssert (state == SmSettingBssState) == (smOwn.answer != nil),
+    where & ": state " & $state & " with an answer held " & $(smOwn.answer != nil)
+  doAssert smOwn.reply == nil or smOwn.request != nil, where & ": a reply reserved for nothing"
+  doAssert authStarts + int(state == SmDisconnectingState) <= 1, where & ": ended twice"
+proc run(where: string) =
+  var count = 0
+  while dispatchOne():
+    check(where)
+    inc count
+    doAssert count < 64
+proc advanceTo(step: int) =
+  ## Until SM has sent request `step`; its replier has not run.
+  while smRequests.len < step + 1:
+    doAssert dispatchOne()
+    check("advance")
+proc answerAt(step: int): pointer = answerFor(step)
+'''
+
+ACTIVATION_SERIES = r'''
+proc check(where: string) =
+  let live = state == SM_ACTIVATING_STATE and smActivationLive()
+  doAssert live == (smOwn.answer != nil),
+    where & ": state " & $state & " with an answer held " & $(smOwn.answer != nil)
+  doAssert smOwn.reply == nil or smOwn.request != nil, where & ": a reply reserved for nothing"
+  doAssert connected + failures.len <= 1, where & ": ended twice"
+proc run(where: string) =
+  var count = 0
+  while dispatchOne():
+    check(where)
+    inc count
+    doAssert count < 64
+proc advanceTo(step: int) =
+  ## Until SM has sent request `step`; its replier has not run.
+  while smActivation.step < step:
+    doAssert dispatchOne()
+    check("advance")
+proc answerAt(step: int): pointer = takeReply(step)
+'''
+
+SERIES_ROWS = ([("bss", step, fate) for step in range(9) for fate in SERIES_FATES]
+               + [("bss", step, "vif_retired") for step in range(9)]
+               + [("activation", step, fate) for step in range(3) for fate in SERIES_FATES]
+               + [("activation", step, "station_deleted") for step in range(3)]
+               + [("activation", step, "vif_retired") for step in range(3)])
+
+# The STA VIF is retired with request `step` queued for its replier, which
+# answers it unapplied (smStaleRequest); SM ends the attempt at the answer
+# and sends nothing more.
+RETIRED = r'''
+advanceTo(step)
+let unapplied = (applied.len, me.psDisableMask, me.activeMask)
+{retire}
+run("retired")
+doAssert (applied.len, me.psDisableMask, me.activeMask) == unapplied,
+  "a request was applied to the retired VIF"
+'''
+
+
+def series_program(family: str, step: int, fate: str) -> str:
+    if family == "bss":
+        from test_wifi_bss_confirmations import source as bss_source
+        code = bss_source() + BSS_SERIES + f"const fate = \"{fate}\"\nlet step = {step}\n"
+        code += "begin()\ncheck(\"start\")\n"
+        if fate == "vif_retired":
+            code += RETIRED.replace("{retire}", "vif.vifType = 2")
+        else:
+            code += SERIES_FATES[fate]
+        code += r'''
+if fate in ["answered", "tx_reset", "duplicate"]:
+  doAssert authStarts == 1 and state == 6 and smRequests.len == 9
+else:
+  if fate == "vif_retired": doAssert failures == @[(14'u16, 0xFFFF'u16)]
+  doAssert authStarts == 0 and state == SmDisconnectingState
+  doAssert smRequests.len == step + 1, "a request was sent after the attempt ended"
+  endAttempt()
+assertQuiet()
+'''
+    else:
+        from test_wifi_activation_exchange import source as activation_source
+        code = activation_source() + ACTIVATION_SERIES
+        code += f"const fate = \"{fate}\"\nlet step = {step}\nbegin()\ncheck(\"start\")\n"
+        if fate == "station_deleted":
+            # The AP station is deleted under the activation: reported once.
+            code += "advanceTo(step)\ninc stationEpochs[2]\nrun(\"deleted\")\n"
+        elif fate == "vif_retired":
+            code += RETIRED.replace("{retire}", "vifs[1].vifType = 4")
+        else:
+            code += SERIES_FATES[fate]
+        code += r'''
+if fate in ["answered", "tx_reset", "duplicate"]:
+  doAssert connected == 1 and failures.len == 0 and stationReady == 1
+elif fate in ["station_deleted", "vif_retired"]:
+  doAssert connected == 0 and failures == @[(5'u16, 0xFFFF'u16)]
+else:
+  doAssert connected == 0 and failures.len == 1 and state == SmDisconnectingState
+doAssert not smActivationLive() and smOwn.answer == nil and meState == MeIdleState
+finish()
+'''
+    return code
+
+
+@pytest.mark.parametrize("family,step,fate", SERIES_ROWS,
+                         ids=[f"{f}-{s}-{t}" for f, s, t in SERIES_ROWS])
+def test_series_table(tmp_path: Path, family: str, step: int, fate: str) -> None:
+    run_program(tmp_path, "checked", series_program(family, step, fate))
+
+
+def test_series_states_have_one_exit() -> None:
+    """The batch and the activation send with smSendReserved and take their
+    answers with smTakeAnswer; nothing forgets, cancels or services them."""
+    tasks = (FW / "task_handlers.nim").read_text()
+    for handler in ["mm_bss_param_setting_handler", "me_set_ps_disable_cfm_handler_sm",
+                    "me_set_active_cfm_handler_sm", "mm_set_vif_state_cfm_handler",
+                    "smActivationOptionsCfmHandler"]:
+        assert "smTakeAnswer(param)" in procedure(tasks, handler), handler
+    for path in ["station_bss.nim", "station_activation.nim"]:
+        code = _code(FW / path)
+        assert "smSendReserved(" in code and "ke_msg_send(" not in code.replace(
+            "ke_msg_send(message)", ""), path
+    main = _code(FW / "task_init_main.nim")
+    assert "smBss" not in main and "smActivation" not in main
+    assert "meControlReset" not in _code(FW / "station_bss.nim") + _code(FW / "station_activation.nim")

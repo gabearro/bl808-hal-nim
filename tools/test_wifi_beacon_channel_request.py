@@ -341,8 +341,7 @@ proc ke_evt_set(bits: uint32) =
   if sendRaises: raise newException(ValueError, "notifier callback")
 '''
     for name in ("mmTimCaptureMessage", "smAbortCaptureMessage", "chanUpdateCaptureMessage",
-                 "mmTimForget", "mmConnLossForget", "rxMgtForget", "smCleanupForget", "smBssForget",
-                 "smActivationForget",
+                 "mmTimForget", "mmConnLossForget", "rxMgtForget", "smCleanupForget",
                  "chanUpdateForget", "smRspTimerForget",
                  "smDeferredForget", "smAbortForget", "chanBcnRequestForget"):
         support += f"proc {name}(p: pointer) = discard\n"

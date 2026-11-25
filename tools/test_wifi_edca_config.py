@@ -46,7 +46,7 @@ proc vifChannelForIdx(index: uint8): ptr Vif =
   addr vifs[index]
 proc regWrite(address: uint; value: uint32) = writes.add((address, value))
 proc mm_env_max_ampdu_duration_set(value: uint32) = inc durationCalls
-proc smActivationAdmitRequest(request: pointer): bool = true
+proc smStaleRequest(request: pointer): bool = false
 proc ps_uapsd_set(p: pointer; ac: uint8; enabled: uint32) =
   powerCalls.add((cast[uint](p), ac, enabled))
 proc reset() =

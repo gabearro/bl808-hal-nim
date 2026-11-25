@@ -274,21 +274,27 @@ doAssert sent.len == 1
 doAssert deliverAbort(request) == KeMsgConsumed
 doAssert deauths == 1 and replies == @[0'u8]
 """,
-    "join_saved": """
-let request = makeAbort()
+    # The pinned handler saves the abort in states 3 and 4; here it ends the
+    # attempt at once, as in states 5 and 7 (no frame went to the AP yet).
+    "join_acts": """
 for state in [3'u16, 4]:
+  reset()
+  outcomes.setLen(0)
+  replies.setLen(0)
   currentState = state
-  let before = allocations
-  doAssert deliverAbort(request) == KeMsgSaved
-  doAssert allocations == before and replies.len == 0
-schedule()
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 1 and sent.len == 0
+  let request = makeAbort()
+  doAssert deliverAbort(request) == KeMsgConsumed
+  doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
+  doAssert currentState == 10 and deauths == 0
 """,
+    # An abort saved because its confirmation could not be allocated does not
+    # act on a later attempt.
     "saved_replacement": """
 let request = makeAbort()
 currentState = 3
+allocFail = true
 doAssert deliverAbort(request) == KeMsgSaved
+allocFail = false
 env.connectInfo = addr replacement
 schedule()
 doAssert deliverAbort(request) == KeMsgConsumed
@@ -310,7 +316,9 @@ doAssert sent.len == 1
     "saved_epoch": """
 let request = makeAbort()
 currentState = 4
+allocFail = true
 doAssert deliverAbort(request) == KeMsgSaved
+allocFail = false
 inc rxVifEpochs[1]
 schedule()
 doAssert deliverAbort(request) == KeMsgConsumed
@@ -344,7 +352,9 @@ doAssert outcomes.len == 1 and replies == @[0'u8]
     "two_inflight": """
 let first = makeAbort()
 currentState = 3
+allocFail = true
 doAssert deliverAbort(first) == KeMsgSaved
+allocFail = false
 env.connectInfo = addr replacement
 schedule(7)
 let second = makeAbort()
@@ -394,7 +404,9 @@ doAssert outcomes.len == 0 and replies == @[1'u8]
     "payload_changed": """
 let request = makeAbort()
 currentState = 3
+allocFail = true
 doAssert deliverAbort(request) == KeMsgSaved
+allocFail = false
 cast[ptr uint8](request)[] = 0
 schedule()
 doAssert deliverAbort(request) == KeMsgConsumed

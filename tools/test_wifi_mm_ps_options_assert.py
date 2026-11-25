@@ -39,7 +39,7 @@ proc keMsgHdrFromPayload(p: pointer): ptr Header =
   addr request.header
 proc mmSetPsOptionsReqView(p: pointer): ptr MmSetPsOptionsReqPayload =
   cast[ptr MmSetPsOptionsReqPayload](p)
-proc smActivationAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc assert_err(condition, file: cstring; line: cint) =
   assertions.add(($condition, $file, line))

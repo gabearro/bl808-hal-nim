@@ -136,8 +136,7 @@ proc ke_evt_clear(bits: uint32) = doAssert bits == KE_EVT_IDLE
 proc ke_msg_free_payload(p: pointer) = doAssert false
 proc hal_machw_idle_req() = inc idleRequests
 proc ke_msg_send_basic_reply(p: pointer; id: uint16) = inc confirms
-proc smBssAdmitRequest(p: pointer): bool = true
-proc smActivationAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc chanUpdateAdmit(p: pointer): bool = true
 proc apmPrepareVifRemoval(vif: uint8): bool = true

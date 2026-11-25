@@ -43,7 +43,7 @@ var
 proc macTimeNow(): uint32 = now
 proc staDeleteEpoch(index: uint8): uint32 = stationEpochs[index]
 proc txlResetting(): bool = false
-proc smBssAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - offsetof(Request, payload).uint)

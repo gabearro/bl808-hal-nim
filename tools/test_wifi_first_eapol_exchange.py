@@ -182,9 +182,8 @@ for timing in 0..7: # before/during/after link-up; rekey, replacement, reset, re
       doAssert wpatx.peerLinked() == (timing == 6)
       doAssert stations[0].controlPortState == 0
     if timing == 7:
-      smActivationCancelConnection(addr replacement)
-      doAssert wpatx.peerLinked()
-      smActivationCancelConnection(addr connection)
+      # The attempt's teardown withdraws the peer published early.
+      smActivationCancel()
       doAssert not wpatx.peerLinked()
     drain()
     finish()

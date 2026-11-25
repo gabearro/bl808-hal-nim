@@ -1,4 +1,10 @@
-"""Keep one BSS configuration coherent across allocator and control callbacks."""
+"""The BSS parameter batch carries the VIF's configuration as sm_set_bss_param found it.
+
+The batch is built in one firmware step, which nothing re-enters (the
+firmware step is not reentered: wifiStepEnter), so no allocator or control
+callback can change the VIF while the requests are filled. The former cases
+that mutated the VIF from such callbacks were removed with that guard.
+"""
 
 from pathlib import Path
 
@@ -32,23 +38,12 @@ proc prepareSnapshot() =
   observedRates = default(typeof(observedRates))
   vif.basicRates = [3'u8, 2, 4, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   expectedRates = vif.basicRates
-proc mutateSettings() =
-  vif.bssid = [8'u8, 7, 6, 5, 4, 3]
-  vif.basicRates = [4'u8, 12, 24, 48, 96, 0, 0, 0, 0, 0, 0, 0, 0]
-  vif.beaconIntervalTu = 200
-  channel.band = 0
-  vif.operChan = nil
-  vif.wmmQosInfo = 0
-  connection.qosInfo = 10
-  ps.uapsdPeriod = 0
-  for ac in 0..3:
-    cast[ptr uint32](addr vif.edcaParams[ac * 4])[] = 0xAABBCC00'u32 + ac.uint32
 proc finishBatch() =
   while sm.pendingBssParams.first != nil:
     acknowledgeBss()
     sm_send_next_bss_param()
   acknowledgeBss()
-  doAssert sent.len == 9 and not smBss.active
+  doAssert sent.len == 9 and smOwn.answer == nil
 proc checkSnapshot(band = 1'u8; qosMask = 5'u8; uapsd = true) =
   doAssert observedRates == expectedRates
   let psRequest = cast[ptr MeSetPsDisableReqPayload](sent[0])
@@ -70,43 +65,8 @@ proc checkSnapshot(band = 1'u8; qosMask = 5'u8; uapsd = true) =
 
 
 CASES = {
-    "allocation_callbacks": r'''
-for point in 1..18:
-  prepareSnapshot()
-  allocationHook = proc() =
-    if calls == point:
-      allocationHook = nil
-      mutateSettings()
-  sm_set_bss_param()
-  finishBatch()
-  checkSnapshot()
-  finish()
-''',
-    "rate_callback": r'''
+    "configuration": r'''
 prepareSnapshot()
-rateHook = proc() =
-  rateHook = nil
-  mutateSettings()
-sm_set_bss_param()
-finishBatch()
-checkSnapshot()
-finish()
-''',
-    "state_callback": r'''
-prepareSnapshot()
-stateHook = proc() =
-  stateHook = nil
-  mutateSettings()
-sm_set_bss_param()
-finishBatch()
-checkSnapshot()
-finish()
-''',
-    "send_callback": r'''
-prepareSnapshot()
-sendHook = proc() =
-  sendHook = nil
-  mutateSettings()
 sm_set_bss_param()
 finishBatch()
 checkSnapshot()
@@ -115,9 +75,6 @@ finish()
     "missing_channel": r'''
 prepareSnapshot()
 vif.operChan = nil
-allocationHook = proc() =
-  allocationHook = nil
-  vif.operChan = addr channel
 sm_set_bss_param()
 finishBatch()
 checkSnapshot(band = 0)
@@ -131,9 +88,6 @@ for period in [0'u32, 100'u32]:
       ps.uapsdPeriod = period
       vif.wmmQosInfo = gate
       connection.qosInfo = mask
-      allocationHook = proc() =
-        allocationHook = nil
-        mutateSettings()
       sm_set_bss_param()
       finishBatch()
       checkSnapshot(qosMask = mask, uapsd = period != 0 and gate >= 128)
@@ -144,9 +98,6 @@ prepareSnapshot()
 vif.basicRates[0] = 12
 for index in 1..12: vif.basicRates[index] = index.uint8
 expectedRates = vif.basicRates
-allocationHook = proc() =
-  allocationHook = nil
-  mutateSettings()
 sm_set_bss_param()
 finishBatch()
 checkSnapshot()
@@ -158,16 +109,13 @@ for count in [13'u8, 255]:
   vif.basicRates[0] = count
   sm_set_bss_param()
   doAssert calls == 0 and rateBuilds == 0 and sent.len == 0
-  doAssert allocated.len == 0 and not smBss.active
+  doAssert allocated.len == 0 and smOwn.request == nil
   doAssert failures == @[(14'u16, 0xFFFF'u16)]
   finish()
 ''',
-    "allocation_failure_after_mutation": r'''
+    "allocation_failure": r'''
 prepareSnapshot()
 failAt = 3
-allocationHook = proc() =
-  allocationHook = nil
-  mutateSettings()
 sm_set_bss_param()
 doAssert sent.len == 0 and allocated.len == 0 and rateBuilds == 0
 doAssert failures == @[(14'u16, 0xFFFF'u16)]

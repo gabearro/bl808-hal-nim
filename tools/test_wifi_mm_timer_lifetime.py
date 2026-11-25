@@ -174,24 +174,18 @@ var
   keTimerQueue: CoList
   keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
   beacons, kernelCallbacks, resets: int
-  registrations, scans, taskMessages: int
-  registrationReady, scanReady, messageReady, holdReset, registrationPostsReset: bool
+  registrations, taskMessages: int
+  registrationReady, messageReady, holdReset, registrationPostsReset: bool
 proc keEnvEventField(): ptr uint32 = addr events
 proc macTimeNow(): uint32 = regRead(MACHW_TIMLO_REG)
-# The first two polled services in wifiDrainScheduledWork's order stand in
-# for any: "registration" runs first and can post a reset, "scan" second.
-proc smActivationNeedsService(): bool = registrationReady
-proc smBssNeedsService(): bool = scanReady
-proc smCleanupNeedsService(): bool = false
-proc smActivationService() =
+# The polled cleanup service in wifiDrainScheduledWork ("registration"
+# here) can post a reset.
+proc smCleanupNeedsService(): bool = registrationReady
+proc smCleanupService() =
   registrationReady = false
   inc registrations
   if registrationPostsReset:
     ke_evt_set(KE_EVT_RESET)
-proc smBssService() =
-  scanReady = false
-  inc scans
-proc smCleanupService() = discard
 proc wifiMessagePendingWork(): bool = messageReady
 proc ke_task_schedule() =
   messageReady = false
@@ -230,10 +224,8 @@ proc armServiceTimers(start, deadline: uint32) =
   kernelCallbacks = 0
   resets = 0
   registrations = 0
-  scans = 0
   taskMessages = 0
   registrationReady = false
-  scanReady = false
   messageReady = false
   holdReset = false
   registrationPostsReset = false
@@ -320,13 +312,12 @@ for deadline in [1000'u32, 20'u32]:
 
   armServiceTimers(deadline - 100, deadline)
   registrationReady = true
-  scanReady = true
   registrationPostsReset = true
   messageReady = true
   doAssert wifiDrainScheduledWork()
-  doAssert registrations == 1 and resets == 1 and scans == 0 and taskMessages == 0
+  doAssert registrations == 1 and resets == 1 and taskMessages == 0
   doAssert wifiDrainScheduledWork()
-  doAssert scans == 1 and taskMessages == 1
+  doAssert registrations == 1 and taskMessages == 1
 
   armServiceTimers(deadline - 100, deadline)
   messageReady = true

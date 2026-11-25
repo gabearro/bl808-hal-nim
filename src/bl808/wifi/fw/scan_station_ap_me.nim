@@ -2655,154 +2655,12 @@ proc sm_add_chan_ctx*(chanIndex: ptr uint8): uint8 {.exportc, cdecl, discardable
   smAddPreparedChannelContext(prepared, chanIndex)
 
 proc sm_send_next_bss_param*() {.exportc, cdecl.} =
-  ## Dispatch at most one request, retaining its batch identity until reply.
-  smBssSendNext()
+  ## Send the BSS parameter batch's next request (station_bss.nim).
+  smBssNext()
 
 proc sm_set_bss_param*() {.exportc, cdecl.} =
-  ## Prepare the vendor's nine-message association configuration sequence.
-  ## Keep it private until allocation and connection-owner checks succeed.
-  if not smBssCanBegin(): return
-  let sm = smEnvView()
-  let connInfo = sm.connectInfo
-  let indication = sm.connectIndMsg
-  if connInfo == nil or indication == nil:
-    return
-  if sm.pendingBssParams.first != nil: return
-  var build = smTxBegin(connInfo)
-  if not build.identity.captured: return
-  let vifIdx = build.identity.vif
-  let vif = vifChannelForIdx(vifIdx)
-  if not smTxBindStation(build, vif.staIdx): return
-  template current(): bool =
-    smTxOwnerCurrent(build) and sm.connectIndMsg == indication
-  var pending: CoList
-  var messages: array[9, pointer]
-  var replies: array[9, pointer]
-  var bssid: array[6, uint8]
-  var basicRates: array[13, uint8]
-  var band: uint8
-  var beaconInterval: uint16
-  var edcaParameters: array[4, MmSetEdcaReqPayload]
-  let serial = smBssNewSerial()
-  var published = false
-  var preparationFailed = false
-  defer:
-    if not published:
-      for message in messages:
-        if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
-      for reply in replies:
-        if reply != nil: ke_msg_free(keMsgHdrFromPayload(reply))
-      # Release the private batch before connection cleanup can reenter.
-      let saved = irqSave()
-      defer: irqRestore(saved)
-      if preparationFailed and current():
-        sm_connect_ind(WLAN_FW_JOIN_NETWORK_FAILURE.uint16, 0xFFFF)
-
-  template pushMsg(msg: pointer) =
-    let msgHdr = cast[ptr CoListHdr](keMsgHdrFromPayload(msg))
-    co_list_push_back(addr pending, msgHdr)
-
-  # Freeze one association configuration before allocation can call out.
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if not current(): return
-    bssid = vif.bssid
-    basicRates = vif.basicRates
-    beaconInterval = vif.beaconIntervalTu
-    if vif.operChan != nil:
-      band = cast[ptr ScanChannelEntry](vif.operChan).band
-    let uapsdEnabled = psEnvView().uapsdPeriod != 0 and vifEdcaPsGate(vif) < 0
-    let qosMask = connectInfoView(connInfo).qosInfo
-    for ac in 0'u8 ..< 4'u8:
-      edcaParameters[ac] = MmSetEdcaReqPayload(
-        edcaParam: cast[ptr uint32](addr vif.edcaParams[ac.uint * 4])[],
-        acmFlag: ac, vifIdx: vifIdx,
-        uapsdAc: (uapsdEnabled and (mac_ac2uapsd[ac] and qosMask) != 0).uint8)
-  if basicRates[0] == 0 or basicRates[0].int >= basicRates.len:
-    preparationFailed = true
-    return
-
-  for index in 0 ..< messages.len:
-    messages[index] = smBssAlloc(index, serial, false)
-    if not current(): return
-    replies[index] = smBssAlloc(index, serial, true)
-    if not current(): return
-  for message in messages:
-    if message == nil:
-      preparationFailed = true
-      return
-  for reply in replies:
-    if reply == nil:
-      preparationFailed = true
-      return
-  let msgPs = messages[0]
-  let msgBssid = messages[1]
-  let msgRates = messages[2]
-  let msgBcn = messages[3]
-  let msgActive = messages[8]
-  let edcaMessages = [messages[4], messages[5], messages[6], messages[7]]
-
-  # 1. ME_SET_PS_DISABLE_REQ (blob 0x90..0xAA)
-  if msgPs != nil:
-    let req = cast[ptr MeSetPsDisableReqPayload](msgPs)
-    req.disable = 1
-    req.vifIdx = vifIdx
-    pushMsg(msgPs)
-
-  # 2. MM_SET_BSSID_REQ: memcpy BSSID from VIF+380 (blob 0xCE), then push (0xEA)
-  if msgBssid != nil:
-    let req = cast[ptr MmSetBssidReqPayload](msgBssid)
-    req.bssid = bssid
-    req.vifIdx = vifIdx
-    pushMsg(msgBssid)
-
-  # 3. MM_SET_BASIC_RATES_REQ: rate bitfield (blob 0x10A), push (0x12A)
-  let rateBitfield = me_legacy_rate_bitfield_build(
-    cast[pointer](addr basicRates[0]), 1)
-  if not current(): return
-  if msgRates != nil:
-    let req = cast[ptr MmSetBasicRatesReqPayload](msgRates)
-    req.band = band
-    req.rateBitfield = rateBitfield
-    req.vifIdx = vifIdx
-    pushMsg(msgRates)
-
-  # 4. MM_SET_BEACON_INT_REQ (blob push at 0x152)
-  if msgBcn != nil:
-    let req = cast[ptr MmSetBeaconIntReqPayload](msgBcn)
-    req.interval = beaconInterval
-    req.vifIdx = vifIdx
-    pushMsg(msgBcn)
-
-  # 5. 4x MM_SET_EDCA_REQ per AC (blob 0x17A alloc, 0x1BC push). These are
-  # pushed BEFORE the ME_SET_ACTIVE_REQ because the blob emits the active
-  # msg last to ensure ME activation fires after the ACs are programmed.
-  for ac in 0'u8 ..< 4'u8:
-    let msg = edcaMessages[ac]
-    if msg != nil:
-      cast[ptr MmSetEdcaReqPayload](msg)[] = edcaParameters[ac]
-      pushMsg(msg)
-
-  # 6. Activate only after all four access categories have been configured.
-  if msgActive != nil:
-    let req = cast[ptr MeSetActiveReqPayload](msgActive)
-    req.active = 1
-    req.vifIdx = vifIdx
-    pushMsg(msgActive)
-
-  # Advance state, then dispatch the queue. The confirmation handlers
-  # require state 4 before the first queued request can complete.
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if not current() or sm.pendingBssParams.first != nil: return
-    if not smTxSetOwnerState(build, SmSettingBssState): return
-    if not current() or sm.pendingBssParams.first != nil: return
-    if not smBssStart(build, serial, replies): return
-    sm.pendingBssParams = pending
-    published = true
-    sm_send_next_bss_param()
+  ## Start the association's BSS parameter batch, state 4 (station_bss.nim).
+  smBssBegin()
 
 proc sm_handle_connection*(vifIdx: uint8, status: uint16,
     callbackCtx: pointer, failureFn: pointer) {.exportc, cdecl.} =
@@ -3795,26 +3653,8 @@ proc smAssocDone(build: var SmTxBuildContext; indication: pointer;
     when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocAid
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return false
-  var prepared: SmActivationPrepared
-  defer: smActivationReleasePrepared(prepared)
-  if not smActivationPrepare(build, indication, aid, prepared):
-    if smAssocOwnerCurrent(build, indication):
-      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocPrepare
-      sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
-    return false
-  if not smTxSetOwnerState(build, SM_ACTIVATING_STATE) or
-      not smAssocOwnerCurrent(build, indication): return false
-  smEnvView().saQueryActive = 0
-  ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
-  if not smAssocOwnerCurrent(build, indication): return false
-  prepared.notifyWps = notifyWps
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smAssocOwnerCurrent(build, indication): return false
-  result = smActivationStart(build, indication, prepared)
-  if not result and smAssocOwnerCurrent(build, indication):
-    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocStart
-    sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+  smActivationStart(build.identity.vif, build.identity.station, aid, notifyWps)
+  true
 
 proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
   let connection = smEnvView().connectInfo

@@ -7035,12 +7035,12 @@ cases below; reachability was argued from code, not reproduced on
 hardware.
 
 `smTxSessionCurrent` now checks the connection attempt without the reset
-epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The BSS
-parameter batch and the activation exchange use the session check. The
+epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
 auth/assoc response deadline and the expected auth response carry the SM
 operation's stamp instead (see "SM response deadline" below), and the
-scan, join and registration exchanges are held by SM's operation (see "SM
-scan, join and registration" below). The deauthentication confirmations
+scan, join, registration, BSS parameter and activation exchanges are held
+by SM's operation (see "SM scan, join and registration" and "SM BSS
+parameters and activation" below). The deauthentication confirmations
 end their wait with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm`
 and `sm_supplicant_deauth_cfm` do (see "SM teardown" below). None of the
 channel deadlines or SM exchanges depends on the TX reset epoch, so
@@ -7427,6 +7427,126 @@ registration), `tools/test_wifi_channel_ownership.py`,
 `tools/test_wifi_message_free_depth.py` and
 `tools/test_wifi_queue_model_fuzzer.py`. The M0 HTTP server manifest
 built; none of this was flashed.
+
+#### SM BSS parameters and activation (states 4 and 9)
+
+In state 4 SM sends the nine requests of `sm_set_bss_param` and in state 9
+the activation's `MM_SET_VIF_STATE_REQ`, `MM_SET_PS_OPTIONS_REQ` and
+`ME_SET_PS_DISABLE_REQ`, one at a time; each answer sends the next. Their
+repliers answer with an empty confirmation from `ke_msg_alloc_reply`. SM
+allocates that reply before it sends the request (`smSendReserved`), and
+`ke_msg_alloc_reply` hands it to the replier (`smTakeReply`). ME's forward
+of a request to MM carries the same reply: `meReserveControl` takes it,
+`meTakeControlReply` relabels it as MM's confirmation and
+`meCompleteControl` as ME's. SM takes only that reply (`smTakeAnswer`), so
+the answer needs no allocation at the replier and cannot be lost. The blob's
+repliers allocate the confirmation with `ke_msg_alloc`, which halts without
+memory. Differences from the archive:
+
+- `sm_set_bss_param` allocates the nine requests with `ke_msg_try_alloc`
+  before entering state 4, as the blob allocates them; a failure ends the
+  attempt with `sm_connect_ind(14)` (the blob halts). Each request's reply
+  is allocated when it is sent; a failure there also ends the attempt (14).
+- `sm_set_bss_param` ends the attempt (14) when the attempt's VIF is no
+  longer a STA VIF. The port had returned silently and left SM in state 3;
+  the blob uses the slot regardless. The batch checks the VIF again at every
+  answer, the answer to `ME_SET_ACTIVE_REQ` before authentication included
+  (`smBssNext`, 14), and the activation at each answer, with its AP station
+  (5). The batch does not watch the AP station, as in the blob; no path is
+  known that deletes it in state 4, where `MM_SET_BEACON_INT_REQ` would then
+  index `sta_info_tab` with 0xFF, as the blob does.
+- `mm_hw_config_handler`, `mm_set_ps_options_req_handler`,
+  `me_set_active_req_handler` and `me_set_ps_disable_req_handler` check
+  SM's requests at entry (`smStaleRequest`). One SM no longer waits on is
+  dropped. One SM still waits on whose STA VIF has been retired (the slot is
+  free or holds another interface type) is answered there with SM's
+  reserved reply and not applied. A request queued before the retirement
+  therefore changes nothing: no field of the freed slot, no MAC BSSID
+  register (`MM_SET_BSSID_REQ` while one VIF is active), no AP beacon
+  interval (`MM_SET_BEACON_INT_REQ` on a slot that is no longer a STA), no
+  assert 1680 (`MM_SET_PS_OPTIONS_REQ`) and no ME mask bit. SM then ends the
+  attempt at that answer. The blob applies any request to whatever the slot holds; the
+  port's former admission checks dropped it unanswered, which left SM in
+  state 4 or 9. A request they accept is always answered. The admission
+  re-checks inside these handlers and in ME's control procs are removed:
+  nothing they call can run SM code (the firmware step is not reentered).
+  The check compares the VIF's index and type only: a STA VIF removed and
+  added again at the same index passes it (the old check's VIF epoch caught
+  that).
+- When the attempt ends, an ME exchange already forwarded to MM is not
+  cancelled: ME and MM finish it, ME goes idle, and SM ignores the answer.
+  When a STA VIF is left to clean up, the teardown's own
+  `ME_SET_PS_DISABLE_REQ(0)` and `ME_SET_ACTIVE_REQ(0)`, saved behind it,
+  undo the mask bits. When the attempt ends because its STA VIF was retired
+  while the forward was in flight, no cleanup runs (`smTeardownUnclaimed`)
+  and the forward leaves that VIF's `psDisableMask` or `activeMask` bit set.
+  The port had cancelled the exchange (`meControlReset`) and reverted the bit
+  itself (`smBssCancelControl`); the blob has no cancel. Clearing the bits
+  of a retired VIF is not done yet: it belongs with `vif_mgmt_unregister`
+  telling SM that the attempt's VIF is gone.
+- Pinned `mm_set_vif_state_cfm_handler` sends `MM_SET_PS_OPTIONS_REQ` and
+  `ME_SET_PS_DISABLE_REQ` without waiting and reports the connection at
+  once. The port waits for each answer and reports after the last, as
+  before. Its requests are now allocated one at a time when sent, no longer
+  all three with their replies and `SM_STA_ADD_IND` before state 9, so an
+  allocation failure ends the attempt from state 9 with
+  `sm_connect_ind(5)` instead of from state 8.
+- The activation is live while SM's state-9 operation is
+  (`smActivationLive`). A TX reset, a VIF epoch or the SM TX serial no
+  longer end it, and its failure is reported (SMCONN-F6). A station
+  deleted under it ends the attempt with `sm_connect_ind(5)` at the next
+  answer; before, the activation was dropped unreported. In state 4 or 9,
+  an attempt whose STA VIF was retired calls `sm_connect_ind` too, but with
+  no STA VIF left the teardown ends it unreported (`smTeardownUnclaimed`).
+- The teardown withdraws a TX peer the activation had published and closes
+  its control port (`smActivationCancel`) whenever the station is still
+  registered; before, the port was closed only on the activation's own
+  failure.
+- An abort in states 3 and 4 ends the attempt with
+  `sm_connect_ind(24, 3)` and is confirmed with status 0, as in states 5
+  and 7. Pinned `sm_connect_abort_req_handler+0x32..0x3a` saves it until a
+  later state.
+- `me_set_active_cfm_handler_sm` no longer re-checks the TX owner after
+  pushing the deauthentication `sm_init` asked for. A TX reset inside that
+  push used to stop the batch before authentication and leave SM in
+  state 4.
+- `mm_sta_add_req_handler` answers SM's request in place with status 1,
+  registering nothing, when its VIF is no longer the attempt's STA VIF
+  (`smAttemptStaVif`); SM ends the attempt with `sm_connect_ind(15)`. The
+  blob registers the station on whatever the slot holds.
+
+Removed: the BSS and activation message tags, their lists and serials, the
+`smBssForget` and `smActivationForget` hooks in `ke_msg_free`, the lost
+flags, `smBssNeedsService`/`smBssService` and
+`smActivationNeedsService`/`smActivationService` with their entries in
+`wifiMainHasPendingWork` and `wifiDrainScheduledWork`,
+`smBssCancelControl` and `smActivationCancelControl` (SM's calls into
+`meControlReset`, and with it SMSTRUCT-N3's reset-epoch check),
+`SmActivationPrepared`, `smActivationCancelConnection` and
+`smSetActiveCfmStateAllowed`. The station cleanup (state 10) still uses its
+own tags and polled service.
+
+Host tests: `tools/test_wifi_sm_bss_allocation.py`,
+`tools/test_wifi_bss_confirmations.py` (the real ME forward, including an
+attempt that ends while MM holds it, and a STA VIF retired before the
+replier runs or during the forward), `tools/test_wifi_activation_exchange.py`
+(including an attempt ended by the host inside `SM_STA_ADD_IND` or by the
+WPS callback), `tools/test_wifi_activation_mm.py` (the real
+`mm_hw_config_handler` answering `MM_SET_VIF_STATE_REQ` for a retired VIF
+without applying it), `tools/test_wifi_sm_table.py` (each request of both
+series with each fate: answered, TX reset, attempt ended before or after
+the reply, duplicate answer, STA VIF retired before the replier runs, and
+for the activation a deleted station, checking that SM holds an answer
+exactly while a series is live, that the attempt is reported once and that
+nothing is applied to a retired VIF), `tools/test_wifi_sm_audit_sm_connect.py`
+(SMCONN-F5, SMCONN-F6, SMSTRUCT-N1 for the forward, the retired-VIF
+registration, the silent `sm_set_bss_param` return, abort in states 3 and
+4) and `tools/test_wifi_station_abort.py`. Cases that changed the VIF or the
+attempt from allocator, timer, trace or filter callbacks in the middle of a
+handler were removed with the re-checks they exercised; the two re-checks
+that remain, after the host's `SM_STA_ADD_IND` and the WPS callback, are
+covered. The M0 HTTP server
+manifest built; none of this was flashed.
 
 ## BLE
 

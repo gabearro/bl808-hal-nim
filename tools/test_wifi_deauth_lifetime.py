@@ -40,8 +40,9 @@ proc failed(p: pointer; status, reason: uint16) {.cdecl.} =
   inc failures
   failureStatus = status
 proc smCleanupConsumeReply(p: pointer): bool = false
-proc smBssConsumeReply(p: pointer): bool = true
 proc sm_auth_start() = inc authStarts
+var batchDone = true
+proc smBssNext(): bool = batchDone  # station_bss.nim: the STA VIF is still there
 '''
 
 TEARDOWN = r'''
@@ -283,39 +284,38 @@ sendDeauth(1)
 doAssert pushes == 1 and failures == 0 and currentState == 4
 doAssert activeFrame.frameLen == 26 and activeFrame.callback == nil
 ''',
-    "active_trace_replacement": r'''
-prepare(1)
-sm.deauthPending = 1
-hook = 4
-action = 1
-doAssert me_set_active_cfm_handler_sm(nil) == 0
-doAssert hookFired and pushes == 0 and authStarts == 0
-doAssert sm.deauthPending == 9 and currentState == 9
-''',
-    "active_handoff_replacement": r'''
-prepare(1)
-sm.deauthPending = 1
-hook = 6
-action = 1
-me_set_active_cfm_handler_sm(nil)
-doAssert hookFired and pushes == 1 and authStarts == 0
-doAssert sm.deauthPending == 9 and currentState == 9
-''',
+    # The answer to the BSS batch's last request sends the deauthentication
+    # sm_init asked for, then starts authentication.
     "active_normal": r'''
 for pending in 0'u8..1:
   prepare(1)
   sm.deauthPending = pending
-  doAssert me_set_active_cfm_handler_sm(nil) == 0
+  var answer: uint8
+  smOwn.answer = addr answer
+  doAssert me_set_active_cfm_handler_sm(addr answer) == 0
   doAssert pushes == pending.int and authStarts == 1 and sm.deauthPending == 0
-''',
-    "active_reentry": r'''
+  doAssert smOwn.answer == nil
+# The batch ended the attempt instead (its STA VIF is gone): no deauthentication
+# and no authentication.
 prepare(1)
 sm.deauthPending = 1
-onHandoff = proc() =
-  onHandoff = nil
-  me_set_active_cfm_handler_sm(nil)
-me_set_active_cfm_handler_sm(nil)
-doAssert pushes == 2 and authStarts == 1 and sm.deauthPending == 0
+batchDone = false
+var answer: uint8
+smOwn.answer = addr answer
+doAssert me_set_active_cfm_handler_sm(addr answer) == 0
+doAssert pushes == 0 and authStarts == 0 and sm.deauthPending == 1
+batchDone = true
+''',
+    # Any other ME_SET_ACTIVE_CFM (stale, or none) changes nothing.
+    "active_not_the_answer": r'''
+prepare(1)
+sm.deauthPending = 1
+var answer, other: uint8
+smOwn.answer = addr answer
+doAssert me_set_active_cfm_handler_sm(addr other) == 0
+doAssert me_set_active_cfm_handler_sm(nil) == 0
+doAssert pushes == 0 and authStarts == 0 and sm.deauthPending == 1
+doAssert smOwn.answer == addr answer
 ''',
 }
 
@@ -359,15 +359,14 @@ def source() -> str:
     rest = rest[:extra_start] + rest[extra_end:]
     code = first + extras + "\n" + marker + rest
     code += TEARDOWN
-    code += station_sm_source("smDeauthConfirmed", "smDeauthVif", "smDeauthGuardExpired",
-                              "smDeauthWait", record=False)
+    code += station_sm_source("smTakeAnswer", "smDeauthConfirmed", "smDeauthVif",
+                              "smDeauthGuardExpired", "smDeauthWait", record=False)
     for name in ["me_build_deauthenticate", "sm_disconnect_deauth_cfm",
                  "sm_connect_abort_deauth_cfm", "sm_handle_connection", "smDeauthSend", "sm_deauth_send"]:
         if not re.search(rf"^proc {name}\*?\(", sm, re.M):
             continue
         code += procedure(sm, name)
     tasks = (FW / "task_handlers.nim").read_text()
-    code += procedure(tasks, "smSetActiveCfmStateAllowed")
     code += procedure(tasks, "me_set_active_cfm_handler_sm")
     return code + CHECKS
 

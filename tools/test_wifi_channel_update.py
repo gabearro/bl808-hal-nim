@@ -231,8 +231,7 @@ var
   replies, idleRequests: int
 proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
-proc smBssAdmitRequest(p: pointer): bool = true
-proc smActivationAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc chanUpdateAdmit(p: pointer): bool = true
 proc apmPrepareVifRemoval(index: uint8): bool = true

@@ -110,12 +110,6 @@ type
     algorithm: uint8
     txSequence: uint16
 
-  SmActivationPrepared = object
-    serial: uint32
-    requests, replies: array[3, pointer]
-    stationInd: pointer
-    notifyWps: bool
-
   ChanCtxtLease = object
     allocation, binding, vifEpoch: uint32
     index, vif: uint8

@@ -18,7 +18,7 @@ for vifIndex in 0'u8 .. 1'u8:
         let expected = if cipher >= 2: 1'u8 else: 2'u8 - (flags and 1).uint8
         doAssert stations[staIndex].controlPortState == expected
         doAssert stations[staIndex].rateWord == 0x888E
-        doAssert stationReady == 1 and calls == 7
+        doAssert stationReady == 1 and calls == (if (flags and 1) == 0: 7 else: 5)
         doAssert connected == (if cipher <= 1: 1 else: 0)
         if cipher >= 2:
           sm_handle_supplicant_result(staIndex, 0)

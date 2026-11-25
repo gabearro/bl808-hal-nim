@@ -11,11 +11,9 @@ from test_wifi_ap_teardown import FW, ROOT, procedure
 
 PLATFORM = r'''
 proc smCleanupOwnsRequest(request: pointer): bool = false
-proc smBssOwnsRequest(request: pointer): bool = false
-proc smBssTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
+proc smAwaits(request: pointer): bool = false
+proc smTakeReply(request: pointer; id: uint16): pointer = nil
 proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
-proc smActivationOwnsRequest(request: pointer): bool = false
-proc smActivationTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
 import bl808/wifi/fw_constants/limits_events
 const
   TASK_MM = 0'u8

@@ -330,13 +330,20 @@ when not declared(mm_timer_set):
 when not declared(macTimeNow):
   proc macTimeNow(): uint32 = 0
 '''
+# smGo frees a reply SM reserved and no replier took (station_sm.nim).
+SM_FREE = r'''
+when not declared(keMsgHdrFromPayload):
+  proc keMsgHdrFromPayload(p: pointer): pointer = p
+when not declared(ke_msg_free):
+  proc ke_msg_free(p: pointer) = doAssert false, "no reply was reserved"
+'''
 SM_SA_QUERY = r'''
 when not declared(smSaQueryEnd):
   proc smSaQueryEnd() = discard
 '''
 SM_RELEASE = r'''
-when not declared(smActivationCancelConnection):
-  proc smActivationCancelConnection(connection: pointer) = discard
+when not declared(smActivationCancel):
+  proc smActivationCancel() = discard
 when not declared(smBssCancel):
   proc smBssCancel() = discard
 when not declared(smDeferredCancel):
@@ -359,6 +366,8 @@ def station_sm_source(*names: str, record: bool = True) -> str:
     code = ""
     if record:
         code += (FW / "op.nim").read_text() + SM_TIMER + sm[sm.index("type\n"):sm.index("proc smGo(")]
+    if "smGo" in names:
+        code += SM_FREE
     if "smDeauthWait" in names:
         code += SM_WAIT
     if "smDeauthWait" in names or "smTeardown" in names:

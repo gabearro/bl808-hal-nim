@@ -45,9 +45,6 @@ proc smCleanupConsumeReply(reply: pointer): bool
 proc smCleanupCancel()
 proc smDeferredCancel() = discard
 proc smBssCancel() = discard
-proc smBssNeedsService(): bool = false
-proc smBssService() = discard
-proc smBssConsumeReply(p: pointer): bool = false
 proc smCleanupService()
 proc chan_ctxt_unlink(index: uint8)
 '''
@@ -142,6 +139,7 @@ proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
 proc smTxEnd(build: var SmTxBuildContext) = discard
 proc smDeauthSend(build: var SmTxBuildContext) = sm_deauth_send()
 proc sm_send_next_bss_param() = inc starts
+proc smBssNext(): bool = true
 proc stationDisconnected(reason: uint8) {.cdecl.} =
   doAssert reason == 0
   inc callbackCalls
@@ -1034,11 +1032,11 @@ template rxHostIrqRestore(saved: uint32) = irqRestore(saved)
     code += ("proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;\n"
              "                    disconnected = false; status = 0'u16; reason = 0'u16): bool\n")
     code += procedure((FW / "station_sa_query.nim").read_text(), "smSaQueryEnd")
-    code += station_sm_source("smGo", "smDeauthConfirmed", "smDeauthVif",
+    code += station_sm_source("smGo", "smTakeAnswer", "smDeauthConfirmed", "smDeauthVif",
                               "smTeardownUnclaimed", "smTeardown")
     code += cleanup
     tasks = (FW / "task_handlers.nim").read_text()
-    for name in ["smSetActiveCfmStateAllowed", "me_set_active_cfm_handler_sm",
+    for name in ["me_set_active_cfm_handler_sm",
                  "me_set_ps_disable_cfm_handler_sm", "mm_sta_del_req_handler", "sm_delete_resources"]:
         code += procedure(tasks, name)
     for name in ("sm_disconnect_process", "smConnectEnd", "sm_connect_ind"):

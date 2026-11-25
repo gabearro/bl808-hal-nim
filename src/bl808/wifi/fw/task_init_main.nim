@@ -78,7 +78,7 @@ proc wifiResetEventPending(): bool {.inline.} =
 proc wifiMainHasPendingWork(): bool =
   wifiEventPendingWork() or wifiKernelTimerPendingWork() or
     wifiMmTimerPendingWork() or wifiMessagePendingWork() or
-    smBssNeedsService() or smCleanupNeedsService() or smActivationNeedsService()
+    smCleanupNeedsService()
 
 proc wifiUpdateMacPlCtrl() {.inline.} =
   ## arch_main.o:wifi_main samples the bit once per step before sleep scheduling.
@@ -148,8 +148,6 @@ proc wifiDrainScheduledWork(): bool =
         return
       service
       result = true
-  serviceWhen(smActivationNeedsService(), smActivationService())
-  serviceWhen(smBssNeedsService(), smBssService())
   serviceWhen(smCleanupNeedsService(), smCleanupService())
   if wifiDispatchScheduledEvent(): result = true
 

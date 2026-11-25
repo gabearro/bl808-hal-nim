@@ -104,11 +104,21 @@ def source() -> str:
                         "if task == TASK_SM: state elif task == TASK_ME: meState else: mmState")
     code = code.replace("  else: meState = value\n",
                         "  elif task == TASK_ME: meState = value\n  else: mmState = value\n")
-    code = code.replace("proc smCleanupAdmitRequest(p: pointer): bool = true", """
+    stubs = ("proc smCleanupOwnsRequest(p: pointer): bool = false\n"
+             "proc smCleanupAdmitRequest(p: pointer): bool = true\n"
+             "proc smCleanupConsumeReply(p: pointer): bool = false\n"
+             "proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil\n")
+    assert stubs in code
+    # The cleanup's own request (station_cleanup.nim), checked by its owner.
+    code = code.replace(stubs, """
 var cleanupRequest: pointer
 var cleanupVifEpoch: uint32
+proc smCleanupOwnsRequest(p: pointer): bool = p != nil and p == cleanupRequest
 proc smCleanupAdmitRequest(p: pointer): bool =
   p != cleanupRequest or (state == 10 and rxVifEpochs[1] == cleanupVifEpoch)
+proc smCleanupConsumeReply(p: pointer): bool = false
+proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer =
+  ke_msg_alloc(id, TASK_SM, TASK_MM, length)
 """, 1)
     start = code.index("  of TASK_MM:\n", code.index("proc dispatchOne"))
     end = code.index("  of TASK_API:\n", start)
@@ -197,20 +207,6 @@ doAssert stations[2].listenWindowDuration == 20
 doAssert vifs[1].psLastTime == 125 and vifs[1].beaconTimeoutBase == 130
 finish()
 ''',
-    "replacement_at_power_save_clock": r'''
-begin()
-onMacRead = proc() =
-  onMacRead = proc() =
-    doAssert macReads == 2
-    replaceOwner()
-    vifs[1].psLastTime = 987
-    vifs[1].beaconTimeoutBase = 654
-doAssert dispatchOne()
-doAssert state == 6 and connected == 0 and stationReady == 0
-doAssert macReads == 2 and vifs[1].psLastTime == 987 and vifs[1].beaconTimeoutBase == 654
-for event in events: doAssert event.id != MM_SET_VIF_STATE_CFM
-finish()
-''',
     "station_applies_each_negotiated_edca_word": r'''
 begin()
 vifs[1].edcaRegs = [0x0A47'u32, 0x0A43'u32, 0x5E432'u32, 0x2F322'u32]
@@ -224,13 +220,18 @@ doAssert edcaWrites == @[(MACHW_BASE + 0x200'u, 0x0A47'u32),
   (MACHW_BASE + 0x20C'u, 0x2F322'u32)]
 finish()
 ''',
-    "replacement_during_idle_request": r'''
+    # The STA VIF is retired with SM's MM_SET_VIF_STATE_REQ queued: the real
+    # handler answers it without touching the slot, its station or the MAC,
+    # and SM ends the attempt at the answer.
+    "retired_vif_is_answered_unapplied": r'''
 begin()
-mmState = 1
-onIdle = replaceOwner
+vifs[1].vifType = 4
 doAssert dispatchOne()
-doAssert state == 6 and connected == 0 and stationReady == 0
-for event in events: doAssert event.id != MM_SET_VIF_STATE_CFM
+doAssert events[^1].id == MM_SET_VIF_STATE_CFM
+doAssert vifs[1].state == 0 and vifs[1].tbttTimer == 0 and stations[2].aid == 0
+doAssert writes.len == 0 and macReads == 0
+drain()
+doAssert failures == @[(5'u16, 0xFFFF'u16)] and connected == 0
 finish()
 ''',
     "restore_before_confirmation": r'''
@@ -245,17 +246,6 @@ doAssert mmState == 99
 finish()
 ''',
 }
-
-for hook in ["onRead", "onTimer", "onBeacon", "onAmpdu", "onWrite", "onState"]:
-    CASES[f"replacement_at_{hook}"] = f'''
-begin()
-{hook} = replaceOwner
-doAssert dispatchOne()
-doAssert state == 6 and connected == 0 and stationReady == 0
-for event in events: doAssert event.id != MM_SET_VIF_STATE_CFM
-finish()
-'''
-
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

@@ -154,32 +154,25 @@ finish(p)
 # --- BSS parameter batch (state 4) -------------------------------------------
 
 def bss_source() -> str:
-    from test_wifi_auth_frames import layouts
-    from test_wifi_sm_bss_allocation import LIFETIME, source
-    names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
-             "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
-    types = layouts(*names)
-    types += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
-    return source(types, (FW / "scan_station_ap_me.nim").read_text()) + LIFETIME
+    from test_wifi_sm_bss_allocation import LIFETIME, source, types
+    return (source(types(), (FW / "scan_station_ap_me.nim").read_text()) + LIFETIME
+            + "var txResetEpoch: uint32\n")
 
 
-def test_bss_reply_queued_before_cancellation(tmp_path: Path) -> None:
-    """The attempt is retired after MM produced a reply but before SM consumed it."""
+def test_bss_answer_after_the_attempt_ended(tmp_path: Path) -> None:
+    """The attempt ends after the replier answered but before SM took the
+    answer: the answer is stale and the next attempt is not advanced."""
     run_nim(tmp_path, bss_source() + r'''
 setup()
 sm_set_bss_param()
 acknowledgeBss()
 sm_send_next_bss_param()
 doAssert state == SmSettingBssState and sent.len == 2
-let reply = smBssTakeReply(smBss.request, SmBssRequests[smBss.step] + 1, 0)
+let reply = smTakeReply(smOwn.request, MM_SET_BSSID_REQ + 1)
 doAssert reply != nil
-# A newer attempt owns SM before the queued confirmation is dispatched.
-sm.connectInfo = addr replacement
-state = SmAuthenticatingState
-doAssert smBssNeedsService()
-smBssService()
-doAssert not smBss.active and sm.pendingBssParams.first == nil
-doAssert not smBssConsumeReply(reply), "stale BSS reply advanced a retired batch"
+# A newer SM operation owns SM before the queued confirmation is dispatched.
+discard smGo(SmAuthenticatingState)
+doAssert not smTakeAnswer(reply), "stale BSS reply advanced a retired batch"
 ke_msg_free(keMsgHdrFromPayload(reply))
 doAssert failures.len == 0 and state == SmAuthenticatingState and sent.len == 2,
   "retired BSS batch reported to or advanced the replacement attempt"
@@ -188,23 +181,57 @@ finish()
 
 
 def test_bss_batch_survives_tx_reset(tmp_path: Path) -> None:
+    """SMCONN-F5 by construction: the batch is SM's live request and its
+    reserved reply; nothing in it reads the TX reset epoch."""
+    bss = (FW / "station_bss.nim").read_text()
+    assert "txResetEpoch" not in bss and "smTx" not in bss
     run_nim(tmp_path, bss_source() + r'''
 setup()
 sm_set_bss_param()
 acknowledgeBss()
 sm_send_next_bss_param()
-doAssert state == SmSettingBssState and sent.len == 2 and smBss.active
+doAssert state == SmSettingBssState and sent.len == 2
 inc txResetEpoch # Same connection, VIF and station; only TX was drained.
-if smBssNeedsService(): smBssService()
-doAssert smBss.active or failures.len == 1, "[SMCONN-F5] BSS batch cancelled after " &
-  "TX reset without sm_connect_ind; SM left in state " & $state &
-  " where abort and disconnect are saved"
-if smBss.active:
-  acknowledgeBss()
-  sm_send_next_bss_param()
-  doAssert sent.len == 3
+acknowledgeBss()
+sm_send_next_bss_param()
+doAssert sent.len == 3 and state == SmSettingBssState and failures.len == 0,
+  "[SMCONN-F5] BSS batch stopped after TX reset; SM left in state " & $state
 finish()
 ''', finding="SMCONN-F5")
+
+
+def test_bss_batch_without_the_sta_vif_ends_the_attempt(tmp_path: Path) -> None:
+    """sm_set_bss_param returned silently when it could not capture the STA
+    VIF, which left SM in state 3 for good. It now ends the attempt."""
+    run_nim(tmp_path, bss_source() + r'''
+for change in 0..1:
+  setup()
+  if change == 0: vif.vifType = 2   # the slot now holds another interface type
+  else: vif.vifIdx = 0              # or another interface index
+  sm_set_bss_param()
+  doAssert failures == @[(14'u16, 0xFFFF'u16)] and sent.len == 0 and allocated.len == 0,
+    "sm_set_bss_param left SM in state " & $state & " with no request"
+  finish()
+''')
+
+
+def test_abort_in_states_3_and_4_ends_the_attempt(tmp_path: Path) -> None:
+    """The plan's SMCONN-F5/F6 item: abort is no longer saved in states 3/4.
+    The real sm_connect_abort_req_handler ends the attempt there with
+    WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH, as in states 5/7, and confirms."""
+    from test_wifi_station_abort import program_source as abort_source
+    run_nim(tmp_path, abort_source() + r'''
+for state in [3'u16, 4]:
+  reset()
+  outcomes.setLen(0)
+  replies.setLen(0)
+  currentState = state
+  let request = makeAbort()
+  doAssert deliverAbort(request) == KeMsgConsumed,
+    "abort saved in state " & $state & "; the attempt keeps running"
+  doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
+  finish()
+''')
 
 
 # --- Deauthentication completions that leave state 10 -------------------------
@@ -432,17 +459,48 @@ for waiting in 1'u16 .. 10'u16:
 # --- Activation exchange (state 9) --------------------------------------------
 
 def test_activation_survives_tx_reset(tmp_path: Path) -> None:
+    """SMCONN-F6 by construction: the activation belongs to SM's state-9
+    operation; a TX reset does not end it."""
+    activation = (FW / "station_activation.nim").read_text()
+    assert "txResetEpoch" not in activation and "smTx" not in activation
     from test_wifi_activation_exchange import source
     run_nim(tmp_path, source() + r'''
 begin()
 inc txResetEpoch # Same connection, VIF and station; only TX was drained.
 drain()
-if smActivationNeedsService(): smActivationService()
-doAssert connected == 1 or failures.len == 1, "[SMCONN-F6] activation cancelled " &
+doAssert connected == 1 and failures.len == 0, "[SMCONN-F6] activation stopped " &
   "after TX reset with no connect indication; SM left in state " & $state &
   " (applied=" & $applied.len & ")"
 finish()
 ''', finding="SMCONN-F6")
+
+
+def test_activation_request_answered_through_the_me_forward(tmp_path: Path) -> None:
+    """SMSTRUCT-N1 (activation, BSS batch): ME forwards SM's request to MM
+    and MM's answer reaches SM in the reply SM reserved before sending, so
+    the forward allocates nothing and cannot drop the answer. A request SM
+    no longer waits on is dropped by its replier, and the forward ME already
+    started completes and leaves ME idle."""
+    from test_wifi_activation_exchange import source
+    run_nim(tmp_path, source() + r'''
+begin()
+let options = takeReply(1)
+consumeReply(options)
+ke_msg_free(keMsgHdrFromPayload(options))
+doAssert smActivation.step == 2 and smOwn.reply != nil
+let reserved = smOwn.reply
+let before = calls
+holdMMMode = true
+drain()
+doAssert meControlReply == reserved and mmPsModeRequest != nil and calls == before
+releaseMM()
+let answer = takeReply(2)
+doAssert answer == reserved, "[SMSTRUCT-N1] the forwarded answer is not SM's reserved reply"
+consumeReply(answer)
+ke_msg_free(keMsgHdrFromPayload(answer))
+doAssert connected == 1 and meState == MeIdleState
+finish()
+''')
 
 
 # --- Requests consumed without their reply ----------------------------------
@@ -507,4 +565,28 @@ release(reply)
 doAssert deletions == 1 and stations[0].valid == 0,
   "a station registered for an attempt SM has left was leaked"
 finishExchange()
+''')
+
+
+def test_registration_for_a_retired_sta_vif_is_refused(tmp_path: Path) -> None:
+    """MM checked only that SM waits on MM_STA_ADD_REQ. A registration whose
+    STA VIF was retired after the join was applied to the freed slot. MM now
+    answers it in place with status 1 and registers nothing; SM ends the
+    attempt with sm_connect_ind(15)."""
+    from test_wifi_message_allocation import run_program
+    from test_wifi_registration_exchange import source
+    run_program(tmp_path, "checked", source() + r'''
+for change in 0..1:
+  resetExchange()
+  let request = issue()
+  if change == 0: vifs[conn.vifIdx].vifType = 4   # retired: the slot is free
+  else: vifs[conn.vifIdx].vifIdx = 127
+  let reply = completeRegistration(request)
+  doAssert reply == request and registrations == 0,
+    "a registration was applied to a VIF that is not the attempt's STA VIF"
+  doAssert cast[ptr MmStaAddCfmPayload](reply).status == 1
+  doAssert mm_sta_add_cfm_handler(reply) == 0
+  release(reply)
+  doAssert failures == @[(15'u16, 0xFFFF'u16)] and bssCalls == 0 and deletions == 0
+  finishExchange()
 ''')

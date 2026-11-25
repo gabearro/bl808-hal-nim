@@ -352,7 +352,6 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
     vif.staIdx = 0xFF
   inc nimFwDbgDisconnectInd
   inc smCleanupSerial
-  let activationConnection = sm.connectInfo
   smCleanup = SmCleanupOperation(active: true, serial: smCleanupSerial,
     vifIndex: vif.vifIdx, station: vif.staIdx,
     session: captureRxHostSession(vif.vifIdx, 0xFF),
@@ -374,7 +373,7 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
   sm.scanResultIndex = 0xFFFFFFFF'u32
   smConnecting = false
   smGo(SmDisconnectingState, tdCleanup)
-  smActivationCancelConnection(activationConnection)
+  smActivationCancel()
   smBssCancel()
   smDeferredCancel()
   true

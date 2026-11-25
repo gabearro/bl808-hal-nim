@@ -19,15 +19,3 @@ doAssert stationReady == 0 and connected == 0 and filterUpdates == 0
 ke_msg_free(keMsgHdrFromPayload(p))
 finish()
 ''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_activation_allocation_replaces_connection(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source() + r'''
-setup()
-onAlloc = replaceOwner
-sm_assoc_done(7)
-doAssert stationReady == 0 and connected == 0 and filterUpdates == 0
-doAssert allocated.len == 0 and state == 6
-finish()
-''')

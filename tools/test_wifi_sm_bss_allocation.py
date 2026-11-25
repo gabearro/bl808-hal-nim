@@ -1,4 +1,10 @@
-"""Verify SM publishes either a complete BSS configuration batch or nothing."""
+"""SM's BSS parameter batch (state 4): what it sends and how it ends.
+
+The harness compiles the real station_bss.nim with station_sm.nim's smGo,
+smSendReserved, smTakeReply and smTakeAnswer. A replier is modelled by
+acknowledgeBss: it takes the reply SM reserved (smTakeReply, as
+ke_msg_alloc_reply does) and SM takes that answer.
+"""
 
 from pathlib import Path
 
@@ -74,25 +80,15 @@ var
   calls, failAt, stateChanges, rateBuilds: int
   state: uint16
   failures: seq[tuple[status, reason: uint16]]
-  rxVifEpochs: array[2, uint32]
-  txResetEpoch, psModeBuildSerial: uint32
-  stationEpochs: array[7, uint32]
-  smTxSerials: array[2, uint32]
   ps: tuple[uapsdPeriod: uint32, flags, pendingCount: uint8, currentVif: pointer]
   interruptsEnabled = true
   allocationHook, freeHook, rateHook, stateHook, sendHook, failureHook: proc()
-  meControlCommand, meControlReply: pointer
-proc smBssForget(header: pointer)
-proc meControlReset() = doAssert false
-proc meCancelQueuedPayload(payload: pointer) = discard
-proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool = false
 let mac_ac2uapsd = [4'u8, 8, 2, 1]
+proc smCleanupOwnsRequest(request: pointer): bool = false
 proc irqSave(): uint32 =
   result = if interruptsEnabled: 8'u32 else: 0'u32
   interruptsEnabled = false
 proc irqRestore(saved: uint32) = interruptsEnabled = (saved and 8) != 0
-proc staDeleteEpoch(index: uint8): uint32 =
-  if index < 7: stationEpochs[index] else: 0
 proc psEnvView(): ptr typeof(ps) = addr ps
 proc calloc(count, size: csize_t): pointer {.importc, header: "<stdlib.h>".}
 proc free(p: pointer) {.importc, header: "<stdlib.h>".}
@@ -117,9 +113,8 @@ proc ke_msg_alloc(id: uint16; dest, source: uint8; size: uint32): pointer =
 proc ke_msg_try_alloc(id: uint16; dest, source: uint8; size: uint32): pointer =
   ke_msg_alloc(id, dest, source, size)
 proc ke_msg_free(p: pointer) =
-  smBssForget(p)
   let index = allocated.find(p)
-  doAssert index >= 0
+  doAssert index >= 0, "message released twice"
   allocated.delete(index)
   free(p)
   if freeHook != nil: freeHook()
@@ -147,17 +142,7 @@ proc me_legacy_rate_bitfield_build(p: pointer; basic: uint8): uint32 =
   inc rateBuilds
   if rateHook != nil: rateHook()
   0x1234
-proc c_memcpy(dest, source: pointer; length: csize_t): pointer =
-  copyMem(dest, source, length.int)
-  dest
-proc assert_err(a, b: cstring; line: int) = doAssert false
 proc ke_state_get(task: uint8): uint16 = state
-proc ke_msg_send_basic(id: uint16; dst, src: uint8) = doAssert false
-proc scanu_cached_scanresult_clear() = doAssert false
-proc smReqVifIdxOrZero(p: pointer): uint8 = 1
-proc sm_handle_connection(vif: uint8; status: uint16; callback, failure: pointer) = doAssert false
-proc sm_connect_abort_deauth_cfm() = discard
-proc sm_connect_abort_process() = discard
 proc sm_connect_ind(status, reason: uint16) =
   failures.add((status, reason))
   state = 10
@@ -165,6 +150,7 @@ proc sm_connect_ind(status, reason: uint16) =
 proc setup() =
   doAssert allocated.len == 0
   sm = default(typeof(sm))
+  smOwn = default(typeof(smOwn))
   connection = Connection(vifIdx: 1, qosInfo: 5)
   sm.connectInfo = addr connection
   sm.connectIndMsg = addr indication
@@ -181,7 +167,6 @@ proc setup() =
   stateChanges = 0
   rateBuilds = 0
   state = 3
-  rxVifEpochs = [1'u32, 1]
   ps.uapsdPeriod = 100
   allocationHook = nil
   freeHook = nil
@@ -194,22 +179,26 @@ proc setup() =
 '''
 
 CHECKS = r'''
-for failure in 1 .. 18:
+# Every request is allocated before state 4; a failure ends the attempt with
+# nothing left allocated or sent.
+for failure in 1 .. 9:
   setup()
   failAt = failure
   sm_set_bss_param()
-  doAssert calls == 18 and allocated.len == 0 and sent.len == 0
+  doAssert calls == failure and allocated.len == 0 and sent.len == 0
   doAssert sm.pendingBssParams.first == nil and sm.pendingBssParams.last == nil
   doAssert state == 10 and stateChanges == 0 and rateBuilds == 0
   doAssert failures == @[(14'u16, 0xFFFF'u16)]
 
+# The nine requests go out one at a time, each with its reply reserved.
 setup()
 sm_set_bss_param()
-doAssert calls == 18 and allocated.len == 18 and sent.len == 1 and state == 4
-while sm.pendingBssParams.first != nil:
+doAssert calls == 10 and allocated.len == 10 and sent.len == 1 and state == 4
+for step in 0 ..< 9:
+  doAssert sent.len == step + 1 and smOwn.request == sent[step] and smOwn.reply != nil
   acknowledgeBss()
-  sm_send_next_bss_param()
-acknowledgeBss()
+  if step < 8: sm_send_next_bss_param()
+doAssert sm.pendingBssParams.first == nil and smOwn.answer == nil and calls == 18
 let expected = [ME_SET_PS_DISABLE_REQ, MM_SET_BSSID_REQ, MM_SET_BASIC_RATES_REQ,
   MM_SET_BEACON_INT_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ,
   MM_SET_EDCA_REQ, ME_SET_ACTIVE_REQ]
@@ -222,17 +211,7 @@ for i, message in sent:
     doAssert edca.vifIdx == 1 and edca.acmFlag == (i - 4).uint8
     doAssert edca.uapsdAc == (if i in [4, 7]: 1'u8 else: 0'u8)
   ke_msg_free(keMsgHdrFromPayload(message))
-doAssert allocated.len == 0
-
-# A repeated call cannot discard a batch already retained by SM.
-setup()
-let original = ke_msg_alloc(0x777, TASK_MM, TASK_SM, 1)
-co_list_push_back(addr sm.pendingBssParams, keMsgHdrFromPayload(original))
-let before = calls
-sm_set_bss_param()
-doAssert calls == before and sm.pendingBssParams.first == keMsgHdrFromPayload(original)
-discard co_list_pop_front(addr sm.pendingBssParams)
-ke_msg_free(keMsgHdrFromPayload(original))
+doAssert allocated.len == 0 and failures.len == 0
 
 for count in [0'u8, 13'u8]:
   setup()
@@ -246,44 +225,39 @@ for count in [0'u8, 13'u8]:
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_sm_bss_allocation_is_atomic(tmp_path: Path, mode: str) -> None:
-    layout = (FW / "layout_types.nim").read_text()
-    types = "type\n"
+    run_program(tmp_path, mode, source(types(), (FW / "scan_station_ap_me.nim").read_text())
+                + CHECKS)
+
+
+def types() -> str:
+    from test_wifi_auth_frames import layouts
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
              "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
-    for name in names:
-        types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
-    types += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
-    scan = (FW / "scan_station_ap_me.nim").read_text()
-    code = source(types, scan)
-    run_program(tmp_path, mode, code + CHECKS)
+    return layouts(*names) + "const\n" + "".join(
+        f"  {name}Size = sizeof({name}).uint32\n" for name in names)
 
 
 def source(types: str, scan: str) -> str:
-    code = types + PLATFORM
-    if "smTxBegin(" in procedure(scan, "sm_set_bss_param"):
-        from test_wifi_auth_frames import layouts
-        code += layouts("TxSessionIdentity", "SmTxBuildContext")
-        helper = (FW / "station_tx_build.nim").read_text()
-        code += station_sm_source()
-        for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
-            code += procedure(helper, name)
+    code = types + PLATFORM.replace("proc setup() =", station_sm_source(
+        "smGo", "smSendReserved", "smAwaits", "smTakeReply", "smTakeAnswer",
+        "smAttemptStaVif") + "proc setup() =", 1)
     code += (FW / "station_bss.nim").read_text()
     code += r'''
 proc acknowledgeBss() =
-  let reply = smBssTakeReply(smBss.request, SmBssRequests[smBss.step] + 1, 0)
-  doAssert reply != nil and smBssConsumeReply(reply)
+  ## The replier answers SM's request in flight with the reply SM reserved
+  ## (ke_msg_alloc_reply), then SM takes the answer. The test sends the next.
+  let request = smOwn.request
+  doAssert request != nil
+  let reply = smTakeReply(request, keMsgHdrFromPayload(request).id + 1)
+  doAssert reply != nil and smOwn.request == nil and smOwn.reply == nil
+  doAssert keMsgHdrFromPayload(reply).destId == TASK_SM
+  doAssert smTakeAnswer(reply) and smOwn.answer == nil
   ke_msg_free(keMsgHdrFromPayload(reply))
 '''
     return code + procedure(scan, "sm_send_next_bss_param") + procedure(scan, "sm_set_bss_param")
 
 
 LIFETIME = r'''
-var replacement = Connection(vifIdx: 1, qosInfo: 10)
-proc replaceCurrent() =
-  sm.connectInfo = addr replacement
-  state = 9
-  let marker = ke_msg_alloc(0x777, TASK_MM, TASK_SM, 1)
-  co_list_push_back(addr sm.pendingBssParams, keMsgHdrFromPayload(marker))
 proc finish() =
   allocationHook = nil
   freeHook = nil
@@ -291,133 +265,50 @@ proc finish() =
   stateHook = nil
   sendHook = nil
   failureHook = nil
+  discard smGo(0)
   smBssCancel()
-  while sm.pendingBssParams.first != nil:
-    ke_msg_free(co_list_pop_front(addr sm.pendingBssParams))
   for message in sent: ke_msg_free(keMsgHdrFromPayload(message))
   sent.setLen(0)
   doAssert allocated.len == 0
 '''
 
 CASES = {
-    "allocation_replacement": r'''
-for point in 1..18:
+    # A failed reply reservation ends the attempt at that step; the teardown
+    # frees what was not sent.
+    "reply_allocation_failure": r'''
+for step in 0 ..< 9:
   setup()
-  allocationHook = proc() =
-    if calls == point:
-      allocationHook = nil
-      replaceCurrent()
+  failAt = 10 + step
   sm_set_bss_param()
-  doAssert state == 9 and sent.len == 0 and allocated.len == 1
-  doAssert sm.pendingBssParams.first.id == 0x777
+  for done in 0 ..< step:
+    acknowledgeBss()
+    sm_send_next_bss_param()
+  doAssert failures == @[(14'u16, 0xFFFF'u16)] and sent.len == step
+  doAssert smOwn.request == nil and smOwn.reply == nil
   finish()
 ''',
-    "rate_replacement": r'''
+    # Leaving state 4 frees the reply reserved for the request in flight; the
+    # replier then drops that request (it is no longer awaited).
+    "teardown_frees_the_reserved_reply": r'''
 setup()
-rateHook = proc() =
-  rateHook = nil
-  replaceCurrent()
 sm_set_bss_param()
-doAssert state == 9 and sent.len == 0 and allocated.len == 1
-doAssert sm.pendingBssParams.first.id == 0x777
+let request = sent[0]
+doAssert smAwaits(request) and smOwn.reply != nil
+discard smGo(10)
+doAssert not smAwaits(request) and smOwn.reply == nil and smOwn.answer == nil
+doAssert smTakeReply(request, ME_SET_PS_DISABLE_REQ + 1) == nil
+doAssert allocated.len == 9
 finish()
 ''',
-    "state_replacement": r'''
-setup()
-stateHook = proc() =
-  stateHook = nil
-  replaceCurrent()
-sm_set_bss_param()
-doAssert state == 9 and sent.len == 0 and allocated.len == 1
-doAssert sm.pendingBssParams.first.id == 0x777
-finish()
-''',
-    "nested_builder": r'''
-setup()
-allocationHook = proc() =
-  allocationHook = nil
-  sm_set_bss_param()
-sm_set_bss_param()
-doAssert state == 4 and allocated.len == 18 and sent.len == 1
-finish()
-''',
-    "owner_changes": r'''
-for site in 0..2:
-  for change in 0..5:
-    setup()
-    let invalidate = proc() =
-      case change
-      of 0: inc rxVifEpochs[1]
-      of 1: inc stationEpochs[2]
-      of 2: vif.staIdx = 3
-      of 3: vif.vifType = 2
-      of 4: state = 7
-      else: sm.connectInfo = nil
-    if site == 0:
-      allocationHook = proc() =
-        if calls == 5:
-          allocationHook = nil
-          invalidate()
-    elif site == 1: rateHook = invalidate
-    else: stateHook = invalidate
-    sm_set_bss_param()
-    doAssert sent.len == 0 and allocated.len == 0
-    doAssert sm.pendingBssParams.first == nil
-    finish()
-''',
-    "cleanup_reentrancy": r'''
-setup()
-failAt = 4
-freeHook = proc() =
-  freeHook = nil
-  replaceCurrent()
-sm_set_bss_param()
-doAssert state == 9 and sent.len == 0 and allocated.len == 1
-doAssert sm.pendingBssParams.first.id == 0x777
-doAssert failures.len == 0
-finish()
-''',
-    "failure_after_release": r'''
-for point in 1..18:
-  setup()
-  failAt = point
-  failureHook = proc() =
-    doAssert allocated.len == 0 and smBssTags == nil
-    doAssert sent.len == 0 and sm.pendingBssParams.first == nil
-    failureHook = nil
-    replaceCurrent()
-  sm_set_bss_param()
-  doAssert failures == @[(14'u16, 0xFFFF'u16)] and state == 9
-  finish()
-''',
-    "indication_replacement": r'''
-for site in 0..3:
-  setup()
-  let replaceIndication = proc() = sm.connectIndMsg = addr otherIndication
-  case site
-  of 0: allocationHook = replaceIndication
-  of 1: rateHook = replaceIndication
-  of 2: stateHook = replaceIndication
-  else:
-    failAt = 4
-    freeHook = replaceIndication
-  sm_set_bss_param()
-  doAssert sm.connectIndMsg == addr otherIndication
-  doAssert failures.len == 0 and sent.len == 0 and allocated.len == 0
-  finish()
-''',
+    # A replier that answers inside ke_msg_send finds SM waiting already.
     "synchronous_dispatch": r'''
 setup()
 sendHook = proc() =
-  doAssert state == 4
+  doAssert state == 4 and smAwaits(sent[^1])
   acknowledgeBss()
-  if sm.pendingBssParams.first != nil:
-    sm_send_next_bss_param()
-  else:
-    sm.connectInfo = addr replacement
-    state = 9
+  if sm.pendingBssParams.first != nil: sm_send_next_bss_param()
 sm_set_bss_param()
-doAssert sent.len == 9 and state == 9 and sm.connectInfo == addr replacement
+doAssert sent.len == 9 and state == 4 and smOwn.answer == nil
 doAssert sm.pendingBssParams.first == nil
 finish()
 ''',
@@ -445,33 +336,25 @@ for period in [0'u32, 100'u32]:
           doAssert req.edcaParam == 0x11223300'u32 + ac.uint32
         finish()
 ''',
-    "interrupt_state": r'''
-for enabled in [false, true]:
-  for failure in [0, 1, 9]:
-    setup()
-    interruptsEnabled = enabled
-    failAt = failure
-    sm_set_bss_param()
-    doAssert interruptsEnabled == enabled
-    finish()
-''',
+    # Without the attempt's STA VIF the attempt ends (it used to return and
+    # leave SM in state 3); without an attempt nothing happens.
     "invalid_owner": r'''
-for bad in 0..5:
+for bad in 0..3:
   setup()
   case bad
   of 0: sm.connectInfo = nil
   of 1: connection.vifIdx = 2
   of 2: vif.vifIdx = 0
-  of 3: vif.vifType = 2
-  of 4: vif.staIdx = 7
-  else: sm.connectIndMsg = nil
+  else: vif.vifType = 2
   sm_set_bss_param()
-  doAssert calls == 0 and stateChanges == 0 and sent.len == 0 and failures.len == 0
+  doAssert calls == 0 and stateChanges == 0 and sent.len == 0
+  doAssert failures.len == int(bad != 0)
+  if bad != 0: doAssert failures[0] == (14'u16, 0xFFFF'u16)
   finish()
 setup()
 vif.staIdx = 0xFF
 sm_set_bss_param()
-doAssert calls == 18 and state == 4 and sent.len == 1
+doAssert calls == 10 and state == 4 and sent.len == 1
 finish()
 ''',
 }
@@ -480,10 +363,5 @@ finish()
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_bss_preparation_lifetime(tmp_path: Path, case: str, mode: str) -> None:
-    from test_wifi_auth_frames import layouts
-    names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
-             "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
-    types = layouts(*names)
-    types += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    run_program(tmp_path, mode, source(types, scan) + LIFETIME + CASES[case])
+    run_program(tmp_path, mode, source(types(), scan) + LIFETIME + CASES[case])

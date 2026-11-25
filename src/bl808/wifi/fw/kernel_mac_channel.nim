@@ -588,12 +588,10 @@ proc ke_msg_alloc_reply*(request: pointer, id: uint16, length: uint32): pointer 
     return nil
   if request == meControlCommand:
     return meTakeControlReply(request, id, length)
-  if smBssOwnsRequest(request):
-    return smBssTakeReply(request, id, length)
+  if smAwaits(request) and length == 0:
+    return smTakeReply(request, id)
   if smCleanupOwnsRequest(request):
     return smCleanupTakeReply(request, id, length)
-  if smActivationOwnsRequest(request):
-    return smActivationTakeReply(request, id, length)
   if request == apmStartRequest:
     return apmTakeStartReply(request, id, length)
   let header = keMsgHdrFromPayload(request)
@@ -786,8 +784,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   mmConnLossForget(param)
   rxMgtForget(param)
   smCleanupForget(param)
-  smBssForget(param)
-  smActivationForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
   smDeferredForget(param)

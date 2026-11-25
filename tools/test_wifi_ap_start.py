@@ -310,19 +310,11 @@ proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
 proc smCleanupOwnsRequest(request: pointer): bool = false
 proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
 proc smCleanupAdmitRequest(request: pointer): bool = true
-proc smBssAdmitRequest(request: pointer): bool = true
-proc smBssAdmitControlReply(reply: pointer): bool = true
-proc smBssOwnsRequest(request: pointer): bool = false
-proc smBssTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
-proc smActivationAdmitRequest(request: pointer): bool = true
-proc smActivationAdmitControlReply(reply: pointer): bool = true
-proc smActivationOwnsRequest(request: pointer): bool = false
-proc smActivationTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
-proc smActivationConfirm(reply: pointer; index: int): bool = false
+proc smStaleRequest(request: pointer): bool = false
+proc smAwaits(request: pointer): bool = false
+proc smTakeReply(request: pointer; id: uint16): pointer = nil
+proc smActivationConfirmed() = discard
 proc smActivationCancel() = discard
-proc smActivationCancelConnection(connection: pointer) = discard
-proc smActivationNeedsService(): bool = false
-proc smActivationService() = discard
 proc ps_set_mode(mode, requester: uint8) =
   ps.mode = requester
   psModes.add(mode)

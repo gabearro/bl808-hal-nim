@@ -174,9 +174,8 @@ proc ke_state_get(task: uint8): uint16 =
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert task == TASK_MM
   mmState = state
-proc smBssAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
-proc smActivationAdmitRequest(p: pointer): bool = true
 proc txlResetting(): bool = false
 proc ps_polling_frame(p: pointer): uint8 {.discardable.} = 0
 proc mmSetPsModeReqView(p: pointer): ptr MmSetPsModeReqPayload =

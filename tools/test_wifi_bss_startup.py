@@ -30,8 +30,6 @@ def source() -> str:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]""", 1)
     code = code.replace(procedure(code, "sm_set_bss_param"),
                         "proc sm_set_bss_param*() {.exportc, cdecl.}\n", 1)
-    code = code.replace("  let index = live.find(p)\n", "  smBssForget(p)\n  let index = live.find(p)\n", 1)
-    code = "proc smBssForget(header: pointer)\n" + code
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
              "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
     code += layouts(*names)
@@ -66,24 +64,9 @@ proc co_list_pop_front(list: ptr CoList): pointer =
     if list.first == nil: list.last = nil
     cast[ptr KeMsgHdr](result).next = nil
 type CoListHdr = KeMsgHdr
-proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool = false
-proc meCancelQueuedPayload(payload: pointer) = discard
 '''
-    # The SM connection identity the BSS batch still uses (station_tx_build.nim).
-    code += "type\n"
-    layout = (FW / "layout_types.nim").read_text()
-    for name in ["TxSessionIdentity", "SmTxBuildContext"]:
-        lines = ("  " + name + layout.split("  " + name, 1)[1]).splitlines()
-        code += lines[0] + "\n"
-        for line in lines[1:]:
-            if line and not line.startswith("    "):
-                break
-            code += line + "\n"
-    code += "var smTxSerials, rxVifEpochs: array[2, uint32]\nvar txResetEpoch: uint32\n"
-    owner = (FW / "station_tx_build.nim").read_text()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent",
-                 "smTxBindStation", "smTxSetOwnerState"]:
-        code += procedure(owner, name)
+    station = (FW / "station_sm.nim").read_text()
+    code += procedure(station, "smSendReserved") + procedure(station, "smTakeReply")
     code += "{.pragma: wifiCtrl.}\n" + (FW / "station_bss.nim").read_text()
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure(scan, "sm_send_next_bss_param") + procedure(scan, "sm_set_bss_param")
@@ -91,51 +74,44 @@ proc meCancelQueuedPayload(payload: pointer) = discard
 
 
 CASES = {
+    # Each allocation of the batch (nine requests, then the first request's
+    # reserved reply) can fail: the attempt ends with JOIN_NETWORK_FAILURE.
     "allocation_failure_after_handoff": r'''
 for initialIrq in [false, true]:
-  for point in 1..18:
+  for point in 1..10:
     resetExchange()
     let reply = completeRegistration(issue())
     enabled = initialIrq
     bssFailAt = allocations + point
     let station = vifs[conn.vifIdx].staIdx
     onFailure = proc() =
-      doAssert live.len == 1 and smBssTags == nil
-      doAssert queued.len == 0 and sm.pendingBssParams.first == nil
+      # The teardown deletes the station and frees the unsent requests.
       state = 10
       mm_sta_del(station)
+      smBssCancel()
     doAssert mm_sta_add_cfm_handler(reply) == 0
     doAssert enabled == initialIrq and state == 10
     doAssert failures == @[(14'u16, 0xFFFF'u16)] and deletions == 1
+    doAssert queued.len == 0 and live.len == 1 and sm.pendingBssParams.first == nil
     bssFailAt = 0
     release(reply)
     doAssert deletions == 1
     finishExchange()
 ''',
-    "replacement_during_startup": r'''
-resetExchange()
-let reply = completeRegistration(issue())
-onAlloc = replaceOwner
-doAssert mm_sta_add_cfm_handler(reply) == 0
-doAssert failures.len == 0 and queued.len == 0 and state == 6
-release(reply)
-doAssert deletions == 0
-finishExchange()
-''',
     "complete_batch_after_handoff": r'''
 resetExchange()
 let reply = completeRegistration(issue())
 doAssert mm_sta_add_cfm_handler(reply) == 0
-doAssert state == 4 and smBss.active and queued.len == 1 and live.len == 19
+doAssert state == 4 and queued.len == 1 and live.len == 11
 release(reply)
 while queued.len != 0:
   let request = take()
-  let response = smBssTakeReply(request, SmBssRequests[smBss.step] + 1, 0)
-  doAssert response != nil and smBssConsumeReply(response)
+  let response = smTakeReply(request, keMsgHdrFromPayload(request).id + 1)
+  doAssert response != nil and smTakeAnswer(response)
   release(request)
   release(response)
-  if smBss.active: smBssSendNext()
-doAssert failures.len == 0 and deletions == 0 and not smBss.active
+  if sm.pendingBssParams.first != nil: sm_send_next_bss_param()
+doAssert failures.len == 0 and deletions == 0 and smOwn.answer == nil
 finishExchange()
 ''',
 }

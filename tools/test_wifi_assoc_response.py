@@ -237,7 +237,7 @@ proc finish(p: pointer) =
 
 def source(trace: bool = False) -> str:
     code = "{.define: bl808WifiConnectTrace.}\n" if trace else ""
-    code += layouts("TxSessionIdentity", "SmTxBuildContext", "SmActivationPrepared", "SmAssocRspFrameView",
+    code += layouts("TxSessionIdentity", "SmTxBuildContext", "SmAssocRspFrameView",
                     "RxuMgtDispatchView", "MacIeView", "TimeoutIntervalIeView",
                     "SmConnectIndPayload", "MmSetVifStateReqPayload") + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
@@ -252,31 +252,24 @@ proc smArmResponse(stamp: uint32; delayUs: uint64): bool =
 '''
     # This suite isolates RX preparation; activation's full exchange has its own suite.
     code += r'''
-proc smActivationReleasePrepared(prepared: var SmActivationPrepared) =
-  if prepared.requests[0] != nil:
-    ke_msg_free(keMsgHdrFromPayload(prepared.requests[0]))
-    prepared.requests[0] = nil
-proc smActivationPrepare(owner: SmTxBuildContext; indication: pointer;
-                         aid: uint16; prepared: var SmActivationPrepared): bool =
-  prepared.requests[0] = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
-                                         MmSetVifStateReqPayloadSize)
-  if prepared.requests[0] == nil: return false
-  cast[ptr MmSetVifStateReqPayload](prepared.requests[0])[] =
-    MmSetVifStateReqPayload(aid: aid, state: 1, vifIdx: owner.identity.vif)
-  true
-proc smActivationStart(owner: SmTxBuildContext; indication: pointer;
-                       prepared: var SmActivationPrepared): bool =
-  if not smTxOwnerCurrent(owner) or smEnvView().connectIndMsg != indication: return false
-  if prepared.notifyWps and wps_cbs != nil:
+proc smActivationStart(vif, station: uint8; aid: uint16; notifyWps: bool) =
+  ## station_activation.nim's entry: state 9, then the first request.
+  discard smGo(SM_ACTIVATING_STATE)
+  smEnvView().saQueryActive = 0
+  ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
+  if notifyWps and wps_cbs != nil:
     let callback = wpsCallbacks().staAddConfirm
     if callback != nil: cast[proc() {.cdecl.}](callback)()
-    if not smTxOwnerCurrent(owner) or smEnvView().connectIndMsg != indication: return false
-  if vifSecurity(vifChannelForIdx(owner.identity.vif)).cipher >= 2:
-    nimFwWpaPendingMask = nimFwWpaPendingMask or (1'u32 shl owner.identity.vif)
-  let message = prepared.requests[0]
-  prepared.requests[0] = nil
+  if vifSecurity(vifChannelForIdx(vif)).cipher >= 2:
+    nimFwWpaPendingMask = nimFwWpaPendingMask or (1'u32 shl vif)
+  let message = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
+                                 MmSetVifStateReqPayloadSize)
+  if message == nil:
+    sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+    return
+  cast[ptr MmSetVifStateReqPayload](message)[] =
+    MmSetVifStateReqPayload(aid: aid, state: 1, vifIdx: vif)
   ke_msg_send(message)
-  true
 '''
     scan = (FW / "scan_station_ap_me.nim").read_text()
     for name in ["smAssocOwnerCurrent", "smAssocIesValid", "smAssocIePrefix", "smAssocDone"]:
@@ -391,28 +384,14 @@ doAssert failures == @[(5'u16, 30'u16)] and clears == @[SM_RSP_TIMEOUT_IND]
 doAssert sent.len == 0 and rates == 0 and delays.len == 0
 finish(p)
 ''',
+    # The activation's first request is allocated in state 9; without memory
+    # the attempt ends there.
     "allocation_failure": r'''
 let p = response([])
 failAlloc = true
 sm_assoc_rsp_handler(p)
 doAssert failures == @[(5'u16, 0xFFFF'u16)]
-doAssert state == 8 and sent.len == 0 and sm.saQueryActive == 1
-finish(p)
-''',
-    "allocation_replacement": r'''
-let p = response([])
-onAlloc = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert state == 6 and sent.len == 0 and failures.len == 0
-doAssert sm.saQueryActive == 1 and nimFwWpaPendingMask == 0
-finish(p)
-''',
-    "allocation_failure_replacement": r'''
-let p = response([])
-failAlloc = true
-onAlloc = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert state == 6 and sent.len == 0 and failures.len == 0
+doAssert sent.len == 0 and sm.saQueryActive == 0
 finish(p)
 ''',
     "rate_replacement": r'''
@@ -438,23 +417,6 @@ doAssert rates == 0 and sent.len == 0 and state == 6
 doAssert otherInd.assocRspIeLen == 0
 finish(p)
 ''',
-    "state_replacement": r'''
-let p = response([])
-vif.security.cipher = 2
-onState = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert sent.len == 0 and state == 6
-doAssert sm.saQueryActive == 1 and nimFwWpaPendingMask == 0
-finish(p)
-''',
-    "sa_query_clear_replacement": r'''
-let p = response([])
-vif.security.cipher = 2
-onState = proc() = onClear = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert sent.len == 0 and state == 6 and nimFwWpaPendingMask == 0
-finish(p)
-''',
     "wps_precedes_handoff": r'''
 let p = response([])
 sm.state = 2
@@ -462,15 +424,6 @@ wps_cbs = addr wps
 sm_assoc_rsp_handler(p)
 doAssert order == @["rate", "power", "state", "wps", "send"]
 doAssert wpsCalls == 1
-finish(p)
-''',
-    "wps_replacement": r'''
-let p = response([])
-sm.state = 2
-wps_cbs = addr wps
-onWps = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert wpsCalls == 1 and sent.len == 0 and state == 6
 finish(p)
 ''',
     "synchronous_completion": r'''

@@ -1,4 +1,11 @@
-"""Run BSS setup across the real ME forwarding and SM confirmation handlers."""
+"""Run the BSS parameter batch across the real ME forwarding and SM handlers.
+
+The harness compiles the real station_bss.nim, station_sm.nim's request
+procs, ME's control exchange (meReserveControl, meForwardControl,
+meCompleteControl, meTakeControlReply), ke_msg_alloc_reply and the SM
+confirmation handlers. MM is a model that answers every request it gets
+(ke_msg_send_basic_reply), or holds a forwarded ME command until told.
+"""
 
 from pathlib import Path
 
@@ -11,11 +18,6 @@ from test_wifi_sm_bss_allocation import PLATFORM
 
 
 EXTRA = r'''
-proc smActivationAdmitRequest(request: pointer): bool = true
-proc smActivationAdmitControlReply(reply: pointer): bool = true
-proc smActivationOwnsRequest(request: pointer): bool = false
-proc smActivationTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
-proc smActivationConfirm(reply: pointer; index: int): bool = false
 const
   KeMsgNoFree = 1.cint
   MeBusyState = 1'u16
@@ -28,27 +30,25 @@ const
   MM_SET_IDLE_CFM = 27'u16
   MM_SET_PS_MODE_REQ = 31'u16
   MM_SET_PS_MODE_CFM = 32'u16
-  HW_ACTIVE = 3'u16
+type SmTxBuildContext = object
 var
   keMsgQueueSent, keMsgQueueSaved: CoList
   me: tuple[requesterId, psOn: uint8, activeMask, psDisableMask: uint32]
   meState: uint16
+  meControlCommand, meControlReply: pointer
   meControlReplyReady: bool
   meConfigInProgress: bool
   meControlEpoch: uint32
   meControlExpectedId, meControlFinalId: uint16
   meControlRequester: uint8
-  apmStartRequest, apmStartReply, mmPsModeRequest: pointer
-  mmPsModeTxResetEpoch: uint32
-  apmStartReplyPublished: bool
-  authStarts: int
-  nimFwDbgActiveCfmBadState, nimFwDbgActiveCfmLastState: uint32
+  apmStartRequest: pointer
+  authStarts, deauths, activations: int
   applied: seq[uint16]
   confirmations: seq[uint16]
-  replacement: Connection
-let mac_ac2uapsd = [4'u8, 8, 2, 1]
+  holdMM: bool
+  heldMM: pointer
+  smRequests: seq[pointer]  # the batch's requests, as SM sent them
 proc meEnvView(): ptr typeof(me) = addr me
-proc txlResetting(): bool = false
 proc controlStateGet(task: uint8): uint16 =
   if task == TASK_SM: state else: meState
 proc releaseSavedControl(task: uint8)
@@ -59,23 +59,23 @@ proc controlStateSet(task: uint8; value: uint16) =
     if stateHook != nil: stateHook()
   else: meState = value
   releaseSavedControl(task)
-proc smCleanupOwnsRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc smCleanupConsumeReply(p: pointer): bool = false
 proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer = nil
+proc smActivationConfirmed() = inc activations
+proc smTxBegin(connection: pointer): SmTxBuildContext = discard
+proc smTxEnd(build: var SmTxBuildContext) = discard
+proc smDeauthSend(build: var SmTxBuildContext) = inc deauths
+proc sm_auth_start() =
+  inc authStarts
+  state = 6
 proc ke_msg_alloc_reply*(request: pointer; id: uint16; length: uint32): pointer
-proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool
+proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
 '''
 
 
 WORKER = r'''
-proc smTxEnd(build: var SmTxBuildContext) = discard
-proc smDeauthSend(build: var SmTxBuildContext) = discard
-proc sm_auth_start() =
-  inc authStarts
-  state = 6
-
 proc consumeReply(p: pointer) =
   let header = keMsgHdrFromPayload(p)
   confirmations.add(header.id)
@@ -83,6 +83,11 @@ proc consumeReply(p: pointer) =
   of ME_SET_PS_DISABLE_CFM: doAssert me_set_ps_disable_cfm_handler_sm(p) == KeMsgConsumed
   of ME_SET_ACTIVE_CFM: doAssert me_set_active_cfm_handler_sm(p) == KeMsgConsumed
   else: doAssert mm_bss_param_setting_handler(p) == KeMsgConsumed
+
+proc answerMM(p: pointer) =
+  ## MM's model: apply the request and answer it.
+  applied.add(keMsgHdrFromPayload(p).id)
+  ke_msg_send_basic_reply(p, keMsgHdrFromPayload(p).id + 1)
 
 proc dispatchOne(): bool =
   let node = co_list_pop_front(addr keMsgQueueSent)
@@ -99,12 +104,28 @@ proc dispatchOne(): bool =
     else: outcome = meCompleteControl(p, header.id)
   else:
     doAssert header.destId == TASK_MM
-    if smBssAdmitRequest(p):
-      applied.add(header.id)
-      ke_msg_send_basic_reply(p, header.id + 1)
+    if smStaleRequest(p): discard
+    elif holdMM and p == meControlCommand:
+      heldMM = p
+      outcome = KeMsgNoFree
+    else: answerMM(p)
   if outcome == KeMsgConsumed: ke_msg_free(header)
   elif outcome == KeMsgSaved: co_list_push_back(addr keMsgQueueSaved, header)
   true
+
+proc releaseMM() =
+  ## MM completes the forwarded command it held (mmPsModeComplete).
+  let p = heldMM
+  doAssert p != nil
+  heldMM = nil
+  holdMM = false
+  answerMM(p)
+  ke_msg_free(keMsgHdrFromPayload(p))
+
+proc queueSent() =
+  let p = sent[^1]
+  if keMsgHdrFromPayload(p).srcId == TASK_SM: smRequests.add(p)
+  co_list_push_back(addr keMsgQueueSent, keMsgHdrFromPayload(p))
 
 proc drain() =
   var count = 0
@@ -124,57 +145,69 @@ proc begin() =
   applied.setLen(0)
   confirmations.setLen(0)
   authStarts = 0
-  sendHook = proc() =
-    co_list_push_back(addr keMsgQueueSent, keMsgHdrFromPayload(sent[^1]))
+  deauths = 0
+  activations = 0
+  holdMM = false
+  heldMM = nil
+  smRequests.setLen(0)
+  sendHook = queueSent
   sm_set_bss_param()
 
-proc takeReply(step: int): pointer =
+proc takeAnswer(): pointer =
+  ## Dispatch until a message for SM heads the queue, and take it.
   var count = 0
   while true:
     let header = cast[ptr KeMsgHdr](keMsgQueueSent.first)
     doAssert header != nil
-    if header.destId == TASK_SM and smBss.step == step:
+    if header.destId == TASK_SM:
       discard co_list_pop_front(addr keMsgQueueSent)
       return keMsgPayload(header)
     doAssert dispatchOne()
     inc count
     doAssert count < 64
 
-proc changeConnection() =
-  replacement = Connection(vifIdx: 1, qosInfo: 10)
-  sm.connectInfo = addr replacement
-  state = 3
+proc answerFor(step: int): pointer =
+  ## The answer to the batch's request `step`; earlier answers are handled.
+  while true:
+    result = takeAnswer()
+    if smRequests.len == step + 1: return
+    consumeReply(result)
+    ke_msg_free(keMsgHdrFromPayload(result))
 
-proc assertFinished() =
-  doAssert authStarts == 1 and state == 6
-  doAssert not smBss.active and smBssTags == nil
+proc endAttempt() =
+  ## The attempt's teardown: SM leaves state 4 and the unsent requests go.
+  discard smGo(SmDisconnectingState)
+  smBssCancel()
+
+proc assertQuiet() =
   doAssert allocated.len == 0 and keMsgQueueSent.first == nil
   doAssert keMsgQueueSaved.first == nil
-  doAssert meControlCommand == nil and meControlReply == nil
+  doAssert meControlCommand == nil and meControlReply == nil and meState == MeIdleState
+  doAssert smOwn.request == nil and smOwn.reply == nil and smOwn.answer == nil
+
+proc assertFinished() =
+  doAssert authStarts == 1 and state == 6 and sm.pendingBssParams.first == nil
+  assertQuiet()
 '''
 
 
 def source() -> str:
     platform = "proc controlStateGet(task: uint8): uint16\n"
     platform += "proc controlStateSet(task: uint8; value: uint16)\n" + PLATFORM
-    replacements = {
-        "meControlReset": "proc meControlReset()\n",
-        "meCancelQueuedPayload": "proc meCancelQueuedPayload(payload: pointer)\n",
-        "smBssCancelControl": "",
+    for name, replacement in {
         "ke_state_get": "proc ke_state_get(task: uint8): uint16 = controlStateGet(task)\n",
         "ke_state_set": "proc ke_state_set(task: uint8; value: uint16) = controlStateSet(task, value)\n",
-    }
-    for name, replacement in replacements.items():
+    }.items():
         platform = platform.replace(procedure(platform, name), replacement)
+    platform = platform.replace("proc setup() =", station_sm_source(
+        "smGo", "smSendReserved", "smAwaits", "smAttemptStaVif", "smStaleRequest",
+        "smTakeReply", "smTakeAnswer") + "proc setup() =", 1)
+    platform = "proc ke_msg_send_basic_reply*(request: pointer; id: uint16)\n" + platform
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
              "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "MmSetEdcaReqPayload"]
-    code = layouts(*names, "TxSessionIdentity", "SmTxBuildContext")
+    code = layouts(*names)
     code += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     code += platform + EXTRA
-    owner = (FW / "station_tx_build.nim").read_text()
-    code += station_sm_source()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
-        code += procedure(owner, name)
     code += (FW / "station_bss.nim").read_text()
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     task = (FW / "task_handlers.nim").read_text()
@@ -188,190 +221,160 @@ proc releaseSavedControl(task: uint8) =
     if node == nil: break
     co_list_push_back(addr keMsgQueueSent, node)
 '''
-    code += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
-    for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
-                 "meControlReset", "meTakeControlReply", "smBssCancelControl",
-                 "meReserveControl", "meForwardControl", "meBeginControl", "meCompleteControl"]:
+    for name in ["meTakeControlReply", "meReserveControl", "meForwardControl", "meBeginControl",
+                 "meCompleteControl"]:
         code += procedure(task, name)
     code += procedure(kernel, "ke_msg_alloc_reply") + procedure(kernel, "ke_msg_send_basic_reply")
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure(scan, "sm_send_next_bss_param") + procedure(scan, "sm_set_bss_param")
-    code += WORKER.split("proc consumeReply", 1)[0]
-    for name in ["me_set_ps_disable_req_handler", "me_set_active_req_handler", "smSetActiveCfmStateAllowed",
-                 "mm_bss_param_setting_handler", "me_set_ps_disable_cfm_handler_sm", "me_set_active_cfm_handler_sm"]:
+    for name in ["me_set_ps_disable_req_handler", "me_set_active_req_handler",
+                 "mm_bss_param_setting_handler", "me_set_ps_disable_cfm_handler_sm",
+                 "me_set_active_cfm_handler_sm"]:
         code += procedure(task, name)
-    code += "proc consumeReply" + WORKER.split("proc consumeReply", 1)[1]
-    return code
+    return code + WORKER
 
 
 CASES = {
+    # The forwarded ME requests answer with the reply SM reserved: nothing is
+    # allocated beyond the nine requests and their nine replies.
     "complete_forwarded_exchange": r'''
 begin()
-doAssert allocated.len == 18 and calls == 18
+doAssert allocated.len == 10 and calls == 10
 drain()
 assertFinished()
-doAssert calls == 18, "forwarding allocated a replacement confirmation"
+doAssert calls == 18, "a confirmation was allocated by a replier"
 doAssert applied == @[MM_SET_PS_MODE_REQ, MM_SET_BSSID_REQ, MM_SET_BASIC_RATES_REQ,
   MM_SET_BEACON_INT_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ,
   MM_SET_EDCA_REQ, MM_SET_IDLE_REQ]
 doAssert confirmations == @[ME_SET_PS_DISABLE_CFM, 21'u16, 19, 17, 23, 23, 23, 23, ME_SET_ACTIVE_CFM]
+doAssert me.psDisableMask == 2 and me.activeMask == 2 and deauths == 0
 ''',
+    # Confirmations SM does not hold change nothing.
     "unrelated_confirmations": r'''
 begin()
-let before = sent.len
+let before = smRequests.len
 for id in [17'u16, 19, 21, 23, ME_SET_PS_DISABLE_CFM, ME_SET_ACTIVE_CFM]:
   let p = ke_msg_alloc(id, TASK_SM, TASK_MM, 0)
   consumeReply(p)
-  doAssert sent.len == before and smBss.step == 0 and authStarts == 0
+  doAssert smRequests.len == before and authStarts == 0 and activations == 0
   ke_msg_free(keMsgHdrFromPayload(p))
 drain()
 assertFinished()
 ''',
-    "stale_reply_every_step": r'''
+    # The attempt ends while an answer is queued: SM ignores it.
+    "stale_answer_every_step": r'''
 for step in 0..8:
   begin()
-  let old = takeReply(step)
-  changeConnection()
-  smBssCancel()
-  sm_set_bss_param()
-  let before = sent.len
-  consumeReply(old)
-  doAssert smBss.step == 0 and sent.len == before and authStarts == 0
-  ke_msg_free(keMsgHdrFromPayload(old))
+  let answer = answerFor(step)
+  endAttempt()
+  let before = smRequests.len
+  consumeReply(answer)
+  doAssert smRequests.len == before and authStarts == 0 and state == SmDisconnectingState
+  ke_msg_free(keMsgHdrFromPayload(answer))
+  drain()
+  assertQuiet()
+''',
+    "duplicate_answer_every_step": r'''
+for step in 0..8:
+  begin()
+  let answer = answerFor(step)
+  consumeReply(answer)
+  let before = (smRequests.len, authStarts)
+  consumeReply(answer)
+  doAssert (smRequests.len, authStarts) == before
+  ke_msg_free(keMsgHdrFromPayload(answer))
   drain()
   assertFinished()
 ''',
-    "duplicate_reply_every_step": r'''
-for step in 0..8:
+    # The attempt ends while ME's forward of the first or last request is with
+    # MM. The exchange completes as in the blob (no cancellation): ME goes
+    # idle with the mask the request set, and SM ignores the answer. The
+    # teardown's own ME requests (station_cleanup.nim) undo the masks.
+    "attempt_ends_during_forward": r'''
+for last in [false, true]:
   begin()
-  let p = takeReply(step)
-  consumeReply(p)
-  let before = sent.len
-  consumeReply(p)
-  doAssert sent.len == before
-  ke_msg_free(keMsgHdrFromPayload(p))
+  if last:
+    while smRequests.len < 9:
+      let answer = takeAnswer()
+      consumeReply(answer)
+      ke_msg_free(keMsgHdrFromPayload(answer))
+  holdMM = true
   drain()
-  assertFinished()
+  doAssert heldMM != nil and meState == MeBusyState
+  endAttempt()
+  releaseMM()
+  drain()
+  doAssert authStarts == 0 and state == SmDisconnectingState
+  if last: doAssert me.activeMask == 2
+  else: doAssert me.psDisableMask == 2
+  assertQuiet()
 ''',
-    "reply_metadata": r'''
-for step in 0..8:
-  for field in 0..3:
-    begin()
-    let p = takeReply(step)
-    let header = keMsgHdrFromPayload(p)
-    let original = header[]
-    case field
-    of 0: header.id = 0xFFFF
-    of 1: header.srcId = TASK_API
-    of 2: header.destId = TASK_ME
-    else: header.paramLen = 1
-    doAssert not smBssConsumeReply(p) and smBss.step == step
-    header[] = original
-    consumeReply(p)
-    ke_msg_free(header)
-    drain()
-    assertFinished()
-''',
-    "cancel_forwarding_stages": r'''
-for stage in 0..3:
-  begin()
-  for unused in 0..<stage: doAssert dispatchOne()
-  smBssCancel()
-  doAssert allocated.len == 0 and smBssTags == nil
-  doAssert keMsgQueueSent.first == nil and meControlCommand == nil and meControlReply == nil
-  doAssert authStarts == 0
-begin()
-doAssert dispatchOne()
-mmPsModeRequest = keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent)))
-smBssCancel()
-doAssert allocated.len == 0 and mmPsModeRequest == nil and smBssTags == nil
-''',
-    "stale_control_reply": r'''
-begin()
-doAssert dispatchOne() and dispatchOne()
-let p = keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent)))
-changeConnection()
-doAssert meCompleteControl(p, MM_SET_PS_MODE_CFM) == KeMsgConsumed
-ke_msg_free(keMsgHdrFromPayload(p))
-doAssert allocated.len == 0 and not smBss.active and authStarts == 0
-sm_set_bss_param()
-drain()
-assertFinished()
-''',
-    "cancel_unfinished_masks": r'''
-begin()
-doAssert dispatchOne()
-doAssert me.psDisableMask == 2
-changeConnection()
-smBssCancel()
-doAssert me.psDisableMask == 0, "cancel retained the unfinished PS mask"
-sm_set_bss_param()
-drain()
-assertFinished()
-begin()
-let p = takeReply(7)
-consumeReply(p)
-ke_msg_free(keMsgHdrFromPayload(p))
-doAssert dispatchOne()
-doAssert me.activeMask == 2
-changeConnection()
-smBssCancel()
-doAssert me.activeMask == 0, "cancel retained the unfinished active mask"
-sm_set_bss_param()
-drain()
-assertFinished()
-''',
+    # The attempt ends before ME runs the request: ME drops it unapplied.
     "stale_request_before_dispatch": r'''
 begin()
-let p = keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent)))
-changeConnection()
-doAssert me_set_ps_disable_req_handler(p) == KeMsgConsumed
-ke_msg_free(keMsgHdrFromPayload(p))
-doAssert applied.len == 0 and allocated.len == 0 and not smBss.active
-sm_set_bss_param()
+let request = keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent)))
+endAttempt()
+doAssert me_set_ps_disable_req_handler(request) == KeMsgConsumed
+ke_msg_free(keMsgHdrFromPayload(request))
+doAssert applied.len == 0 and me.psDisableMask == 0 and meState == MeIdleState
+assertQuiet()
+''',
+    # The attempt's STA VIF is retired while SM's request waits for its
+    # replier: the replier answers it unapplied (no MM write, no ME mask bit)
+    # and SM ends the attempt at that answer, the last one included.
+    "vif_retired_before_the_replier_runs": r'''
+for step in 0..8:
+  begin()
+  while smRequests.len < step + 1: doAssert dispatchOne()
+  let before = (applied.len, me.psDisableMask, me.activeMask)
+  vif.vifType = 2
+  drain()
+  doAssert (applied.len, me.psDisableMask, me.activeMask) == before,
+    "request " & $step & " was applied to the retired VIF"
+  doAssert failures == @[(14'u16, 0xFFFF'u16)] and smRequests.len == step + 1
+  doAssert authStarts == 0 and state == SmDisconnectingState
+  endAttempt()
+  assertQuiet()
+''',
+    # The STA VIF is retired while MM holds ME's forward of the first or the
+    # last request: ME and MM finish it and SM ends the attempt at the answer.
+    # (The mask bit the forward set stays set when no cleanup runs; clearing
+    # it belongs with vif_mgmt_unregister telling SM, stage 9g.)
+    "vif_retired_during_forward": r'''
+for last in [false, true]:
+  begin()
+  if last:
+    while smRequests.len < 9:
+      let answer = takeAnswer()
+      consumeReply(answer)
+      ke_msg_free(keMsgHdrFromPayload(answer))
+  holdMM = true
+  drain()
+  doAssert heldMM != nil and meState == MeBusyState
+  vif.vifType = 2
+  releaseMM()
+  drain()
+  doAssert failures == @[(14'u16, 0xFFFF'u16)] and authStarts == 0
+  doAssert state == SmDisconnectingState
+  endAttempt()
+  assertQuiet()
+''',
+    # A request saved while ME is busy still gets its answer.
+    "saved_while_me_busy": r'''
+begin()
+meState = MeBusyState
+doAssert dispatchOne() and keMsgQueueSaved.first != nil
+controlStateSet(TASK_ME, MeIdleState)
 drain()
 assertFinished()
 ''',
-    "owner_loss_and_dropped_reply": r'''
-for reason in 0..7:
-  begin()
-  case reason
-  of 0: inc rxVifEpochs[1]
-  of 1: inc stationEpochs[2]
-  of 2: state = 0
-  of 3: vif.staIdx = 3
-  of 4: discard smTxBegin(addr connection)
-  of 5:
-    let p = takeReply(0)
-    ke_msg_free(keMsgHdrFromPayload(p))
-  of 6: vif.vifType = 2
-  else: ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
-  doAssert smBssNeedsService()
-  smBssService()
-  doAssert allocated.len == 0 and not smBss.active and smBssTags == nil
-''',
-    "reserved_reply_and_repeat_begin": r'''
+    "synchronous_reply_dispatch": r'''
 begin()
-doAssert not smBssConsumeReply(smBss.reply)
-let before = calls
-sm_set_bss_param()
-doAssert calls == before
-let p = takeReply(8)
-doAssert sm.pendingBssParams.first == nil and smBss.active
-sm_set_bss_param()
-doAssert calls == before
-consumeReply(p)
-ke_msg_free(keMsgHdrFromPayload(p))
+sendHook = proc() =
+  queueSent()
+  doAssert dispatchOne()
+drain()
 assertFinished()
-''',
-    "cleanup_retains_pending_list": r'''
-begin()
-var retained = sm.pendingBssParams
-co_list_init(addr sm.pendingBssParams)
-smBssCancel()
-doAssert allocated.len == 8
-while retained.first != nil: ke_msg_free(co_list_pop_front(addr retained))
-doAssert allocated.len == 0 and smBssTags == nil
 ''',
     "interrupt_preservation": r'''
 for enabled in [false, true]:
@@ -380,61 +383,26 @@ for enabled in [false, true]:
   drain()
   assertFinished()
   doAssert interruptsEnabled == enabled
-  begin()
-  interruptsEnabled = enabled
-  smBssCancel()
-  doAssert interruptsEnabled == enabled and allocated.len == 0
 ''',
-    "synchronous_reply_dispatch": r'''
-begin()
-sendHook = proc() =
-  co_list_push_back(addr keMsgQueueSent, keMsgHdrFromPayload(sent[^1]))
-  doAssert dispatchOne()
-drain()
-assertFinished()
-''',
-    "cancel_free_reentry": r'''
-begin()
-changeConnection()
-freeHook = proc() =
-  freeHook = nil
-  sm_set_bss_param()
-smBssCancel()
-doAssert smBss.active and allocated.len == 18
-drain()
-assertFinished()
-''',
-    "duplicate_forwarded_request_and_control_reply": r'''
+    # ME's forward of SM's ME_SET_PS_DISABLE_REQ takes the reserved reply once;
+    # MM's confirmation and ME's are that message.
+    "forward_carries_the_reserved_reply": r'''
 begin()
 let request = keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent)))
+let reserved = smOwn.reply
 doAssert me_set_ps_disable_req_handler(request) == KeMsgNoFree
+doAssert meControlReply == reserved and smOwn.reply == nil and smOwn.answer == reserved
+doAssert not smAwaits(request) and meControlCommand == request
 doAssert keMsgPayload(cast[ptr KeMsgHdr](co_list_pop_front(addr keMsgQueueSent))) == request
-ke_msg_send_basic_reply(request, MM_SET_PS_MODE_CFM)
-doAssert dispatchOne()
-let reply = takeReply(0)
-consumeReply(reply)
-doAssert not smBssAdmitRequest(request) and smBss.active and smBss.step == 1
-doAssert meCompleteControl(reply, MM_SET_PS_MODE_CFM) == KeMsgConsumed
-doAssert smBss.active and smBss.step == 1
+answerMM(request)
 ke_msg_free(keMsgHdrFromPayload(request))
-ke_msg_free(keMsgHdrFromPayload(reply))
+let answer = takeAnswer()
+doAssert answer == reserved and keMsgHdrFromPayload(answer).id == ME_SET_PS_DISABLE_CFM
+consumeReply(answer)
+ke_msg_free(keMsgHdrFromPayload(answer))
+doAssert smRequests.len == 2
 drain()
 assertFinished()
-''',
-    "cancel_preserves_other_vif_masks": r'''
-begin()
-doAssert dispatchOne()
-me.psDisableMask = me.psDisableMask or 1
-smBssCancel()
-doAssert me.psDisableMask == 1 and allocated.len == 0
-begin()
-let p = takeReply(7)
-consumeReply(p)
-ke_msg_free(keMsgHdrFromPayload(p))
-doAssert dispatchOne()
-me.activeMask = me.activeMask or 1
-smBssCancel()
-doAssert me.activeMask == 1 and allocated.len == 0
 ''',
 }
 
@@ -445,16 +413,25 @@ def test_bss_confirmations(tmp_path: Path, case: str, mode: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
 
 
-def test_bss_runtime_hooks() -> None:
+def test_bss_batch_has_no_loss_machinery() -> None:
+    """The batch is SM's live request and its reserved reply; the repliers
+    check SM once at entry. Nothing tracks, forgets, cancels or services it."""
     task = (FW / "task_handlers.nim").read_text()
-    for name in ["mm_hw_config_handler", "mm_set_idle_req_handler", "mm_set_ps_mode_req_handler",
+    for name in ["mm_hw_config_handler", "mm_set_ps_options_req_handler",
                  "me_set_active_req_handler", "me_set_ps_disable_req_handler"]:
-        assert "smBssAdmitRequest(param)" in procedure(task, name)
+        assert "smStaleRequest(param)" in procedure(task, name), name
+    for name in ["mm_bss_param_setting_handler", "me_set_ps_disable_cfm_handler_sm",
+                 "me_set_active_cfm_handler_sm"]:
+        assert "smTakeAnswer(param)" in procedure(task, name), name
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    assert "smBssCancel()" in procedure(kernel, "ke_flush")
-    assert "smBssForget(param)" in procedure(kernel, "ke_msg_free")
+    assert "smBss" not in procedure(kernel, "ke_msg_free")
+    assert "smTakeReply(request, id)" in procedure(kernel, "ke_msg_alloc_reply")
     assert "smBssCancel()" in procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init")
     assert "smBssCancel()" in procedure((FW / "station_cleanup.nim").read_text(), "smCleanupBegin")
     loop = (FW / "task_init_main.nim").read_text()
-    assert "smBssNeedsService()" in procedure(loop, "wifiMainHasPendingWork")
-    assert "smBssService()" in procedure(loop, "wifiDrainScheduledWork")
+    assert "smBss" not in procedure(loop, "wifiMainHasPendingWork")
+    assert "smBss" not in procedure(loop, "wifiDrainScheduledWork")
+    sources = "".join(path.read_text() for path in FW.rglob("*.nim"))
+    for gone in ["smBssForget", "smBssTags", "smBssNeedsService", "smBssService",
+                 "smBssCancelControl", "smBssAdmitRequest", "smBssTakeReply", "smBssSerial"]:
+        assert gone not in sources, gone

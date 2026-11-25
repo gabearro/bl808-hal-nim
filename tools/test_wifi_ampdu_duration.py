@@ -66,7 +66,7 @@ proc c_memset(p: pointer; value: cint; length: csize_t): pointer =
   p
 proc vifEntryAddr(index: uint8): uint = cast[uint](addr vifs[index])
 proc vifChannelAt(p: uint): ptr Vif = cast[ptr Vif](p)
-proc smActivationAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc ps_uapsd_set(p: pointer; ac: uint8; enabled: uint32) =
   doAssert p == (addr vifs[1]) and ac == request.acmFlag and enabled == request.uapsdAc.uint32
   inc uapsdCalls

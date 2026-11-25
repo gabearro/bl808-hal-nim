@@ -32,6 +32,20 @@
 # length checks rely on. The message stays allocated from smSend until its
 # answer is handled, so the pointer cannot name another message meanwhile.
 #
+# States 4 and 9 send a series of requests to MM and ME, one at a time
+# (station_bss.nim, station_activation.nim). Their repliers answer with an
+# empty confirmation, allocated by ke_msg_alloc_reply: smSendReserved
+# allocates that reply before it sends the request and ke_msg_alloc_reply
+# hands it out (smTakeReply), so again the answer needs no allocation at the
+# replier and always comes. ME's forward of a request to MM carries the same
+# reply: ME takes it when it accepts the request, MM's confirmation to ME
+# and ME's to SM are that message relabelled. From the hand-out SM waits for
+# the reply, which stays allocated until SM handles it; the replier frees
+# the request. Every smGo frees a reply not handed out yet. A replier drops
+# a request of SM's that SM no longer waits on, and answers one whose STA
+# VIF has been retired without applying it (smStaleRequest). SM checks the
+# VIF at every answer and ends the attempt when it is gone.
+#
 # States 6 and 8 wait for the AP's auth or assoc response. The request's
 # sender arms SM_RSP_TIMEOUT_IND with the stamp of the operation it started
 # (smArmResponse), and the expected auth response carries the same stamp
@@ -47,6 +61,8 @@ type
     op: Op
     teardown: SmTeardown
     request: pointer  ## the request the live operation waits on, or nil
+    reply: pointer    ## the reply SM reserved for it, until a replier takes it
+    answer: pointer   ## what ends the wait: the request itself or its reply
     deauthVif: uint8
     deauthCallback: pointer  ## the waited frame's callback, run by the guard
     guard: MmTimerView
@@ -60,26 +76,85 @@ var smOwn {.wifiCtrl.}: SmOwner
 proc smGo(state: uint16; teardown = tdNone): uint32 {.discardable.} =
   ## The only ke_state_set for TASK_SM. Returns the new operation's stamp.
   if smOwn.teardown == tdDeauthWait: mm_timer_clear(addr smOwn.guard)
+  let reserved = smOwn.reply
   smOwn.teardown = teardown
   smOwn.request = nil
+  smOwn.reply = nil
+  smOwn.answer = nil
   result = opGo(smOwn.op)
   ke_state_set(TASK_SM, state)
+  if reserved != nil: ke_msg_free(keMsgHdrFromPayload(reserved))
 
 proc smSend(request: pointer) =
-  ## Send the live operation's request; its answer ends the wait.
+  ## Send the live operation's request; its answer, in place, ends the wait.
   smOwn.request = request
+  smOwn.answer = request
   ke_msg_send(request)
+
+proc smSendReserved(request: pointer): bool =
+  ## Send the live operation's request with the reply its replier answers
+  ## with (smTakeReply). Without memory for the reply the request is freed
+  ## unsent: false.
+  let header = keMsgHdrFromPayload(request)
+  let reply = ke_msg_try_alloc(header.id + 1, TASK_SM, header.destId, 0)
+  if reply == nil:
+    ke_msg_free(header)
+    return false
+  smOwn.request = request
+  smOwn.reply = reply
+  smOwn.answer = reply
+  ke_msg_send(request)
+  true
 
 proc smAwaits(request: pointer): bool =
   ## `request` is the one the live operation waits on (a replier's check).
   request != nil and request == smOwn.request
 
+proc smAttemptStaVif(vifIdx: uint8): bool =
+  ## `vifIdx` still names the attempt's STA interface.
+  let connection = smEnvView().connectInfo
+  connection != nil and connectInfoView(connection).vifIdx == vifIdx and
+    vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx).vifIdx == vifIdx and
+    vifChannelForIdx(vifIdx).vifType == VIF_TYPE_STA
+
+proc smStaleRequest(request: pointer): bool =
+  ## The entry check of the repliers of states 4 and 9: true when the
+  ## replier must not apply `request`. A request SM sent and no longer waits
+  ## on is dropped. One SM waits on whose STA VIF has been retired (the slot
+  ## is free or holds another interface) is answered here, unapplied, with
+  ## SM's reserved reply; SM ends the attempt when it takes the answer.
+  ## (The cleanup's requests are checked by station_cleanup.nim.)
+  let header = keMsgHdrFromPayload(request)
+  if header.srcId != TASK_SM or smCleanupOwnsRequest(request): return false
+  if not smAwaits(request): return true
+  let connection = smEnvView().connectInfo
+  if connection != nil and smAttemptStaVif(connectInfoView(connection).vifIdx):
+    return false
+  ke_msg_send_basic_reply(request, header.id + 1)
+  true
+
+proc smTakeReply(request: pointer; id: uint16): pointer =
+  ## ke_msg_alloc_reply for the request SM waits on: the reply reserved for
+  ## it, as confirmation `id` back to the sender. The request is answered
+  ## (its replier frees it); SM now waits for the reply.
+  result = smOwn.reply
+  if result == nil: return
+  smOwn.reply = nil
+  smOwn.request = nil
+  let header = keMsgHdrFromPayload(result)
+  let requestHeader = keMsgHdrFromPayload(request)
+  header.id = id
+  header.destId = requestHeader.srcId
+  header.srcId = requestHeader.destId
+  header.paramLen = 0
+
 proc smTakeAnswer(answer: pointer): bool =
   ## `answer` answers the live operation's request: the wait ends here, and
   ## the caller takes the next transition. The state is still the one the
   ## request was sent in, since every smGo forgets the request.
-  if not smAwaits(answer): return false
+  if answer == nil or answer != smOwn.answer: return false
   smOwn.request = nil
+  smOwn.answer = nil
   true
 
 proc smArmResponse(stamp: uint32; delayUs: uint64): bool =
@@ -112,7 +187,7 @@ proc smTeardownUnclaimed() =
   let indication = sm.connectIndMsg
   sm.connectInfo = nil
   sm.connectIndMsg = nil
-  smActivationCancelConnection(connection)
+  smActivationCancel()
   smBssCancel()
   smDeferredCancel()
   smGo(SmIdleState)

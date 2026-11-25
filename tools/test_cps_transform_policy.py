@@ -3582,7 +3582,7 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
     )
     me_set_active = body(
         "proc me_set_active_req_handler*",
-        "proc smSetActiveCfmStateAllowed",
+        "proc me_set_active_cfm_handler_sm*",
     )
     me_set_ps_disable = body(
         "proc me_set_ps_disable_req_handler*",
@@ -14877,9 +14877,9 @@ def test_wifi_rx_control_port_and_pending_wpa_are_enforced():
     activate = fw.rsplit("proc smActivationApply(", 1)[1].split(
         "proc smActivationConfirm", 1
     )[0]
-    owner = fw.rsplit("proc smActivationOwnerCurrent(", 1)[1].split("\nproc ", 1)[0]
-    assert "staInfoForIdx(station).valid != 0" in owner
-    assert "staInfoForIdx(station).instNbr == owner.identity.vif" in owner
+    # Each answer is applied only while the AP station is still registered.
+    confirmed = fw.rsplit("proc smActivationConfirmed(", 1)[1].split("\nproc ", 1)[0]
+    assert "staDeleteIsCurrent(smActivation.station, smActivation.stationEpoch)" in confirmed
     for expected in [
         "nimFwWpaPendingMask and (1'u32 shl vifIdx)",
         "let controlPortState = if wpaPending: 1'u8 else: configuredControlPortState",
@@ -17264,7 +17264,7 @@ def test_wifi_mm_state_handlers_use_vif_overlays():
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
-        "let staIdx = owner.identity.station",
+        "let staIdx = smActivation.station",
         "let keyPointerFlags = vifKeyPointers(vif).flags",
         "let securityState = vifSecurity(vif)",
     ]:
@@ -18303,8 +18303,8 @@ def test_wifi_connect_ind_uses_typed_payload_overlay():
 def test_wifi_sta_add_ind_uses_typed_vif_security_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc smActivationSendReady(", 1)[1].split(
-        "proc smActivationNotifyCurrent", 1
+    body = wifi_fw.rsplit("proc smStaAddInd(", 1)[1].split(
+        "proc smStaAddIndSend", 1
     )[0]
 
     for expected in [

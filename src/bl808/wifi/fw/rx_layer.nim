@@ -1025,7 +1025,7 @@ proc rxlObserveStaWmm(desc: pointer; vif: ptr VifChannelView; sta: ptr StaInfoVi
                      frameData: pointer) =
   let saved = irqSave()
   defer: irqRestore(saved)
-  if smActivation.active and smActivation.owner.identity.vif == vif.vifIdx:
+  if smActivationLive() and smActivation.vif == vif.vifIdx:
     return
   let identity = rxCaptureFrame(desc)
   var channel: array[2, uint32]

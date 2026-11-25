@@ -115,25 +115,13 @@ proc apmPrepareVifRemoval(vifIdx: uint8): bool
 proc meTakeControlReply(request: pointer, id: uint16, length: uint32): pointer
 proc meControlReset()
 proc meCancelQueuedPayload(payload: pointer)
-proc smBssForget(header: pointer)
-proc smActivationForget(header: pointer)
-proc smActivationPrepare(owner: SmTxBuildContext; indication: pointer;
-                         aid: uint16; prepared: var SmActivationPrepared): bool
-proc smActivationReleasePrepared(prepared: var SmActivationPrepared)
-proc smActivationStart(owner: SmTxBuildContext; indication: pointer;
-                       prepared: var SmActivationPrepared): bool
-proc smActivationOwnsRequest(request: pointer): bool
-proc smActivationAdmitRequest(request: pointer): bool
-proc smActivationAdmitControlReply(reply: pointer): bool
-proc smActivationTakeReply(request: pointer; id: uint16; length: uint32): pointer
-proc smActivationConfirm(reply: pointer; index: int): bool
+proc smActivationStart(vif, station: uint8; aid: uint16; notifyWps: bool)
+proc smActivationConfirmed()
 proc smActivationCancel()
-proc smActivationCancelConnection(connection: pointer)
-proc smActivationCancelControl(request, reply: pointer; owner: SmTxBuildContext): bool
-proc smActivationNeedsService(): bool
-proc smActivationService()
 proc smActivationNotifyCurrent(): bool
 proc smActivationConsumeSuccess(station: uint8): bool
+proc smAwaits(request: pointer): bool
+proc smTakeReply(request: pointer; id: uint16): pointer
 proc txlRebasePostponedLeases()
 proc smSaQueryQueueTimeout(serial: uint32)
 proc smSaQueryBeginReset(): bool
@@ -143,21 +131,9 @@ template smSaQueryResetScope() =
   let previousSaQueryReset = smSaQueryBeginReset()
   defer: smSaQueryEndReset(previousSaQueryReset)
 
-proc smBssCanBegin(): bool
-proc smBssNewSerial(): uint32
-proc smBssAlloc(index: int; serial: uint32; reply: bool): pointer
-proc smBssStart(owner: SmTxBuildContext; serial: uint32;
-                replies: array[9, pointer]): bool
-proc smBssOwnsRequest(request: pointer): bool
-proc smBssAdmitRequest(request: pointer): bool
-proc smBssAdmitControlReply(reply: pointer): bool
-proc smBssTakeReply(request: pointer; id: uint16; length: uint32): pointer
-proc smBssConsumeReply(reply: pointer): bool
-proc smBssSendNext()
+proc smBssBegin()
+proc smBssNext(): bool {.discardable.}
 proc smBssCancel()
-proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool
-proc smBssNeedsService(): bool
-proc smBssService()
 proc smCleanupForget(header: pointer)
 proc smDeferredForget(header: pointer)
 proc smDeferredCancel()

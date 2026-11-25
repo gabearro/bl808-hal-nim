@@ -55,7 +55,7 @@ const MmSetIdleReqPayloadSize = sizeof(MmSetIdleReqPayload).uint32
 var
   idleReplies: seq[uint16]
   delivered: int
-proc smBssAdmitRequest(p: pointer): bool = true
+proc smStaleRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc mmSetIdleReqView(p: pointer): ptr MmSetIdleReqPayload = cast[ptr MmSetIdleReqPayload](p)
 proc ke_msg_send_basic_reply(p: pointer; id: uint16) = idleReplies.add(id)
