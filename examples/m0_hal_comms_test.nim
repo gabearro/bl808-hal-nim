@@ -92,6 +92,7 @@ proc smokeSpi() =
   let (_, byteErr) = s.transferByte(0xA5'u8)
   check("spi bounded byte transfer", byteErr == spiOk or byteErr == spiTimeout)
   s.clearFifos()
+  s.setFifoThresholds(0, 0)
   s.enableDmaTx()
   s.enableDmaRx()
   checkEq("spi tx fifo address", s.txFifoAddr().uint32, (Spi0Base + SpiFifoWdata).uint32)

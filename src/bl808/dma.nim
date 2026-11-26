@@ -254,6 +254,16 @@ proc channelActive*(dma: Dma, ch: DmaChannel): bool =
 proc channelEnabled*(dma: Dma, ch: DmaChannel): bool =
   (regRead(dma.base + DmaEnabledChns) and (1'u32 shl ch.uint32)) != 0
 
+proc channelSrcAddr*(dma: Dma, ch: DmaChannel): uint32 =
+  ## The address the channel reads next. With an incrementing source this is
+  ## the position in the buffer (in a circular list, the ring's read
+  ## position); it changes while the channel runs.
+  regRead(channelBase(dma.base, ch.uint32) + DmaChSrcAddr)
+
+proc channelDstAddr*(dma: Dma, ch: DmaChannel): uint32 =
+  ## The address the channel writes next.
+  regRead(channelBase(dma.base, ch.uint32) + DmaChDstAddr)
+
 # =============================================================================
 # Interrupt handling
 # =============================================================================
@@ -316,13 +326,17 @@ proc memcopy*(dma: Dma, ch: DmaChannel, dst, src: uint32, sizeBytes: uint32): bo
 proc buildLli*(srcAddr, dstAddr: uint32, transferSize: uint32,
                srcWidth: DmaWidth = width32, dstWidth: DmaWidth = width32,
                srcIncr: bool = true, dstIncr: bool = true,
-               nextLli: uint32 = 0, tcInt: bool = false): DmaLli =
+               nextLli: uint32 = 0, tcInt: bool = false,
+               srcBurst: DmaBurstSize = burst4,
+               dstBurst: DmaBurstSize = burst4): DmaLli =
+  ## A peripheral FIFO that requests a transfer as soon as it has room for
+  ## one item needs the burst on its side set to `burst1`.
   result.srcAddr = srcAddr
   result.dstAddr = dstAddr
   result.nextLli = nextLli
   var ctrl = transferSize and CtrlTransferSizeMask
-  ctrl = ctrl or (burst4.uint32 shl CtrlSBSizeShift)
-  ctrl = ctrl or (burst4.uint32 shl CtrlDBSizeShift)
+  ctrl = ctrl or (srcBurst.uint32 shl CtrlSBSizeShift)
+  ctrl = ctrl or (dstBurst.uint32 shl CtrlDBSizeShift)
   ctrl = ctrl or (srcWidth.uint32 shl CtrlSWidthShift)
   ctrl = ctrl or (dstWidth.uint32 shl CtrlDWidthShift)
   if srcIncr: ctrl = ctrl or (1'u32 shl CtrlSrcIncr)

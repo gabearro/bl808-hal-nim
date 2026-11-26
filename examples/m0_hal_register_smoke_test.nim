@@ -112,7 +112,7 @@ proc smokeGlb() =
   enableI2cClock()
   checkEq("GLB I2C clock divider", (regRead(GlbI2cCfg0) shr 16) and 0xFF'u32, 11)
   enableDma1Clock()
-  check("GLB DMA1 clock enable", (regRead(GlbDmaCfg0) and (1'u32 shl 25)) != 0)
+  check("GLB DMA1 clock enable", (regRead(GlbDmaCfg1) and (0xFF'u32 shl 24)) != 0)
   discard getHclkDiv()
   discard getBclkDiv()
   check("GLB clock divider readback", true)

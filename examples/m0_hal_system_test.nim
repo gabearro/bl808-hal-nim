@@ -118,7 +118,7 @@ proc smokeGlbGpio() =
     enableI2cClock()
     checkEq("glb i2c divider", (regRead(GlbI2cCfg0) shr 16) and 0xFF'u32, 11)
     enableDma1Clock()
-    check("glb dma1 clock", (regRead(GlbDmaCfg0) and (1'u32 shl 25)) != 0)
+    check("glb dma1 clock", (regRead(GlbDmaCfg1) shr 24) == 0xFF'u32)
     mmPowerOn()
     setDspXclkSel(0)
     setDspRootClkSel(0)
@@ -154,7 +154,8 @@ proc smokeGlbGpio() =
   gpioInitOutput(TestGpio, drive2, pullUp)
   let cfg = regRead(gpioCfg(TestGpio))
   check("gpio output config", (cfg and (1'u32 shl GpioOe)) != 0 and
-        ((cfg and GpioFuncSelMask) shr GpioFuncSelShift) == funcGpio.uint32)
+        ((cfg and GpioFuncSelMask) shr GpioFuncSelShift) == funcGpio.uint32 and
+        ((cfg and GpioModeMask) shr GpioModeShift) == GpioModeSetClr)
   gpioSetFunction(TestGpio, funcGpio)
   gpioSetDrive(TestGpio, drive3)
   gpioSetPull(TestGpio, pullDown)
@@ -167,7 +168,10 @@ proc smokeGlbGpio() =
   gpioDisableInterrupt(TestGpio)
   gpioClearInterrupt(TestGpio)
   check("gpio pin APIs", true)
-  gpioSetupSpi(21, 22, 23, 24)
+  gpioSetupSpi(sclkPin = 23, mosiPin = 21, misoPin = 22, csPin = 24)
+  gpioSetupSpiPin(23)
+  check("gpio spi pin config", gpioCfgAddr(23) == gpioCfg(23) and
+        ((regRead(gpioCfgAddr(23)) and GpioFuncSelMask) shr GpioFuncSelShift) == funcSpi0.uint32)
   gpioSetupI2c(25, 26, 0)
   check("gpio alternate setup helpers", true)
 

@@ -61,10 +61,41 @@
 
 #define LWIP_TCP                       1
 #define TCP_MSS                        1460
+
+/* The window and send-buffer sizes below suit the single-connection HTTP
+ * server. A TCP client (a stream, a download) can raise them without editing
+ * this file: this header is force-included, so pass the value to the C
+ * compiler, e.g. `--passC:-DTCP_WND=16384` (a plain number: Nim hands the
+ * flag to a shell). init.c rejects inconsistent values at compile time; a
+ * window above 65535 also needs LWIP_WND_SCALE and TCP_RCV_SCALE. Options
+ * this file does not define (TCP_QUEUE_OOSEQ, DNS_TABLE_SIZE, ...) take the
+ * same kind of -D. */
+#ifndef TCP_WND
 #define TCP_WND                        (2 * TCP_MSS)
+#endif
+#ifndef TCP_SND_BUF
 #define TCP_SND_BUF                    (2 * TCP_MSS)
+#endif
+#ifndef TCP_SND_QUEUELEN
 #define TCP_SND_QUEUELEN               (4 * TCP_SND_BUF / TCP_MSS)
+#endif
+
+/* lwIP's resolver is off unless the image is built with
+ * -d:bl808WifiRealLwipDns: lwipcore.nim then passes -DLWIP_DNS=1 and compiles
+ * dns.c, and DHCP hands the servers it is given to dns_setserver(). Use the
+ * Nim define, not a bare -DLWIP_DNS=1, which would leave dns.c out. */
+#ifndef LWIP_DNS
 #define LWIP_DNS                       0
+#endif
+#if LWIP_DNS && !defined(DNS_RAND_TXID)
+/* Query ids and source ports come from the same TRNG-backed source as the
+ * DHCP transaction id; this profile has no LWIP_RAND. */
+#ifndef __ASSEMBLER__
+#include <stdint.h>
+extern uint32_t bl808_lwip_dhcp_xid_seed(void);
+#endif
+#define DNS_RAND_TXID()                bl808_lwip_dhcp_xid_seed()
+#endif
 #define LWIP_NETCONN                   0
 #define LWIP_SOCKET                    0
 #define LWIP_IGMP                      0

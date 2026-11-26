@@ -66,7 +66,7 @@
       "kind": "qemu",
       "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_spi_test.nim"}],
       "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
-      "required": ["[PASS] Full-duplex no-peer readback: 0x00", "[PASS] Recv no-peer bus: 0x00 0x00 0x00", "=== Test Complete ==="],
+      "required": ["[PASS] Full-duplex no-peer readback: 0x00", "[PASS] Recv no-peer bus: 0x00 0x00 0x00", "[OK] send 100 bytes", "[PASS] Cancelled transfers release their slots", "=== Test Complete ==="],
       "timeout": 18
     },
     {

@@ -9,6 +9,36 @@
 ##   2. Clears BSS
 ##   3. Sets up the trap vector
 ##   4. Calls `main()`
+##
+## Module-level code does not run at boot
+## --------------------------------------
+## `_start` calls the exported `main` directly; Nim's `NimMain` is never
+## called. Top-level statements and global initialisers that need code
+## therefore do not run on their own:
+##
+## * `var x = 5`, `var t = [1, 2, 3]`, `var o = Obj(a: 1)`, `var p: T` and
+##   `var f: proc () = nil` are fine: they are static data (`.data`/`.bss`).
+## * `var s = "text"`, `var n = compute()`, `var hook: proc () = defaultProc`,
+##   `let`/`var` of a seq, table or ref, and any other top-level statement
+##   compile into the module's init procedure. In an image without Wi-Fi that
+##   procedure never runs, and the variable stays zero.
+## * In an M0 Wi-Fi image `wifiInit()` runs the init procedures of every
+##   *imported* module once (it calls Nim's `PreMain`), in the middle of
+##   `main`: globals of that kind are zero before `wifiInit()` and are reset
+##   to their initial values by it. The main module's own top-level code never
+##   runs.
+##
+## So give a module an explicit `init` proc, called from `main` after
+## `heapInit()`, for anything that is not static data. Do not call `NimMain()`
+## from `main` or below it: when the main module has a top-level statement
+## (such as a trailing `main()`), `NimMain` runs it and re-enters `main`.
+## Calling `PreMain()` yourself is only safe before anything has stored into
+## such globals, after `heapInit()`, and not in an image that also calls
+## `wifiInit()`, which would run every init procedure a second time.
+##
+## `_start` does not do this for you because the init procedures may allocate
+## and the heap (in PSRAM on some profiles) is not up until `main` has set it
+## up, and because `wifiInit()` would then run them twice.
 
 import core, irq
 import kernel/fault

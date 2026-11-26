@@ -255,6 +255,24 @@ proc flashReadRawByte*(offset: uint32): uint8 {.flashRam.} =
   sfCtrlRestoreXip()
   flashIrqRestore(irqState)
 
+proc flashReadRaw*(offset: uint32, buf: var openArray[uint8]) {.flashRam.} =
+  ## Read `buf.len` bytes starting at physical flash offset `offset` with raw
+  ## SPI READ commands, bypassing the XIP window, its image-offset remap and
+  ## the cache. Unlike `flashReadXipBuffer` this sees what was just erased or
+  ## programmed. Runs from RAM with interrupts masked for one page (at most
+  ## `FlashPageSize` bytes, the size of the controller's buffer) at a time.
+  var base = 0
+  while base < buf.len:
+    let n = min(buf.len - base, FlashPageSize.int)
+    let irqState = flashIrqSave()
+    sfCtrlSendCmd(FlashCmdRead, offset + base.uint32, hasAddr = true, dataLen = n.uint32)
+    for i in 0 ..< n:
+      let word = regRead(SfCtrlBufBase + ((i and not 3).uint))
+      buf[base + i] = ((word shr ((i and 3) * 8)) and 0xFF).uint8
+    sfCtrlRestoreXip()
+    flashIrqRestore(irqState)
+    base += n
+
 var
   flashVerifyFailIndex*: uint32   # diagnostics for the first flashRawMatches mismatch
   flashVerifyExpected*: uint8

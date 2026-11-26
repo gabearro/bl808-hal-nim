@@ -84,6 +84,9 @@ when defined(bl808m0):
       switch("passC", "-DBL808_WIFI_MBEDTLS_CACHED_WRAM")
       switch("passL", "-T src/linker/bl808_m0_wifi_cached_hot.ld")
     switch("passL", "-T src/linker/bl808_m0_allcore_http.ld")
+  elif defined(bl808WifiApp):
+    # A Wi-Fi application: 1 MB PSRAM heap, its own globals in PSRAM.
+    switch("passL", "-T src/linker/bl808_m0_wifi_app.ld")
   elif defined(bl808WifiHttpServer):
     switch("passL", "-T src/linker/bl808_m0_wifi_http.ld")
   elif defined(bl808WifiCachedBss):

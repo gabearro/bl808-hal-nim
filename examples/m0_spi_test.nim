@@ -3,7 +3,8 @@
 ## No external SPI peer is attached on the Ox64 board model. SPI0 transfers on
 ## the modeled bus read back 0x00, which matches QEMU's BL808 board wiring for
 ## an unhandled transfer. This test verifies the native SPI register contract,
-## IRQ-driven transfers, and receive-only behavior.
+## IRQ-driven transfers, receive-only behavior, a send longer than the FIFO,
+## and that abandoned transfers give their interrupt-bridge slots back.
 ##
 ## Build: nim c -d:bl808m0 -d:bl808kernel examples/m0_spi_test.nim
 ## Run:
@@ -18,6 +19,7 @@ import bl808/spi
 import bl808/kernel/cps
 import bl808/kernel/log
 import bl808/kernel/asyncspi
+import bl808/kernel/isrbridge
 
 const
   ConsoleBaud {.intdefine.} = 230_400'u32
@@ -80,6 +82,34 @@ proc spiTestTask(): CpsVoidFuture {.cps.} =
       logError "[FAIL] recv data": lStr(" "); lHex(recvBuf[0].uint32); lStr(" "); lHex(recvBuf[1].uint32); lStr(" "); lHex(recvBuf[2].uint32)
   else:
     logError "[FAIL] recv err=": lInt(err3.int)
+
+  # Send more than the FIFO holds: the rest is fed from the interrupt.
+  var longData: array[100, uint8]
+  for i in 0 ..< longData.len: longData[i] = i.uint8
+  let err4 = await aspi.sendPtr(
+    cast[ptr UncheckedArray[uint8]](addr longData[0]), longData.len)
+  if err4 == spiOk:
+    logInfo "[OK] send 100 bytes"
+  else:
+    logError "[FAIL] long send err=": lInt(err4.int)
+
+  # Abandon more transfers than the interrupt bridge has slots.
+  var cancelled = 0
+  for i in 0 ..< MaxIsrSlots + 8:
+    var pending: CpsFuture[SpiError]
+    withInterruptsDisabled:   # before its interrupt can finish it
+      pending = aspi.sendPtr(
+        cast[ptr UncheckedArray[uint8]](addr longData[0]), longData.len)
+      aspi.cancel()
+    let outcome = await pending
+    if outcome == spiCancelled: cancelled.inc
+  let err5 = await aspi.sendPtr(
+    cast[ptr UncheckedArray[uint8]](addr sendData[0]), 2)
+  if cancelled == MaxIsrSlots + 8 and err5 == spiOk and
+     isrBridgeActiveSlotsCount() == 0:
+    logInfo "[PASS] Cancelled transfers release their slots"
+  else:
+    logError "[FAIL] cancel": lStr(" cancelled="); lInt(cancelled); lStr(" err="); lInt(err5.int); lStr(" slots="); lInt(isrBridgeActiveSlotsCount())
 
   logInfo ""
   logInfo "=== Test Complete ==="

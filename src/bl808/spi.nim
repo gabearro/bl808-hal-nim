@@ -14,8 +14,8 @@ const
   SpiConfigReg*     = 0x00'u  # SPI configuration register
   SpiIntSts*        = 0x04'u  # Interrupt status / mask
   SpiBusBusy*       = 0x08'u  # Bus busy flag
-  SpiPrd0*          = 0x10'u  # Clock period phase 0/1
-  SpiPrd1*          = 0x14'u  # Clock period phase 2/3
+  SpiPrd0*          = 0x10'u  # Clock period: start, stop, data phase 0, data phase 1
+  SpiPrd1*          = 0x14'u  # Clock period: interval between frames
   SpiRxdIgnr*       = 0x18'u  # RX data ignore count
   SpiStoValue*      = 0x1C'u  # Slave timeout value
   SpiFifoConfig0*   = 0x80'u  # FIFO configuration 0
@@ -32,7 +32,7 @@ const
   SpiFrameSizeShift* = 2      # Frame size [3:2]: 0=8bit, 1=16bit, 2=24bit, 3=32bit
   SpiFrameSizeMask*  = 0x03'u32 shl 2
   SpiSclkPol*       = 4       # Clock polarity (CPOL)
-  SpiSclkPh*        = 5       # Clock phase (CPHA)
+  SpiSclkPh*        = 5       # Clock phase, inverted: 1 = sample on the first edge (CPHA=0)
   SpiBitInv*        = 6       # Bit order invert (MSB/LSB first)
   SpiByteInv*       = 7       # Byte order invert
   SpiRxdIgnrEn*     = 8       # RX data ignore enable
@@ -41,6 +41,16 @@ const
   SpiDeglitchEn*    = 11      # Deglitch enable
   SpiDeglitchCntShift* = 12   # Deglitch count [15:12]
   SpiDeglitchCntMask*  = 0x0F'u32 shl 12
+
+# =============================================================================
+# Clock period fields (each lasts value + 1 source clocks)
+# =============================================================================
+const
+  SpiPrdStartShift*  = 0      # PRD_0 [7:0]: CS active to the first clock edge
+  SpiPrdStopShift*   = 8      # PRD_0 [15:8]: last clock edge to CS inactive
+  SpiPrdPhase0Shift* = 16     # PRD_0 [23:16]: first half of a bit
+  SpiPrdPhase1Shift* = 24     # PRD_0 [31:24]: second half of a bit
+  SpiPrdIntervalMask* = 0xFF'u32  # PRD_1 [7:0]: gap between frames
 
 # =============================================================================
 # SPI interrupt bits (in SPI_INT_STS)
@@ -62,8 +72,8 @@ const
 # FIFO fields
 # =============================================================================
 const
-  SpiFifoDmaRxEn*   = 0
-  SpiFifoDmaTxEn*   = 1
+  SpiFifoDmaTxEn*   = 0
+  SpiFifoDmaRxEn*   = 1
   SpiFifoTxClr*     = 2
   SpiFifoRxClr*     = 3
   SpiFifoTxOverflow*  = 4
@@ -92,10 +102,12 @@ type
     spi1  # MM subsystem
 
   SpiMode* = enum
-    spiMode0  # CPOL=0, CPHA=0
-    spiMode1  # CPOL=0, CPHA=1
-    spiMode2  # CPOL=1, CPHA=0
-    spiMode3  # CPOL=1, CPHA=1
+    ## The standard SPI modes. The hardware's phase bit is the inverse of
+    ## CPHA (`SpiSclkPh` set = sample on the first clock edge).
+    spiMode0  # CPOL=0, CPHA=0: idle low, sample on the rising edge
+    spiMode1  # CPOL=0, CPHA=1: idle low, sample on the falling edge
+    spiMode2  # CPOL=1, CPHA=0: idle high, sample on the falling edge
+    spiMode3  # CPOL=1, CPHA=1: idle high, sample on the rising edge
 
   SpiFrameSize* = enum
     frame8bit  = 0
@@ -111,12 +123,14 @@ type
     spiOk
     spiTimeout
     spiFifoError
+    spiCancelled   ## The transfer was abandoned before it finished
 
   SpiConfig* = object
     mode*: SpiMode
     frameSize*: SpiFrameSize
     role*: SpiRole
-    prescaler*: uint32   ## Clock phase period (sets SPI clock speed)
+    prescaler*: uint32   ## Half a bit lasts prescaler + 1 source clocks:
+                         ## SCLK = source / (2 * (prescaler + 1))
     deglitch*: bool
 
   Spi* = object
@@ -132,6 +146,16 @@ proc spiBase(id: SpiId): uint =
   of spi0: Spi0Base
   of spi1: Spi1Base
 
+const
+  # GLB_PARM_CFG0: whether the SPI pads act as a master's or a slave's.
+  GlbParmCfg0 = GlbBase + 0x510'u
+  GlbSpi0MasterMode = 12
+  GlbMmSpiMasterMode = 27
+
+proc selectPadRole(id: SpiId, role: SpiRole) =
+  let bit = 1'u32 shl (if id == spi0: GlbSpi0MasterMode else: GlbMmSpiMasterMode)
+  regModify(GlbParmCfg0, bit, if role == spiMaster: bit else: 0'u32)
+
 # =============================================================================
 # Default config
 # =============================================================================
@@ -146,8 +170,21 @@ const DefaultSpiConfig* = SpiConfig(
 # =============================================================================
 # Initialization
 # =============================================================================
+proc setPrescaler*(spi: Spi, prescaler: uint32) =
+  ## Set the clock period: the start and stop delays, each half of a bit
+  ## and the frame interval all last (`prescaler` + 1) source clocks, so
+  ## SCLK = source / (2 * (prescaler + 1)). Change it only between transfers.
+  let prd = prescaler and 0xFF
+  regWrite(spi.base + SpiPrd0,
+           (prd shl SpiPrdStartShift) or (prd shl SpiPrdStopShift) or
+           (prd shl SpiPrdPhase0Shift) or (prd shl SpiPrdPhase1Shift))
+  regModify(spi.base + SpiPrd1, SpiPrdIntervalMask, prd)
+
 proc initSpi*(id: SpiId, config: SpiConfig): Spi =
   ## Initialize SPI peripheral. Returns an SPI handle.
+  ## The peripheral clock, its source and divider, and the pins are the
+  ## caller's (see `glb` and `gpioSetupSpi`).
+  selectPadRole(id, config.role)
   result.base = spiBase(id)
   result.id = id
   result.frameSize = config.frameSize
@@ -167,12 +204,12 @@ proc initSpi*(id: SpiId, config: SpiConfig): Spi =
   # Frame size
   cfg = cfg or (config.frameSize.uint32 shl SpiFrameSizeShift)
 
-  # Clock mode
+  # Clock mode (the phase bit is set for CPHA=0)
   case config.mode
-  of spiMode0: discard  # CPOL=0, CPHA=0
-  of spiMode1: cfg = cfg or (1'u32 shl SpiSclkPh)
-  of spiMode2: cfg = cfg or (1'u32 shl SpiSclkPol)
-  of spiMode3: cfg = cfg or (1'u32 shl SpiSclkPol) or (1'u32 shl SpiSclkPh)
+  of spiMode0: cfg = cfg or (1'u32 shl SpiSclkPh)
+  of spiMode1: discard
+  of spiMode2: cfg = cfg or (1'u32 shl SpiSclkPol) or (1'u32 shl SpiSclkPh)
+  of spiMode3: cfg = cfg or (1'u32 shl SpiSclkPol)
 
   # Deglitch
   if config.deglitch:
@@ -180,10 +217,8 @@ proc initSpi*(id: SpiId, config: SpiConfig): Spi =
 
   regWrite(base + SpiConfigReg, cfg)
 
-  # Clock period: prescaler sets all 4 phases
-  let prd = config.prescaler and 0xFF
-  regWrite(base + SpiPrd0, (prd shl 16) or prd)
-  regWrite(base + SpiPrd1, (prd shl 16) or prd)
+  # Clock period: start, stop, both halves of a bit and the frame interval
+  result.setPrescaler(config.prescaler)
 
   # Clear FIFOs
   regSet(base + SpiFifoConfig0,
@@ -281,6 +316,12 @@ proc recv*(spi: Spi, rxBuf: var openArray[uint8]): SpiError =
 proc clearFifos*(spi: Spi) =
   regSet(spi.base + SpiFifoConfig0,
          (1'u32 shl SpiFifoTxClr) or (1'u32 shl SpiFifoRxClr))
+
+proc setFifoThresholds*(spi: Spi, tx, rx: uint32) =
+  ## The TX FIFO interrupt (and DMA request) is raised while more than `tx`
+  ## entries are free, the RX one while more than `rx` entries are waiting.
+  regModify(spi.base + SpiFifoConfig1, SpiFifoTxThreshMask or SpiFifoRxThreshMask,
+            (tx shl SpiFifoTxThreshShift) or (rx shl SpiFifoRxThreshShift))
 
 proc enableDmaTx*(spi: Spi) =
   regSet(spi.base + SpiFifoConfig0, 1'u32 shl SpiFifoDmaTxEn)

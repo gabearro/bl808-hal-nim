@@ -28,7 +28,7 @@ type
 const
   ErrOk: ErrT = 0
   ErrMem: ErrT = -1
-  ErrAbrt: ErrT = -6
+  ErrAbrt: ErrT = -13
 
 template requireLive(pcb: ptr TcpPcb) =
   doAssert pcb != nil and pcb.live, "lwIP operation on a dead PCB"

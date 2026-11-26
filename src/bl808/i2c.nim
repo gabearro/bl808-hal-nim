@@ -63,8 +63,8 @@ const
 # =============================================================================
 const
   I2cFifoDepth*     = 2'u32
-  I2cFifoDmaRxEn*   = 0
-  I2cFifoDmaTxEn*   = 1
+  I2cFifoDmaTxEn*   = 0
+  I2cFifoDmaRxEn*   = 1
   I2cFifoTxClr*     = 2
   I2cFifoRxClr*     = 3
 

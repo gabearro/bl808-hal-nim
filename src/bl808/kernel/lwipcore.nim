@@ -30,6 +30,9 @@ when defined(bl808WifiNimFw):
       {.passC: "-include src/bl808/kernel/lwip_wifi_http/lwipopts.h".}
       {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/include".}
       {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/portable/GCC/RISC-V".}
+      when defined(bl808WifiRealLwipDns):
+        # Opt-in resolver for TCP clients; see lwip_wifi_http/lwipopts.h.
+        {.passC: "-DLWIP_DNS=1".}
     else:
       {.passC: "-Isrc/bl808/kernel/lwip_wifi_smoke".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/src/include".}
@@ -65,7 +68,15 @@ when defined(bl808WifiRealLwip):
   {.compile: "src/bl808/kernel/lwip_wifi_smoke/timeouts.c".}
 else:
   {.compile: LwipRoot & "/src/core/timeouts.c".}
-when not defined(bl808WifiRealLwip):
+const lwipDnsEnabled* = not defined(bl808WifiRealLwip) or
+    (defined(bl808WifiRealLwipTcp) and defined(bl808WifiRealLwipDns))
+  ## Whether lwIP's resolver is in the image. Wi-Fi images leave it out unless
+  ## built with `-d:bl808WifiRealLwipTcp -d:bl808WifiRealLwipDns`.
+
+when defined(bl808WifiRealLwipDns) and not lwipDnsEnabled:
+  {.error: "bl808WifiRealLwipDns needs the TCP profile: add -d:bl808WifiRealLwipTcp".}
+
+when lwipDnsEnabled:
   {.compile: LwipRoot & "/src/core/dns.c".}
 {.compile: LwipRoot & "/src/core/sys.c".}
 when not defined(bl808WifiRealLwip):
@@ -125,8 +136,11 @@ const
   ErrBuf*: ErrT = -2
   ErrTimeout*: ErrT = -3
   ErrRte*: ErrT = -4
-  ErrAbrt*: ErrT = -6
+  ErrInProgress*: ErrT = -5
   ErrConn*: ErrT = -11
+  ErrAbrt*: ErrT = -13
+  ErrRst*: ErrT = -14
+  ErrClsd*: ErrT = -15
 
   NetifFlagBroadcast* = 0x02'u8
   NetifFlagEtharp* = 0x08'u8
@@ -239,6 +253,16 @@ proc netifSetOutput*(netif: ptr Netif, fn: NetifOutputFn) =
 proc netifSetName*(netif: ptr Netif, a, b: char) =
   {.emit: "`netif`->name[0] = `a`; `netif`->name[1] = `b`;".}
 
+proc netifIp4Addr*(netif: ptr Netif): IpAddr =
+  ## The interface's IPv4 address (0 until DHCP or `netifSetAddr` sets one).
+  {.emit: "`result` = *netif_ip4_addr(`netif`);".}
+
+proc netifIp4Netmask*(netif: ptr Netif): IpAddr =
+  {.emit: "`result` = *netif_ip4_netmask(`netif`);".}
+
+proc netifIp4Gw*(netif: ptr Netif): IpAddr =
+  {.emit: "`result` = *netif_ip4_gw(`netif`);".}
+
 # =============================================================================
 # Ethernet / ARP
 # =============================================================================
@@ -319,6 +343,8 @@ type
   TcpSentFn* = proc(arg: pointer, tpcb: ptr TcpPcb,
                       len: uint16): ErrT {.cdecl.}
   TcpErrFn* = proc(arg: pointer, err: ErrT) {.cdecl.}
+  TcpConnectedFn* = proc(arg: pointer, tpcb: ptr TcpPcb,
+                           err: ErrT): ErrT {.cdecl.}
 
 proc tcpNew*(): ptr TcpPcb
   {.importc: "tcp_new", header: "lwip/tcp.h".}
@@ -332,6 +358,12 @@ proc tcpListen*(pcb: ptr TcpPcb): ptr TcpPcb
 
 proc tcpAccept*(pcb: ptr TcpPcb, accept: TcpAcceptFn)
   {.importc: "tcp_accept", header: "lwip/tcp.h".}
+
+proc tcpConnect*(pcb: ptr TcpPcb, ipaddr: ptr IpAddr, port: uint16,
+                  connected: TcpConnectedFn): ErrT
+  {.importc: "tcp_connect", header: "lwip/tcp.h".}
+  ## Start connecting. `connected` runs once the handshake is done; a refused
+  ## or timed-out attempt goes to the `tcpErr` callback instead.
 
 proc tcpRecv*(pcb: ptr TcpPcb, recv: TcpRecvFn)
   {.importc: "tcp_recv", header: "lwip/tcp.h".}
@@ -355,6 +387,10 @@ proc tcpOutput*(pcb: ptr TcpPcb): ErrT
 proc tcpRecved*(pcb: ptr TcpPcb, len: uint16)
   {.importc: "tcp_recved", header: "lwip/tcp.h".}
 
+proc tcpSndbuf*(pcb: ptr TcpPcb): uint16 =
+  ## Bytes `tcpWrite` will take right now.
+  {.emit: "`result` = tcp_sndbuf(`pcb`);".}
+
 proc tcpClose*(pcb: ptr TcpPcb): ErrT
   {.importc: "tcp_close", header: "lwip/tcp.h".}
 
@@ -364,6 +400,12 @@ proc tcpAbort*(pcb: ptr TcpPcb)
 const
   TcpWriteFlagCopy* = 0x01'u8
   TcpWriteFlagMore* = 0x02'u8
+
+let
+  TcpWnd* {.importc: "TCP_WND", header: "lwip/opt.h", nodecl.}: cint
+    ## The receive window a connection opens with (set in lwipopts.h).
+  TcpSndBuf* {.importc: "TCP_SND_BUF", header: "lwip/opt.h", nodecl.}: cint
+    ## What `tcpSndbuf` reports on an idle connection.
 
 # =============================================================================
 # UDP raw API
@@ -392,3 +434,31 @@ proc udpSendto*(pcb: ptr UdpPcb, p: ptr Pbuf,
 
 proc udpRemove*(pcb: ptr UdpPcb)
   {.importc: "udp_remove", header: "lwip/udp.h".}
+
+# =============================================================================
+# DNS
+# =============================================================================
+
+when lwipDnsEnabled:
+  {.emit: "#include \"lwip/dns.h\"".}
+
+  type
+    DnsFoundFn* = proc(name: cstring, ipaddr: ptr IpAddr,
+                        arg: pointer) {.cdecl.}
+      ## `ipaddr` is nil when the lookup failed.
+
+  proc dnsSetServer*(index: uint8, server: ptr IpAddr)
+    {.importc: "dns_setserver", header: "lwip/dns.h".}
+    ## Set resolver `index` (0 ..< DNS_MAX_SERVERS). DHCP does this itself
+    ## with the servers the lease names.
+
+  proc dnsGetServer*(index: uint8): IpAddr =
+    ## Resolver `index`, or 0 when none is set.
+    {.emit: "`result` = *dns_getserver(`index`);".}
+
+  proc dnsGetHostByName*(hostname: cstring, ipaddr: ptr IpAddr,
+                          found: DnsFoundFn, arg: pointer): ErrT =
+    ## `ErrOk`: `ipaddr` is filled in (cached, or `hostname` is an address).
+    ## `ErrInProgress`: `found` will be called with the answer.
+    ## Anything else: the lookup could not be started.
+    {.emit: "`result` = dns_gethostbyname(`hostname`, `ipaddr`, (dns_found_callback)`found`, `arg`);".}

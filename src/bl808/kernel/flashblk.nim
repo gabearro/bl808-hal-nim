@@ -1,19 +1,25 @@
 ## Flash block device for LittleFS.
 ##
 ## Bridges LittleFS's 4 block device callbacks to the flash.nim HAL.
-## The filesystem partition starts at FlashFsOffset (8MB into flash),
-## using 4KB sectors as LittleFS blocks.
+## The filesystem partition is the top 8 MB of the 16 MB flash
+## (`FlashFsFlashOffset` in flash_layout.nim), using 4KB sectors as LittleFS
+## blocks.
 
 import ../flash
-import ../memmap
+import ../flash_layout
 
 const
-  FlashFsOffset* = 0x800000'u32   ## Filesystem starts 8MB into flash
-  FlashFsSize* = Ox64WasmStoreOffset.uint32 - FlashFsOffset
+  FlashFsOffset* = FlashFsFlashOffset   ## Filesystem starts 8MB into flash
+  FlashFsSize* = FlashFsFlashLen        ## 8MB, up to the end of flash
   FlashFsBlockSize* = 4096'u32    ## 4KB erase sectors
   FlashFsBlockCount* = FlashFsSize div FlashFsBlockSize  ## 2048 blocks
   FlashFsReadSize* = 256'u32      ## Read granularity
   FlashFsProgSize* = 256'u32      ## Program granularity (page size)
+
+static:
+  # FlashFsSize was once `WASM store offset - FlashFsOffset`, which wraps to
+  # 4 GB in uint32 and gave LittleFS 1,048,320 blocks on a 4096-block chip.
+  doAssert FlashFsBlockCount == 2048
 
 proc blockAddr(blk, off: uint32): uint32 {.inline.} =
   FlashFsOffset + blk * FlashFsBlockSize + off

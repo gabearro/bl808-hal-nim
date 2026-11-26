@@ -60,8 +60,8 @@ const
 # FIFO_CONFIG_0 fields
 # =============================================================================
 const
-  FifoDmaRxEn*       = 0       # DMA RX enable
-  FifoDmaTxEn*       = 1       # DMA TX enable
+  FifoDmaTxEn*       = 0       # DMA TX enable
+  FifoDmaRxEn*       = 1       # DMA RX enable
   FifoTxFifoClr*     = 2       # Clear TX FIFO
   FifoRxFifoClr*     = 3       # Clear RX FIFO
   FifoTxFifoOverflow*  = 4     # TX FIFO overflow flag

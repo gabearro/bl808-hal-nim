@@ -36,6 +36,9 @@ const
   # AUPLL accessed via CCI at 0x20008000 + 0x750
   GlbAuPllCfg0*     = CciBase + 0x750'u  # Audio PLL reset/power
   GlbAuPllCfg1*     = CciBase + 0x754'u  # Audio PLL post-div, ref-div
+  GlbAuPllCfg2*     = CciBase + 0x758'u  # Audio PLL charge pump
+  GlbAuPllCfg3*     = CciBase + 0x75C'u  # Audio PLL loop filter
+  GlbAuPllCfg4*     = CciBase + 0x760'u  # Audio PLL sample clock select
   GlbAuPllCfg5*     = CciBase + 0x764'u  # Audio PLL VCO speed
   GlbAuPllCfg6*     = CciBase + 0x768'u  # Audio PLL SDM fractional
   GlbAuPllCfg8*     = CciBase + 0x770'u  # Audio PLL output dividers
@@ -43,7 +46,8 @@ const
   # Peripheral clock configuration (verified against BL808 glb_reg.h)
   GlbAdcCfg0*       = GlbBase + 0x110'u  # ADC clock (was 0x0F4 - wrong)
   GlbDacCfg0*       = GlbBase + 0x120'u  # DAC analog control (was 0x0F8 - wrong)
-  GlbDmaCfg0*       = GlbBase + 0x130'u  # DMA clock
+  GlbDmaCfg0*       = GlbBase + 0x130'u  # DMA0 channel clock gates [31:24]
+  GlbDmaCfg1*       = GlbBase + 0x134'u  # DMA1 channel clock gates [31:24]
   GlbIrCfg0*        = GlbBase + 0x140'u  # IR clock (was 0x1C0 - wrong)
   GlbUartCfg0*      = GlbBase + 0x150'u  # UART clock
   GlbUartSigSwap*   = GlbBase + 0x154'u  # UART signal swap
@@ -58,6 +62,7 @@ const
   GlbDigClkCfg0*    = GlbBase + 0x250'u  # Digital clock config 0 (was 0x100 - wrong)
   GlbDigClkCfg1*    = GlbBase + 0x254'u  # Digital clock config 1
   GlbDigClkCfg2*    = GlbBase + 0x258'u  # Digital clock config 2
+  GlbParmCfg0*      = GlbBase + 0x510'u  # Pad/signal routing (SPI role and swap, UART swap, ...)
 
   # Software reset
   GlbSwrstCfg0*     = GlbBase + 0x540'u
@@ -142,9 +147,9 @@ type
     uartClkXclk      ## Crystal clock
 
   SpiClkSrc* = enum
-    spiClkBclk       ## Bus clock
-    spiClkPll160m    ## PLL 160 MHz
-    spiClkXclk       ## Crystal clock
+    ## GLB_SPI_CFG0 `spi_clk_sel` (one bit; there is no bus-clock source).
+    spiClkPll160m = 0  ## MCU MUXPLL 160 MHz
+    spiClkXclk    = 1  ## XCLK (crystal or RC32M)
 
   SdhClkSrc* = enum
     sdhClkWifiPll96m = 0
@@ -156,6 +161,7 @@ type
 type
   McuPeriph* = enum
     ## CGEN_CFG1 bit positions for MCU peripheral clock gates (from BL808 glb_reg.h)
+    periphDma     = 12  # DMA0 (see enableDma0Clock for the channel gates)
     periphUart0   = 16
     periphUart1   = 17
     periphSpi     = 18
@@ -167,6 +173,7 @@ type
     # periphRsvd8 = 24  # Reserved; DMA clock is in DMA_CFG0.
     periphI2c1    = 25
     periphUart2   = 26
+    periphI2s     = 27  # Reserved in glb_reg.h; bflb_clock.h PERIPHERAL_CLOCK_I2S_ENABLE
 
 # =============================================================================
 # Clock gating
@@ -276,8 +283,33 @@ proc setSpiClockDiv*(divider: uint32) =
 proc enableSpiClock*() =
   regSet(GlbSpiCfg0, 1'u32 shl 8)
 
+proc disableSpiClock*() =
+  regClear(GlbSpiCfg0, 1'u32 shl 8)
+
 proc setSpiClockSource*(src: SpiClkSrc) =
   regModify(GlbSpiCfg0, 0x01'u32 shl 9, src.uint32 shl 9)
+
+proc setSpiClock*(enable: bool, src: SpiClkSrc, divider: uint32 = 0) =
+  ## Configure the SPI0 clock: `src` / (divider + 1), divider 0..31. The
+  ## clock is gated off while it changes (GLB_Set_SPI_CLK).
+  disableSpiClock()
+  setSpiClockDiv(divider)
+  setSpiClockSource(src)
+  if enable:
+    enableSpiClock()
+
+# =============================================================================
+# SPI0 pad role (GLB_PARM_CFG0)
+# =============================================================================
+proc setSpi0MasterMode*(master: bool) =
+  ## Make the SPI0 pads act as a master's (true) or a slave's (false). The
+  ## reset value is slave, so a master must set this as well as the role in
+  ## the SPI block itself.
+  regModify(GlbParmCfg0, 1'u32 shl 12, master.uint32 shl 12)
+
+proc swapSpi0MosiMiso*(swap: bool) =
+  ## Exchange the MOSI and MISO pads of SPI0.
+  regModify(GlbParmCfg0, 1'u32 shl 13, swap.uint32 shl 13)
 
 # =============================================================================
 # I2C clock configuration
@@ -292,11 +324,22 @@ proc enableI2cClock*() =
 # =============================================================================
 # DMA clock configuration
 # =============================================================================
+const
+  CgenMDma = 3                          # CGEN_CFG0: gate shared by DMA0 and DMA1
+  DmaChannelGates = 0xFF'u32 shl 24     # DMA_CFG0 / DMA_CFG1: one bit per channel
+
 proc enableDma0Clock*() =
-  regSet(GlbDmaCfg0, 1'u32 shl 24)
+  ## Clock DMA0: the two gates the vendor's GLB_PER_Clock_UnGate opens for
+  ## it and every channel's own gate (GLB_Set_DMA_CLK; all set at reset).
+  regSet(GlbCgenCfg0, 1'u32 shl CgenMDma)
+  enablePeriphClock(periphDma)
+  regSet(GlbDmaCfg0, DmaChannelGates)
 
 proc enableDma1Clock*() =
-  regSet(GlbDmaCfg0, 1'u32 shl 25)
+  ## Clock DMA1: the shared gate and its channel gates, which are in
+  ## DMA_CFG1 (the bits in DMA_CFG0 belong to DMA0's channels).
+  regSet(GlbCgenCfg0, 1'u32 shl CgenMDma)
+  regSet(GlbDmaCfg1, DmaChannelGates)
 
 # =============================================================================
 # MCU system clock configuration
@@ -623,6 +666,88 @@ proc auPllEnable*() =
 proc auPllDisable*() =
   regWrite(GlbAuPllCfg0, 0)
 
+type
+  AudioPllVco* = enum
+    ## The two audio PLL settings the vendor SDK provides. The post divider
+    ## brings each down to the usual audio master clock.
+    auPll442M368   ## 442.368 MHz / 18 = 24.576 MHz: 8/12/16/24/32/48/96 kHz
+    auPll451M584   ## 451.584 MHz / 20 = 22.5792 MHz: 11.025/22.05/44.1/88.2 kHz
+
+const
+  # AUPLL_CFG0 fields (cci_reg.h)
+  AuPllSdmRstb     = 0
+  AuPllFbdvRstb    = 2
+  AuPllPuSfreg     = 9
+  AuPllPu          = 10
+
+  # Vendor audioPllCfg_442P368M / audioPllCfg_451P584M: the fractional
+  # multiplier (sdmin, /2048) per crystal, indexed by XtalType.
+  AuPllSdmin: array[AudioPllVco, array[xtal24m..xtalRc32m, uint32]] = [
+    [0x126E9'u32, 0x1BA5E, 0x170A3, 0x161E5, 0x1103A, 0x1BA5E],
+    [0x12D0E'u32, 0x1C395, 0x17851, 0x16944, 0x115E5, 0x1C395]]
+  AuPllPostDiv: array[AudioPllVco, uint32] = [0x12'u32, 0x14]
+  XtalHz: array[xtal24m..xtalRc32m, uint32] = [
+    24_000_000'u32, 32_000_000, 38_400_000, 40_000_000, 26_000_000, 32_000_000]
+
+func auPllRefDiv(xtal: XtalType): uint32 =
+  ## Reference divider: the PLL compares at 8..13 MHz.
+  if xtal in {xtal24m, xtal26m}: 2 else: 4
+
+func audioPllFor*(sampleRate: uint32): AudioPllVco =
+  ## The PLL setting whose clock divides evenly to `sampleRate`.
+  if sampleRate mod 11_025 == 0: auPll451M584 else: auPll442M368
+
+func audioPllHz*(vco: AudioPllVco, xtal: XtalType = xtal40m): uint32 =
+  ## The audio PLL's post-divided output for `vco`: the clock
+  ## `setI2sRefClock` divides for the I2S block. Nominally 24.576 or
+  ## 22.5792 MHz, exact to the PLL's fractional resolution (a few ppm).
+  ## 0 for `xtalNone`.
+  if xtal == xtalNone: return 0
+  uint32(uint64(XtalHz[xtal] div auPllRefDiv(xtal)) * AuPllSdmin[vco][xtal] div
+         2048 div AuPllPostDiv[vco])
+
+proc configAudioPll*(vco: AudioPllVco, xtal: XtalType = xtal40m): bool =
+  ## Power the audio PLL down, program it for `vco` from the crystal (or
+  ## RC32M) and power it up again, with outputs div1/2/2.5/5/6 enabled
+  ## (GLB_Config_AUDIO_PLL). False, with nothing changed, for `xtalNone`.
+  ## The delays are several times the vendor's minimums because `delayUs`
+  ## is calibrated for the 32 MHz boot clock.
+  if xtal == xtalNone: return false
+  regClear(GlbAuPllCfg0, 1'u32 shl AuPllPu)
+  regClear(GlbAuPllCfg0, 1'u32 shl AuPllPuSfreg)
+
+  # Reference: crystal = 0, RC32M = 3; then the divider
+  regModify(GlbAuPllCfg1, 0x03'u32 shl 16,
+            (if xtal == xtalRc32m: 3'u32 else: 0'u32) shl 16)
+  regModify(GlbAuPllCfg1, 0x0F'u32 shl 8, auPllRefDiv(xtal) shl 8)
+  # int_frac_sw = 1, icp_1u = 1, icp_5u = 0
+  regModify(GlbAuPllCfg2, (1'u32 shl 8) or (0x03'u32 shl 6) or (0x03'u32 shl 4),
+            (1'u32 shl 8) or (1'u32 shl 6))
+  # rz = 5, cz = 2, c3 = 2, r4_short = 0, c4_en = 1
+  regModify(GlbAuPllCfg3, (0x07'u32 shl 16) or (0x03'u32 shl 14) or
+                          (0x03'u32 shl 12) or (1'u32 shl 8) or 1'u32,
+            (5'u32 shl 16) or (2'u32 shl 14) or (2'u32 shl 12) or 1'u32)
+  regModify(GlbAuPllCfg4, 0x03'u32, 1)             # sel_sample_clk
+  regModify(GlbAuPllCfg5, 0x07'u32, 3)             # vco_speed
+  # sdm_bypass = 0 and the multiplier
+  regModify(GlbAuPllCfg6, (1'u32 shl 24) or 0x7_FFFF'u32, AuPllSdmin[vco][xtal])
+
+  regSet(GlbAuPllCfg0, 1'u32 shl AuPllPuSfreg)
+  delayUs(40)                                      # > 2 us
+  regSet(GlbAuPllCfg0, 1'u32 shl AuPllPu)
+  delayUs(40)                                      # > 2 us
+  for bit in [AuPllSdmRstb, AuPllFbdvRstb]:        # pulse each reset low > 1 us
+    regSet(GlbAuPllCfg0, 1'u32 shl bit)
+    delayUs(20)
+    regClear(GlbAuPllCfg0, 1'u32 shl bit)
+    delayUs(20)
+    regSet(GlbAuPllCfg0, 1'u32 shl bit)
+
+  regModify(GlbAuPllCfg1, 0x7F'u32, AuPllPostDiv[vco])
+  regSet(GlbAuPllCfg8, 0x67'u32)                   # en_div1, 2, 2p5, 5, 6
+  delayUs(500)                                     # settle (> 45 us)
+  true
+
 # =============================================================================
 # PWM clock configuration
 # =============================================================================
@@ -648,6 +773,18 @@ proc setI2sClockDiv*(divider: uint32) =
 
 proc enableI2sClock*() =
   regSet(GlbI2sCfg0, 1'u32 shl 7)
+
+proc setI2sRefClock*(enable: bool, divider: uint32 = 0,
+                     diPinRefOut = false, doPinRefOut = false) =
+  ## Configure the I2S clock: audio PLL output (`audioPllHz`) /
+  ## (divider + 1), divider 0..63 (GLB_Set_I2S_CLK). `diPinRefOut` /
+  ## `doPinRefOut` turn the data-in / data-out pin into an output of this
+  ## clock (a codec's master clock) instead of its I2S function.
+  var v = divider and 0x3F
+  if diPinRefOut: v = v or (1'u32 shl 6)
+  if enable: v = v or (1'u32 shl 7)
+  if doPinRefOut: v = v or (1'u32 shl 8)
+  regModify(GlbI2sCfg0, 0x3F'u32 or (1'u32 shl 6) or (1'u32 shl 7) or (1'u32 shl 8), v)
 
 # =============================================================================
 # ADC clock configuration
