@@ -76,7 +76,6 @@ proc blOpsFunc(offset: int): pointer =
   else: nil
 template platformFree(p: pointer) = heapFree(p)
 proc rxMgtForget(p: pointer) = discard
-proc mmConnLossForget(p: pointer) = discard
 proc chanSwitchForget(p: pointer): bool = false
 proc smRspTimerForget(p: pointer) = discard
 proc smDisconnectStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length

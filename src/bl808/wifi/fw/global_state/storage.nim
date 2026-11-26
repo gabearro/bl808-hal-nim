@@ -297,7 +297,6 @@ var
   meControlFinalId: uint16
   meControlRequester: uint8
   mmTimIdentities {.wifiCtrl.}: ptr MmTimIdentityNode
-  mmConnLossTags {.wifiCtrl.}: ptr MmConnLossTag
   staDeleteEpochs: array[STA_MGMT_FREE_STAS, uint32]
   mmStaAddInProgress: array[MAX_VIFS, bool]
   mmStaAddVifEpoch: array[MAX_VIFS, uint32]

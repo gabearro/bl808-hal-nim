@@ -411,8 +411,6 @@ proc ke_evt_schedule*() {.exportc, cdecl.} =
 # ###########################################################################
 
 # TIM lifetime metadata shares the allocation but stays beyond the wire payload.
-proc mmConnLossForget(header: pointer)
-
 proc mmTimAllocationSize(id: uint16; destination: uint8; length: uint32): uint32 =
   if id != MM_TIM_UPDATE_REQ or destination != TASK_MM:
     return length
@@ -674,7 +672,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   # The channel switch's static request is never freed.
   if chanSwitchForget(param): return
   mmTimForget(param)
-  mmConnLossForget(param)
   rxMgtForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
@@ -2626,84 +2623,39 @@ proc mmVifCurrent(identity: MmVifIdentity): bool =
     vifChannelForIdx(identity.index).staIdx == identity.station and
     staDeleteEpoch(identity.station) == identity.stationEpoch
 
-proc mmConnLossTagAt(message: pointer): ptr MmConnLossTag =
-  const mask = alignof(MmConnLossTag).uint - 1
-  let start = cast[uint](message) + MmConnectionLossIndPayloadSize.uint +
-    KeMsgTailSlack.uint
-  cast[ptr MmConnLossTag]((start + mask) and not mask)
-
-proc mmConnLossForget(header: pointer) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  var link = addr mmConnLossTags
-  while link[] != nil:
-    if link[].header == header:
-      link[] = link[].next
-      return
-    link = addr link[].next
-
 proc mmConnLossProbeEpoch(reason: uint16; vif: uint8): uint32 {.inline.} =
   # A beacon proves downlink liveness, not that the AP ACKed our traffic.
   if reason == 22: mmTrafficProbeEpochs[vif] else: mmBeaconProbeEpochs[vif]
 
-proc mmConnLossTagFor(message: pointer): ptr MmConnLossTag =
-  let header = keMsgHdrFromPayload(message)
-  if header.id != MM_CONNECTION_LOSS_IND or header.destId != TASK_SM or
-      header.srcId != TASK_MM or
-      header.paramLen != MmConnectionLossIndPayloadSize:
-    return nil
-  var tag = mmConnLossTags
-  while tag != nil:
-    if tag.header == cast[pointer](header):
-      let ind = mmConnectionLossIndView(message)
-      if tag.consumed or
-          ind.vifIdx != tag.identity.index or ind.reason != tag.reason or
-          not mmVifCurrent(tag.identity) or
-          (tag.tracksProbe and mmConnLossProbeEpoch(tag.reason, tag.identity.index) != tag.probeEpoch):
-        return nil
-      return tag
-    tag = tag.next
+proc mmConnLossCurrent(ind: ptr MmConnLossInd): bool =
+  ## The VIF and AP station the loss was raised for are still there, and no
+  ## ACK or beacon has proved the link alive since (the probe's epoch).
+  let index = ind.wire.vifIdx
+  index < MAX_VIFS.uint8 and
+    mmVifCurrent(MmVifIdentity(vif: vifChannelForIdx(index), index: index,
+      epoch: ind.vifEpoch, station: ind.station,
+      stationEpoch: ind.stationEpoch, captured: true)) and
+    (not ind.tracksProbe or
+     mmConnLossProbeEpoch(ind.wire.reason, index) == ind.probeEpoch)
 
 proc mmPublishConnectionLoss(vifEntry: pointer; reason: uint16;
                              probeEpoch: ptr uint32) {.noinline.} =
+  ## Send MM_CONNECTION_LOSS_IND to SM for `vifEntry`, carrying what it was
+  ## raised for: SM drops it once that is no longer current. A probe's loss
+  ## passes the probe epoch it saw (`probeEpoch`).
   inc nimFwDbgConnLossInd
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let identity = mmCaptureVif(vifEntry)
-  let resetEpoch = txResetEpoch
-  let tracksProbe = probeEpoch != nil
-  let expectedProbe = if tracksProbe: probeEpoch[] else: 0'u32
-  template current(): bool =
-    mmVifCurrent(identity) and txResetEpoch == resetEpoch and
-      (not tracksProbe or mmConnLossProbeEpoch(reason, identity.index) == expectedProbe)
-  if not current(): return
-  template outside(body: untyped) =
-    irqRestore(saved)
-    try: body
-    finally: discard irqSave()
-  var ind: ptr MmConnectionLossIndPayload
-  outside:
-    const alignment = alignof(MmConnLossTag).uint32
-    const storageLength = MmConnectionLossIndPayloadSize + KeMsgTailSlack +
-      alignment - 1 + sizeof(MmConnLossTag).uint32
-    ind = cast[ptr MmConnectionLossIndPayload](
-      ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_SM, TASK_MM,
-                   storageLength))
+  let peer = mmCaptureVif(vifEntry)
+  if not peer.captured: return
+  let ind = cast[ptr MmConnLossInd](
+    ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_SM, TASK_MM, MmConnLossIndSize))
   if ind == nil: return
-  if not current():
-    outside: ke_msg_free_payload(ind)
-    return
-  let header = keMsgHdrFromPayload(ind)
-  header.paramLen = MmConnectionLossIndPayloadSize
-  ind.reason = reason
-  ind.vifIdx = identity.index
-  let tag = mmConnLossTagAt(ind)
-  tag[] = MmConnLossTag(next: mmConnLossTags, header: cast[pointer](header),
-    identity: identity, reason: reason,
-    tracksProbe: tracksProbe, probeEpoch: expectedProbe)
-  mmConnLossTags = tag
-  outside: ke_msg_send(ind)
+  ind[] = MmConnLossInd(
+    wire: MmConnectionLossIndPayload(reason: reason, vifIdx: peer.index),
+    vifEpoch: peer.epoch, station: peer.station, stationEpoch: peer.stationEpoch,
+    tracksProbe: probeEpoch != nil,
+    probeEpoch: if probeEpoch != nil: probeEpoch[] else: 0'u32)
+  ke_msg_send(ind)
 
 proc mm_send_connection_loss_ind*(vifEntry: pointer, reason: uint16) {.exportc, cdecl, noinline.} =
   ## Report connection loss without a TBTT probe freshness requirement.

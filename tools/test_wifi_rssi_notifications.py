@@ -31,7 +31,6 @@ var
   allocations: array[8, array[128, uint8]]
   headers: array[8, KeMsgHdr]
   txResetEpoch: uint32
-  mmConnLossTags: ptr MmConnLossTag
   ids: array[8, uint16]
   attempts, freed: int
   reports: seq[Report]
@@ -60,9 +59,7 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; length: uint32): pointer =
   doAssert slot < allocations.len
   doAssert src == 0
   doAssert (id == 0x43 and dst == 9 and length == 3) or
-           (id == 0x31 and dst == 4 and
-            length == MmConnectionLossIndPayloadSize + KeMsgTailSlack +
-              alignof(MmConnLossTag).uint32 - 1 + sizeof(MmConnLossTag).uint32)
+           (id == 0x31 and dst == 4 and length == MmConnLossIndSize)
   ids[slot] = id
   allocations[slot] = default(typeof(allocations[slot]))
   invoke(onAllocate)
@@ -103,7 +100,6 @@ proc setup(old = -50'i8; threshold = -60'i8; hysteresis = 7'u8; state = 0'u8) =
   clock = 100
   reportTime = 0
   txResetEpoch = 0
-  mmConnLossTags = nil
   enabled = true
 proc recycle() =
   inc rxVifEpochs[0]
@@ -117,7 +113,7 @@ def source() -> str:
     storage = (FW / "global_state/storage.nim").read_text()
     declarations = []
     for name in ("MmRssiStatusIndPayload", "MmConnectionLossIndPayload",
-                 "MmVifIdentity", "MmConnLossTag"):
+                 "MmVifIdentity", "MmConnLossInd"):
         match = re.search(rf"(?m)^  {name}(?: \{{\.packed\.\}})? = object\n(?:    [^\n]*\n)+", layout)
         assert match, name
         declarations.append(match.group(0))
@@ -131,15 +127,15 @@ type KeMsgHdr = object
 const
   MmRssiStatusIndPayloadSize = sizeof(MmRssiStatusIndPayload).uint32
   MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+  MmConnLossIndSize = sizeof(MmConnLossInd).uint32
   KeMsgTailSlack = 4'u32
   MM_CONNECTION_LOSS_IND = 0x31'u16
   TASK_SM = 4'u8
   TASK_MM = 0'u8
 ''' + PLATFORM
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    code += procedure(kernel, "mmConnLossTagAt")
-    for name in ("mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch", "mmPublishConnectionLoss",
-                 "mm_send_connection_loss_ind", "mm_check_rssi"):
+    for name in ("mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch", "mmConnLossCurrent",
+                 "mmPublishConnectionLoss", "mm_send_connection_loss_ind", "mm_check_rssi"):
         if re.search(rf"(?m)^proc {name}\*?\(", kernel):
             code += procedure(kernel, name)
     return code
@@ -268,18 +264,20 @@ doAssert reportTime == 2_500_000
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_connection_loss_is_bound_to_original_vif(tmp_path: Path, mode: str) -> None:
+    # The loss carries the VIF it was raised for (MmConnLossInd); SM
+    # drops it once the VIF has been recycled (mmConnLossCurrent).
     run_program(tmp_path, mode, source() + r'''
 for incoming in [false, true]:
-  setup()
-  enabled = incoming
-  mm_send_connection_loss_ind(addr vifs[0], 22)
-  doAssert reports == @[(0x31'u16, 0'u8, 0'u8, 0'u8, 22'u16)]
-  doAssert enabled == incoming
-  setup()
-  enabled = incoming
-  onAllocate = recycle
-  mm_send_connection_loss_ind(addr vifs[0], 22)
-  doAssert reports.len == 0 and freed == 1 and enabled == incoming
+  for recycled in [false, true]:
+    setup()
+    enabled = incoming
+    mm_send_connection_loss_ind(addr vifs[0], 22)
+    doAssert reports == @[(0x31'u16, 0'u8, 0'u8, 0'u8, 22'u16)]
+    doAssert enabled == incoming and freed == 0
+    let ind = cast[ptr MmConnLossInd](addr allocations[0][0])
+    doAssert not ind.tracksProbe and ind.vifEpoch == rxVifEpochs[0]
+    if recycled: recycle()
+    doAssert mmConnLossCurrent(ind) == not recycled
 setup()
 mm_send_connection_loss_ind(nil, 22)
 mm_check_rssi(nil, -50)
@@ -290,16 +288,23 @@ doAssert attempts == 0
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_station_replacement_on_same_vif_cancels_notification(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
-for loss in [false, true]:
-  for binding in [false, true]:
-    setup()
-    onAllocate = proc() =
-      if binding: vifs[0].staIdx = 1
-      else: inc stationEpochs[0]
-    if loss: mm_send_connection_loss_ind(addr vifs[0], 22)
-    else: mm_check_rssi(addr vifs[0], -75)
-    doAssert reports.len == 0 and freed == 1
-    doAssert vifs[0].rssiState == 0 and enabled
+for binding in [false, true]:
+  setup()
+  onAllocate = proc() =
+    if binding: vifs[0].staIdx = 1
+    else: inc stationEpochs[0]
+  mm_check_rssi(addr vifs[0], -75)
+  doAssert reports.len == 0 and freed == 1
+  doAssert vifs[0].rssiState == 0 and enabled
+# A connection loss carries the station: SM drops it once it is replaced.
+for binding in [false, true]:
+  setup()
+  mm_send_connection_loss_ind(addr vifs[0], 22)
+  let ind = cast[ptr MmConnLossInd](addr allocations[0][0])
+  doAssert reports.len == 1 and mmConnLossCurrent(ind)
+  if binding: vifs[0].staIdx = 1
+  else: inc stationEpochs[0]
+  doAssert not mmConnLossCurrent(ind)
 ''')
 
 
@@ -318,8 +323,11 @@ mm_check_rssi(addr vifs[0], -75)
 doAssert reports.len == 1 and reports[0].state == 0
 doAssert vifs[0].rssiState == 0 and enabled
 
+# A TX reset does not make a connection loss stale (nor did it at SM's
+# dispatch before); the loss is sent.
 setup()
-onAllocate = proc() = inc txResetEpoch
 mm_send_connection_loss_ind(addr vifs[0], 22)
-doAssert reports.len == 0 and freed == 1 and enabled
+inc txResetEpoch
+doAssert reports.len == 1 and freed == 0 and enabled
+doAssert mmConnLossCurrent(cast[ptr MmConnLossInd](addr allocations[0][0]))
 ''')

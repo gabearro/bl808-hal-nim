@@ -40,9 +40,7 @@ var
   schedules: seq[uint32]
   messages: seq[string]
   events: seq[string]
-  retireOnLog, retireOnSend: bool
-  resetOnSend: bool
-  replaceOnLog, clearOnArm: bool
+  resetOnSend, replaceOnSend, clearOnArm: bool
   delivery: MmTimerMutation
   interruptsEnabled: bool
   mutateFlagsOnSend: bool
@@ -52,11 +50,6 @@ proc vifMgmtEnvView(): ptr VifEnv = addr vifEnv
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc staDeleteEpoch(index: uint8): uint32 = stationEpochs[index]
-proc retireFirstVif() =
-  inc rxVifEpochs[0]
-  inc stationEpochs[1]
-  vifEnv.activeList.first = vifs[0].next
-  vifs[0].state = 0
 proc chan_is_on_channel(p: pointer): bool =
   for index in 0 ..< vifs.len:
     if p == addr vifs[index]:
@@ -99,8 +92,12 @@ proc txlSendUapsdTrigger(station: uint8; qos: uint16; callback: pointer): uint8 
   events.add("send:" & $station)
   if mutateFlagsOnSend and station == 1:
     vifs[0].flags = vifs[0].flags or 2'u32
-  if retireOnSend and station == 1:
-    retireFirstVif()
+  if replaceOnSend:
+    # The trigger's allocation recovery ran a PS commit that re-armed the
+    # timer: this delivery is cancelled.
+    replaceOnSend = false
+    delivery.cancelled = true
+    schedules.add(999)
   if resetOnSend:
     # The trigger's allocation recovery flushed AC3 and a protection
     # completion reset TX (PS-N2).
@@ -120,12 +117,6 @@ proc logWrite(level: uint32; tag, file: cstring; line: cint; format: cstring)
   doAssert length == 19
   messages.add($cast[cstring](addr output[0]))
   events.add("log")
-  if retireOnLog:
-    retireOnLog = false
-    retireFirstVif()
-  if replaceOnLog:
-    delivery.cancelled = true
-    schedules.add(999)
 proc getLogFunc(slot: int): pointer =
   doAssert slot == 204
   inc lookups
@@ -152,10 +143,8 @@ proc setup() =
   schedules.setLen(0)
   messages.setLen(0)
   events.setLen(0)
-  retireOnLog = false
-  retireOnSend = false
   resetOnSend = false
-  replaceOnLog = false
+  replaceOnSend = false
   clearOnArm = false
   delivery = default(MmTimerMutation)
   interruptsEnabled = true
@@ -163,7 +152,7 @@ proc setup() =
 '''
 
 
-def source(*, real_channel: bool = False) -> str:
+def source(*, real_channel: bool = False, mutation: str = "") -> str:
     layout = (FW / "layout_types.nim").read_text()
     logger_type = (FW / "global_state/c_runtime.nim").read_text().split("# Helper:", 1)[0]
     ps_type = "type\n  PsEnvView" + layout.split("  PsEnvView", 1)[1].split(
@@ -196,9 +185,17 @@ proc chanCtxtAt(p: pointer): ptr Channel = cast[ptr Channel](p)
             + procedure(mac, "mmVifCurrent")
             + procedure(power, "ps_uapsd_set")
             + procedure(power, "psUapsdTimerCurrent")
-            + procedure(power, "psUapsdPeerCurrent")
             + procedure(power, "psUapsdTriggerTid")
-            + procedure(power, "ps_uapsd_timer_handle"))
+            + timer_handle(power, mutation))
+
+
+def timer_handle(power: str, mutation: str) -> str:
+    body = procedure(power, "ps_uapsd_timer_handle")
+    if mutation == "unchecked_send":
+        old = ("        if not psUapsdTimerCurrent(delivery):\n          return\n")
+        assert body.count(old) == 1
+        body = body.replace(old, "")
+    return body
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -273,42 +270,6 @@ doAssert schedules == @[70'u32] and clockIndex == 5
 doAssert events == @["channel:0", "time:11", "send:1", "time:20",
                       "channel:1", "time:30", "send:2", "time:40",
                       "time:50", "schedule:70"]
-''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_callback_retirement_skips_stale_vif_and_continues(tmp_path: Path, mode: str) -> None:
-    for retire_at in ("log", "send"):
-        run_program(tmp_path, mode, source() + f'''
-setup()
-vifs[0].next = addr vifs[1]
-vifs[0].psLastTime = 0
-vifs[1].psLastTime = 0
-logging = true
-retireOnLog = {str(retire_at == "log").lower()}
-retireOnSend = {str(retire_at == "send").lower()}
-clocks = @[11'u32, 20, 30, 40]
-ps_uapsd_timer_handle()
-doAssert rxVifEpochs[0] == 1 and stationEpochs[1] == 1
-doAssert vifs[0].psLastTime == 0
-doAssert vifs[1].psLastTime == 30
-doAssert sends == {"@[(2'u8, 7'u16)]" if retire_at == "log" else "@[(1'u8, 7'u16), (2'u8, 7'u16)]"}
-doAssert schedules == @[60'u32] and clockIndex == clocks.len
-''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_retired_only_vif_stops_timer(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source() + r'''
-setup()
-logging = true
-retireOnLog = true
-vifs[0].psLastTime = 0
-clocks = @[11'u32]
-ps_uapsd_timer_handle()
-doAssert sends.len == 0 and schedules.len == 0
-doAssert ps.uapsdTimerActive == 0 and clockIndex == 1
-doAssert vifs[0].psLastTime == 0 and vifs[0].flags == 0x80000000'u32
 ''')
 
 
@@ -423,18 +384,34 @@ for marker in [3'u8, 4]:
 ''')
 
 
+REPLACED_IN_SEND = r'''
+# A PS commit inside the trigger's submission re-arms the timer: this
+# delivery stops there and leaves the new arm alone.
+setup()
+vifs[0].next = addr vifs[1]
+replaceOnSend = true
+clocks = @[111'u32, 112, 113, 114]
+ps_uapsd_timer_handle()
+doAssert delivery.cancelled and ps.uapsdTimerActive == 1
+doAssert sends == @[(1'u8, 7'u16)] and schedules == @[999'u32] and clockIndex == 1
+doAssert vifs[0].psLastTime == 100 and vifs[0].flags == 0x80000008'u32
+doAssert vifs[1].psLastTime == 100
+'''
+
+
+@pytest.mark.parametrize("mutation", ["", "unchecked_send"])
+def test_timer_replaced_inside_a_trigger_stops_the_old_delivery(tmp_path: Path, mutation: str) -> None:
+    if mutation:
+        with pytest.raises(AssertionError) as failure:
+            run_program(tmp_path, "checked", source(mutation=mutation) + REPLACED_IN_SEND)
+        assert "AssertionDefect" in str(failure.value)
+    else:
+        run_program(tmp_path, "checked", source() + REPLACED_IN_SEND)
+
+
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_reentrant_timer_replacement_preserves_new_state(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
-setup()
-logging = true
-replaceOnLog = true
-clocks = @[111'u32, 112, 113]
-ps_uapsd_timer_handle()
-doAssert delivery.cancelled and ps.uapsdTimerActive == 1
-doAssert sends.len == 0 and schedules == @[999'u32] and clockIndex == 1
-doAssert vifs[0].psLastTime == 100 and vifs[0].flags == 0x80000000'u32
-
 setup()
 ps.uapsdTimerActive = 0
 clearOnArm = true

@@ -488,13 +488,6 @@ proc psUapsdTimerCurrent(delivery: ptr MmTimerMutation): bool =
   ps.enabled != 0 and ps.uapsdTimerActive != 0 and
     (delivery == nil or not delivery.cancelled)
 
-proc psUapsdPeerCurrent(peer: MmVifIdentity;
-                        delivery: ptr MmTimerMutation): bool {.noinline.} =
-  if not psUapsdTimerCurrent(delivery) or not mmVifCurrent(peer):
-    return false
-  let vif = vifChannelAt(peer.vif)
-  vif.vifType == VIF_TYPE_STA and vif.state != 0 and (vif.uapsdBitmap and 0x0F) != 0
-
 proc psUapsdTriggerTid(bitmap: uint8): uint16 =
   # The installed bits are in hardware AC order: BK, BE, VI, VO.
   if (bitmap and 8) != 0: 7'u16
@@ -506,83 +499,55 @@ proc ps_uapsd_timer_handle*() {.exportc, cdecl.} =
   ## Trigger eligible STA VIFs after half a U-APSD period without activity.
   ## Vendor uses a signed, wrapped deadline comparison and samples MAC time
   ## separately for each VIF, after each submission, and before rearming.
+  ## Only a trigger's submission can run other firmware code: its frame
+  ## allocation's pool recovery runs TX callbacks, which can stop or re-arm
+  ## this timer (a PS commit) but cannot remove a VIF or a station. So only the
+  ## timer's own delivery is checked again after it.
   let saved = irqSave()
   let delivery = mmTimerActiveDelivery(psUapsdTimer())
   irqRestore(saved)
   let ps = psEnvView()
-  var visited: array[MAX_VIFS, bool]
+  if not psUapsdTimerCurrent(delivery):
+    return
   var foundAny = false
-  while true:
-    if not psUapsdTimerCurrent(delivery):
-      return
-    var vifPtr = cast[pointer](vifMgmtEnvView().activeList.first)
-    var vifIdx = MAX_VIFS.uint8
-    var inspected = 0
-    while vifPtr != nil and inspected < MAX_VIFS:
-      let candidate = vifChannelAt(vifPtr)
-      let candidateIdx = candidate.vifIdx
-      if candidateIdx < MAX_VIFS.uint8 and not visited[candidateIdx] and
-          cast[pointer](vifChannelForIdx(candidateIdx)) == vifPtr:
-        vifIdx = candidateIdx
-        break
-      vifPtr = candidate.next
-      inc inspected
-    if vifIdx == MAX_VIFS.uint8:
-      break
-    visited[vifIdx] = true
+  var vifPtr = cast[pointer](vifMgmtEnvView().activeList.first)
+  while vifPtr != nil:
     let vif = vifChannelAt(vifPtr)
-    if vif.vifType != VIF_TYPE_STA or vif.state == 0 or (vif.uapsdBitmap and 0x0F) == 0:
-      continue
     let staIdx = vif.staIdx
-    if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
-      continue
-    let peer = MmVifIdentity(vif: vifPtr, index: vifIdx, captured: true,
-      station: staIdx, epoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(staIdx))
-    template current(): bool =
-      psUapsdPeerCurrent(peer, delivery)
-    let onChannel = chan_is_on_operational_channel(vifPtr)
-    if not current():
-      continue
-    if not onChannel:
-      # A scan or ROC temporarily prevents TX; it does not retire this VIF.
-      when defined(bl808WifiBenchStaUapsd):
-        inc nimFwDbgUapsd.offChannel
+    if vif.vifType == VIF_TYPE_STA and vif.state != 0 and
+        (vif.uapsdBitmap and 0x0F) != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
       foundAny = true
-      continue
-    let halfPeriod = ps.uapsdPeriod shr 1
-    let macTime = macTimeNow()
-    if not current(): continue
-    let remaining = vif.psLastTime + halfPeriod - macTime
-    if cast[int32](remaining) < 0:
-      let logFn = getLogFunc(204)
-      if not current(): continue
-      if logFn != nil:
-        type LP = proc(level: uint32, tag, file: cstring, line: cint,
-                       format: cstring) {.cdecl, varargs.}
-        cast[LP](logFn)(1, nil, "ps.c", 567, "apsd timer: UAPSD\r\n")
-      if not current(): continue
-      let alreadyPending = (vif.flags and 8'u32) != 0
-      # Publish before submission so an inline receive can clear EOSP state.
-      vif.flags = vif.flags or 0x08'u32
-      let tid = psUapsdTriggerTid(vif.uapsdBitmap)
-      let callback: pointer =
-        when defined(bl808WifiBenchStaUapsd): cast[pointer](psUapsdProbeCfm)
-        else: nil
-      when defined(bl808WifiBenchStaUapsd):
-        inc nimFwDbgUapsd.attempted
-      let submitted = txlSendUapsdTrigger(staIdx, tid, callback) == 0
-      when defined(bl808WifiBenchStaUapsd):
+      # A scan or ROC temporarily prevents TX; it does not retire this VIF.
+      if not chan_is_on_operational_channel(vifPtr):
+        when defined(bl808WifiBenchStaUapsd):
+          inc nimFwDbgUapsd.offChannel
+      elif cast[int32](vif.psLastTime + (ps.uapsdPeriod shr 1) - macTimeNow()) < 0:
+        let logFn = getLogFunc(204)
+        if logFn != nil:
+          type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                         format: cstring) {.cdecl, varargs.}
+          cast[LP](logFn)(1, nil, "ps.c", 567, "apsd timer: UAPSD\r\n")
+        let alreadyPending = (vif.flags and 8'u32) != 0
+        # Publish before submission so an inline receive can clear EOSP state.
+        vif.flags = vif.flags or 0x08'u32
+        let tid = psUapsdTriggerTid(vif.uapsdBitmap)
+        let callback: pointer =
+          when defined(bl808WifiBenchStaUapsd): cast[pointer](psUapsdProbeCfm)
+          else: nil
+        when defined(bl808WifiBenchStaUapsd):
+          inc nimFwDbgUapsd.attempted
+        let submitted = txlSendUapsdTrigger(staIdx, tid, callback) == 0
+        when defined(bl808WifiBenchStaUapsd):
+          if not submitted:
+            inc nimFwDbgUapsd.rejected
+        if not psUapsdTimerCurrent(delivery):
+          return
         if not submitted:
-          inc nimFwDbgUapsd.rejected
-      if not current(): continue
-      if not submitted:
-        if not alreadyPending:
-          vif.flags = vif.flags and not 8'u32
-      else:
-        let sentTime = macTimeNow()
-        if not current(): continue
-        vif.psLastTime = sentTime
-    foundAny = true
+          if not alreadyPending:
+            vif.flags = vif.flags and not 8'u32
+        else:
+          vif.psLastTime = macTimeNow()
+    vifPtr = vif.next
   let timerTarget = if foundAny: macTimeNow() + ps.uapsdPeriod else: 0'u32
   let endSaved = irqSave()
   defer: irqRestore(endSaved)

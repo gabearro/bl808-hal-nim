@@ -165,7 +165,6 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
       ieLen > scan_probe_req_ie.ieData.len.uint32:
     return 0
   let totalLen = 26'u32 + ssid.length.uint32 + ieLen
-  let stamp = scanOwn.op.serial
   let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: 0xFF,
     vifEpoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(0xFF),
     resetEpoch: txResetEpoch)
@@ -173,8 +172,9 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
   let localMac = scanReq.localMac
   let ieBytes = scan_probe_req_ie.ieData
   # Pool recovery inside txl_frame_get completes queued frames and runs
-  # their callbacks. The frame is built from the copies above, for the dwell
-  # that is still live.
+  # their callbacks. None of them ends or aborts the dwell (they run no
+  # TASK_SCAN code), so the dwell is not re-checked; the frame is built from
+  # the copies above.
   let frame = txl_frame_get(totalLen)
   if frame == nil:
     return 1
@@ -183,9 +183,6 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
   frameDesc.vifIdx = vifIdx
   frameDesc.staInfoIdx = 0xFF
   if not txlFramePreparationCurrent(frameDesc, identity, generation):
-    return 0
-  if not opCurrent(scanOwn.op, stamp) or scan_env.abortFlag != 0:
-    txl_frame_release(frame, false)
     return 0
 
   let linkDesc = hostTxLinkDescAt(frameDesc.bufDesc)

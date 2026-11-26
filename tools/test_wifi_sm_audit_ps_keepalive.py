@@ -501,7 +501,9 @@ const
   KeMsgSaved = 2.cint
   VIF_TYPE_STA = 0'u8
   HW_ACTIVE = 3
-const MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+const
+  MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+  MmConnLossIndSize = sizeof(MmConnLossInd).uint32
 type
   Vif = object
     vifIdx, staIdx, vifType, state: uint8
@@ -517,7 +519,6 @@ var
   stationEpochs: array[16, uint32]
   mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   txResetEpoch: uint32
-  mmConnLossTags: ptr MmConnLossTag
   chanTbttTimerOwner, chanConnlessTimerOwner: tuple[valid: bool, resetEpoch: uint32]
   sent: seq[pointer]
   interruptsEnabled = true
@@ -534,7 +535,6 @@ proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
 proc mmConnectionLossIndView(p: pointer): ptr MmConnectionLossIndPayload =
   cast[ptr MmConnectionLossIndPayload](p)
-proc mmConnLossForget(header: pointer)
 proc ke_msg_alloc(id: uint16; destination, source: uint8; length: uint32): pointer =
   let header = cast[ptr KeMsgHdr](alloc0(sizeof(KeMsgHdr) + length.int + KeMsgTailSlack.int))
   header.id = id
@@ -543,9 +543,7 @@ proc ke_msg_alloc(id: uint16; destination, source: uint8; length: uint32): point
   header.paramLen = length
   cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
 proc ke_msg_free_payload(p: pointer) =
-  let header = keMsgHdrFromPayload(p)
-  mmConnLossForget(cast[pointer](header))
-  dealloc(header)
+  dealloc(keMsgHdrFromPayload(p))
 proc ke_msg_send(p: pointer) = sent.add(p)
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
@@ -580,14 +578,12 @@ proc smRegistrationPreserveAcrossChannelReset(previous: uint32) = discard
 
 def loss_source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    code = layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag",
-                   "MmConnectionLossIndPayload")
+    code = layouts("KeMsgHdr", "MmVifIdentity", "MmConnectionLossIndPayload",
+                   "MmConnLossInd")
     code += LOSS_PLATFORM
-    for name in ["mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch",
-                 "mmConnLossTagFor", "mmPublishConnectionLoss", "mm_send_connection_loss_ind"]:
+    for name in ["mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch", "mmConnLossCurrent",
+                 "mmPublishConnectionLoss", "mm_send_connection_loss_ind"]:
         code += procedure(kernel, name)
-    code += procedure(kernel[kernel.index("proc mmConnLossForget(header: pointer) ="):],
-                      "mmConnLossForget")
     code += owned_disconnect_source()
     code += procedure((FW / "task_handlers.nim").read_text(), "mm_connection_loss_ind_handler")
     code += procedure((FW / "power_save.nim").read_text(), "mm_ap_traffic_probe_cfm")
@@ -612,7 +608,6 @@ smState = SmIdleState
 let direct = exhaustKeepalive()
 doAssert handler(direct) == KeMsgConsumed and disconnects == 1 and lastReason == 22
 ke_msg_free_payload(direct)
-doAssert mmConnLossTags == nil
 
 # A scan's channel switch is processed before SM dispatches the indication.
 smState = SmIdleState

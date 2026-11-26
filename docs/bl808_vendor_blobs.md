@@ -7634,10 +7634,9 @@ none of this was flashed.
 
 `vif_mgmt_unregister` is the only place a VIF is removed. When it retires a
 STA VIF it now clears that VIF's bits in ME's `activeMask` and
-`psDisableMask` and calls `smStaVifRetired`, at every return once the
-removal is committed (a `defer` placed just before
-`rxInvalidateQuiescentVif`, so it runs after the TX completions and the
-supplicant's deinit inside the removal). If SM's attempt (states 1 to 9) or
+`psDisableMask` and calls `smStaVifRetired`, at every return once the removal is committed (a
+`defer` placed just before `rxInvalidateQuiescentVif`, so it runs after the
+TX completions and the supplicant's deinit inside the removal). If SM's attempt (states 1 to 9) or
 its teardown (state 10: deauthentication wait or cleanup) is on that VIF,
 it ends there, unreported (`smAbandon`): the messages SM holds are freed,
 the BSS batch and the activation are cancelled and SM goes idle, so every
@@ -7660,10 +7659,11 @@ lost. Consequences:
   supplicant callback and channel unlink of the cleanup's first step).
   `smSubmitScanRequest` keeps its type check: an FT request (`authType` 2)
   is admitted on a VIF of any type.
-- When the removal leaves `activeMask` or `psDisableMask` at zero, nothing
-  is sent to MM: MM stays active, or PS stays disabled, until the next ME
-  transition. The blob keeps the bit, so the remaining VIFs could never let
-  MM idle or re-enable PS.
+- ME releases the removed VIF's bits with the requests SM's cleanup would
+  have sent, so a mask left at zero idles MM or re-enables PS (stage 13b;
+  before, the bits were cleared and MM was told nothing until the next ME
+  transition). The blob keeps the bits, so the remaining VIFs could never
+  let MM idle or re-enable PS.
 - A removed VIF's stations stay valid, as pinned `vif_mgmt_unregister`
   leaves them, and the abandoned cleanup sends no `MM_STA_DEL_REQ` for the
   AP station. The removal empties the VIF's station list, so
@@ -7939,10 +7939,10 @@ the archive:
 - The re-checks after the traces, register reads, timer clear,
   `chan_scan_req`, `scan_set_channel_request` and `scan_get_scan_duration`
   are removed, as are `chan_scan_req`'s own after its traces: none of these
-  runs TASK_SCAN code. `scan_probe_req_tx` keeps one check, of the dwell's
-  stamp, after `txl_frame_get`, whose pool recovery runs TX callbacks. No
-  callback is known to end a dwell from there, so the check is a candidate
-  for removal.
+  runs TASK_SCAN code. `scan_probe_req_tx` no longer checks the dwell's
+  stamp after `txl_frame_get` either (stage 13b): the TX callbacks its pool
+  recovery runs run no TASK_SCAN code, so they cannot end or abort the
+  dwell.
 
 SCANU:
 
@@ -8164,13 +8164,12 @@ reset replay, re-checks, the clear-before-finalize order and saving
 requests during a dwell.
 
 Not done (stage 13): `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout` and the
-beacon-detect ROC keep their re-checks (`mmStaTimerCurrent`), `mm_tbtt_evt`
-its `mmTbttActive` guard, and the connection loss its tagged message
-(`MmConnLossTag`); `mm_ap_probe_cfm` and `mmStaBeaconProbeCfm` both remain.
-The U-APSD timer keeps its per-VIF re-checks. When the removal of a STA VIF
-leaves ME's `activeMask` or `psDisableMask` at zero, MM is still not idled
-and PS not re-enabled. A MAC recovery does not tell the AP PS's state after
-it flushed a transition's null (above).
+beacon-detect ROC keep their re-checks (`mmStaTimerCurrent`), and
+`mm_tbtt_evt` its `mmTbttActive` guard; `mm_ap_probe_cfm` and
+`mmStaBeaconProbeCfm` both remain. A MAC recovery does not tell the AP PS's state after it flushed a
+transition's null (above). The connection loss's tagged message and the
+U-APSD timer's per-VIF re-checks were done in stage 13b (see "Sweep,
+second pass").
 
 Host tests: `tools/test_wifi_ps_table.py` drives the real machine
 (`ps_machine.nim`, the transition procedures of `power_save.nim`,
@@ -8271,22 +8270,22 @@ count and was not shown to be redundant; and the
 one in `bl_reset_evt`.
 
 Not done (stage 13): the remaining message tags (`mmTim`, `rxMgt`,
-`chanUpdate`, `chanBcnRequest`, `mmEdca`, `smDisconnect` in `ke_msg_free`)
-and the connection loss's `MmConnLossTag` list (the plan's payload
-`{vif, sta, staEpoch, reason}`); `MM_SET_VIF_STATE_REQ` raising a STA VIF
+`chanUpdate`, `chanBcnRequest`, `mmEdca`, `smDisconnect` in `ke_msg_free`);
+`MM_SET_VIF_STATE_REQ` raising a STA VIF
 while SM is not in state 9 still changes nothing and is not answered, as in
 pinned `mm_hw_config_handler` (+0x3d0 clears s2 and returns through the
-state restore at +0x22a without a confirmation); `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout`, the
-beacon-detect ROC and the U-APSD trigger keep their re-checks and lock
+state restore at +0x22a without a confirmation); `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout` and the
+beacon-detect ROC keep their re-checks and lock
 juggling, `mm_tbtt_evt` its `mmTbttActive`, and `mm_ap_probe_cfm` and
-`mmStaBeaconProbeCfm` both remain; the `statusFlags` bit-3 mirror; SA Query
-on an `Op`; `scan_probe_req_tx`'s stamp check after `txl_frame_get` and
-`scanu_frame_handler`'s re-checks and IRQ masks; ME idling MM and
-re-enabling PS when the removal of a STA VIF leaves `activeMask` or
-`psDisableMask` at zero; retiring a removed VIF's stations; restricting
+`mmStaBeaconProbeCfm` both remain; SA Query
+on an `Op`; `scanu_frame_handler`'s re-checks and IRQ masks; retiring a
+removed VIF's stations; restricting
 `irqSave` to a whitelist and `txResetEpoch` to `tx_layer.nim`; and ending a
 rate trial on the first confirmation of any frame (`rc_update_counters`)
-rather than only when a frame reached the trial slot.
+rather than only when a frame reached the trial slot. The connection loss's
+tag list, ME's release of a removed STA VIF's bits, `scan_probe_req_tx`'s
+stamp check and the U-APSD trigger's per-VIF re-checks were done in the
+second pass (below).
 
 Host tests: `tools/test_wifi_timer_lifetime.py` (cases that set, cleared or
 flushed a timer from the allocator, the free, the hardware programming or an
@@ -8307,6 +8306,100 @@ STA timers), `tools/test_wifi_task_state.py` (no longer pins `mmState`) and
 `sm_drain_stale_sent_messages`). The model fuzzers passed with seed 808
 (256 steps) and seed 13013 (1024 steps). The M0 HTTP server manifest built;
 none of this was flashed.
+
+#### Sweep, second pass (stage 13b)
+
+Differences from the archive and from the port before:
+
+- ME and the removal of a STA VIF: unchanged. `vif_mgmt_unregister` still
+  clears the VIF's bits in `activeMask` and `psDisableMask` itself and tells
+  MM nothing, so when the host removes a STA interface without
+  disconnecting first, MM stays active and PS disabled until ME's next
+  transition (the pinned function leaves the bits set). Having ME send
+  itself `ME_SET_PS_DISABLE_REQ(0)` and `ME_SET_ACTIVE_REQ(0)` was tried and
+  withdrawn: those requests have no reserved reply, so heap pressure turns
+  into a MAC recovery, and one saved while ME is busy can run after a new
+  VIF at the same index has set its bit and clear it.
+- `MM_CONNECTION_LOSS_IND` carries what it was raised for (`MmConnLossInd`,
+  `layout_types.nim`): after the blob's four bytes (reason, VIF index), the
+  generations of the VIF and of its AP station and, for a TBTT or traffic
+  probe's loss, the probe epoch that a later beacon or ACK advances.
+  `mm_connection_loss_ind_handler` drops an indication whose VIF, station
+  or probe has moved on (`mmConnLossCurrent`), also one saved while SM was
+  busy. The tag list (`MmConnLossTag`, `mmConnLossTags`), its lookup, its
+  `consumed` flag and its hook in `ke_msg_free` (`mmConnLossForget`) are
+  gone. The message goes only from MM to SM, so the longer payload reaches
+  no host. `mmPublishConnectionLoss` no longer takes the IRQ lock nor checks
+  the VIF and the TX reset epoch again after the allocation, which runs no
+  firmware code; a TX reset never made a queued loss stale at SM either.
+  Pinned `mm_send_connection_loss_ind` sends the four bytes and
+  `sm_task.o:mm_connection_loss_ind_handler` checks only the VIF's type and
+  state.
+- `scan_probe_req_tx` no longer checks the dwell's stamp and the abort flag
+  after `txl_frame_get`. The pool recovery there runs TX callbacks, and
+  none of them runs TASK_SCAN code: a dwell is started, ended and aborted
+  only by TASK_SCAN's message handlers and SCANU's frame handler. The blob
+  has no check. The frame's own identity check (`txlFramePreparationCurrent`)
+  stays.
+- `ps_uapsd_timer_handle` walks the VIF list once, as `ps.o` does, and
+  checks again only its own delivery (`psUapsdTimerCurrent`), after a
+  trigger's submission: that submission's pool recovery can run a PS commit
+  that stops or re-arms the timer. The re-checks of each VIF and station
+  after the channel check, the clock reads, the log call and the
+  submission, the visited set with its restart from the head of the list,
+  and `psUapsdPeerCurrent` are removed; none of those calls can remove a
+  VIF or a station. The `statusFlags` bit-3 mirror stays: it is the nap gate
+  of `bl_sleep_schedule` (`statusFlags == 0`).
+
+Not done (stage 13b):
+
+- A removed VIF's stations still stay valid until `MM_RESET`, as pinned
+  `vif_mgmt_unregister` leaves them (see "SM and the removal of its VIF"
+  above). Retiring them inside the removal means running `mm_sta_del`'s
+  key and address deletion, with its 100 ms retry, before the VIF entry is
+  zeroed and under identities the removal itself advances; that was not
+  attempted.
+- SA Query keeps its serial, reset scope and the special case in the
+  kernel timer expiry instead of an `Op`.
+- `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout` and the beacon-detect ROC keep
+  their re-checks and lock juggling, `mm_tbtt_evt` its `mmTbttActive`, and
+  `mm_ap_probe_cfm` and `mmStaBeaconProbeCfm` both remain.
+- `scanu_frame_handler` keeps its re-checks and IRQ masks.
+- The other message tags (`mmTim`, `rxMgt`, `chanUpdate`, `chanBcnRequest`,
+  `mmEdca`, `smDisconnect`) keep their hooks in `ke_msg_free`. `mmEdca` and
+  `chanBcnRequest` hold one message in flight at a time and learn that it is
+  gone only from the hook, so a payload stamp alone would not replace them.
+  The ad-hoc `ke_reschedule_saved_messages(TASK_MM)` calls stay: each
+  releases the MM requests saved behind a resource it frees, as the
+  critique of the plan found (an AP stop ending, `apmFinishStop` and the
+  failed-start branch of `apm_start_cfm`, for an `MM_REMOVE_IF_REQ` saved
+  by `apmPrepareVifRemoval`; a PS transition ending, `psFinish` and
+  `psCancel`; the station delete retry, `mmStaDelRetryCb`, for an
+  `MM_STA_DEL_REQ` saved behind it; and the MAC recovery, `bl_reset_evt`).
+  No other event releases those requests.
+- The rate trial still ends only when a frame reached the trial slot, and
+  feedback for frames in flight is still dropped at a sample-table epoch
+  change (the vendor's `rc_update_counters` ends the trial at the first
+  confirmation of any frame). Matching it was not attempted in this pass.
+
+Host tests: `tools/test_wifi_handler_contracts.py` (the real producer and
+handler: saved until idle, dropped after a VIF, station or probe change, a
+malformed or wire-only message; removing the handler's check is caught),
+`tools/test_wifi_loss_model_fuzzer.py` (allocation-time faults that cannot
+happen were removed; the stale-probe mutation now removes the probe epoch
+from `mmConnLossCurrent`), `tools/test_wifi_rssi_notifications.py`,
+`tools/test_wifi_message_producers.py`,
+`tools/test_wifi_sm_audit_ps_keepalive.py`,
+`tools/test_wifi_message_routing.py` (one hook fewer in `ke_msg_free`),
+`tools/test_wifi_probe_lifetime.py` (the cases that started a new dwell from
+the pool recovery, which cannot happen, and their mutation were removed) and
+`tools/test_wifi_uapsd_timer.py` (the cases that retired a VIF from the log
+call or the submission, or replaced the timer from the log call, which
+cannot happen, were removed; a timer replaced inside the submission stops
+the old delivery, and removing that check is caught). The model fuzzers
+passed with seed 808 (256 steps) and seed 13013 (1024 steps). The M0 HTTP
+server manifest built, also with `-d:bl808WifiOpCheck` and with
+`-d:bl808WifiBenchStaUapsd`; none of this was flashed.
 
 ## BLE
 

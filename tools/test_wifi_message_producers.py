@@ -85,7 +85,6 @@ proc sta_mgmt_send_postponed_frame(vif, sta: pointer; budget: uint32): uint32 =
   inc postponedCalls
   0
 proc reset() =
-  mmConnLossTags = nil
   messageCount = 0
   messageId = 0
   destination = 0
@@ -102,7 +101,8 @@ for index in [0'u8, 1]:
     vifs[index] = Vif(vifIdx: index)
     mm_send_connection_loss_ind(addr vifs[index], reason)
     doAssert messageCount == 1 and messageId == 49
-    doAssert destination == 4 and source == 0 and messageLength == 4
+    # SM-internal: the blob's four bytes, then what the loss was raised for.
+    doAssert destination == 4 and source == 0 and messageLength == MmConnLossIndSize
     doAssert allocation[0] == (reason and 255).uint8
     doAssert allocation[1] == (reason shr 8).uint8 and allocation[2] == index
 
@@ -140,13 +140,13 @@ def test_message_producers_use_vendor_wire_contracts(tmp_path: Path) -> None:
     layout = (base / "layout_types.nim").read_text()
     types = "type\n"
     for name in ["MmConnectionLossIndPayload", "MmTrafficReqIndPayload",
-                 "MmVifIdentity", "MmConnLossTag"]:
-        types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
+                 "MmVifIdentity", "MmConnLossInd"]:
+        types += "  " + name + layout.split("  " + name + " ", 1)[1].split("\n\n  ", 1)[0] + "\n"
     types += "const\n  MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32\n"
+    types += "  MmConnLossIndSize = sizeof(MmConnLossInd).uint32\n"
     types += "  MmTrafficReqIndPayloadSize = sizeof(MmTrafficReqIndPayload).uint32\n"
-    types += "var mmConnLossTags: ptr MmConnLossTag\n"
     helpers = "".join(procedure(kernel, name) for name in
-                      ["mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch",
+                      ["mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch",
                        "mmResetBeaconProbeCount"])
     loss = "proc mmPublishConnectionLoss" + kernel.split(
         "proc mmPublishConnectionLoss", 1

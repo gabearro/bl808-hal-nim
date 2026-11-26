@@ -178,25 +178,24 @@ for irq in [false, true]:
       else:
         checkFrame(currentFrame, 5, 31)
 
-# The pool's recovery callback can publish a new request at the same address,
-# or change shared IEs without replacing this request. Only the latter is valid.
+# The pool's recovery runs TX callbacks, none of which runs TASK_SCAN code:
+# they cannot end or abort the dwell, so it is not re-checked. A change of
+# the frame's identity (here its VIF's generation) still drops the frame, and
+# shared IEs rewritten meanwhile do not reach it.
 for irq in [false, true]:
-  for change in 0 .. 3:
+  for change in 0 .. 1:
     setup(irq, 4)
     onRecovery = proc() =
       onRecovery = nil
-      case change
-      of 0: newDwell(addr request, 9)
-      of 1: newDwell(addr otherRequest, 9)
-      of 2: inc rxVifEpochs[1]
+      if change == 0: inc rxVifEpochs[1]
       else:
         for byte in scan_probe_req_ie.ieData.mitems: byte = 0xDD
       txl_frame_release(held[0], false)
     currentFrame = held[0]
     let rc = scan_probe_req_tx()
     doAssert interruptsEnabled == irq
-    doAssert pushes == (change == 3).int
-    if change == 3:
+    doAssert pushes == change
+    if change == 1:
       doAssert rc == 0
       checkFrame(currentFrame, 5, 31)
 
@@ -250,7 +249,7 @@ for irq in [false, true]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "count", "ssid", "ies", "binding", "request",
+@pytest.mark.parametrize("mutation", [None, "count", "ssid", "ies", "binding",
                                       "snapshot", "handoff", "unlocked"])
 def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
@@ -277,9 +276,6 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
         probe = probe.replace("ieLen > scan_probe_req_ie.ieData.len.uint32", "false")
     elif mutation == "binding":
         probe = probe.replace("  frameDesc.vifIdx = vifIdx\n  frameDesc.staInfoIdx = 0xFF\n", "")
-    elif mutation == "request":
-        assert "not opCurrent(scanOwn.op, stamp)" in probe
-        probe = probe.replace("not opCurrent(scanOwn.op, stamp)", "false")
     elif mutation == "snapshot":
         probe = probe.replace("unsafeAddr ieBytes[0]", "addr scan_probe_req_ie.ieData[0]")
     elif mutation == "handoff":

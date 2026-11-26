@@ -67,7 +67,8 @@ NOT_ANSWERS = {
     "sm_connect_req_handler": "host request (admission)",
     "sm_disconnect_req_handler": "host request, stamped with its VIF's generation",
     "sm_connect_abort_req_handler": "host request, answered in place",
-    "mm_connection_loss_ind_handler": "MM indication, checked against its tag",
+    "mm_connection_loss_ind_handler": "MM indication, checked against the VIF, station "
+                                      "and probe epoch it carries",
     "rxu_mgt_ind_handler_sm": "frame from the air; the auth response is matched "
                               "to the operation's stamp (smAuthResponseMatches)",
 }

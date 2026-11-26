@@ -67,7 +67,6 @@ proc mmTimAllocationSize(id: uint16; destination: uint8; length: uint32): uint32
 proc mmTimRegisterAllocation(header: ptr KeMsgHdr) = discard
 proc mmTimCaptureMessage(header: ptr KeMsgHdr) = discard
 proc mmTimForget(header: pointer) = discard
-proc mmConnLossForget(header: pointer) = discard
 proc chanSwitchForget(header: pointer): bool = false
 proc smRspTimerForget(header: pointer) = discard
 proc smDisconnectStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length

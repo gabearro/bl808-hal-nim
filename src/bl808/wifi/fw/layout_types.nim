@@ -1553,14 +1553,6 @@ type
     index, station: uint8
     captured: bool
 
-  MmConnLossTag = object
-    next: ptr MmConnLossTag
-    header: pointer
-    identity: MmVifIdentity
-    probeEpoch: uint32
-    reason: uint16
-    consumed, tracksProbe: bool
-
   RxPayloadHwDescView {.packed.} = object
     magic*: uint32
     next*: pointer
@@ -1740,6 +1732,16 @@ type
     reason*: uint16
     vifIdx*: uint8
     vifIdxTailPadding*: uint8
+
+  MmConnLossInd = object
+    ## MM_CONNECTION_LOSS_IND as MM sends it to SM (it never reaches the
+    ## host): the blob's four bytes, then the generations of the VIF and AP
+    ## station it was raised for and, for a probe's loss, the probe epoch that
+    ## a later ACK or beacon advances (mmConnLossCurrent).
+    wire: MmConnectionLossIndPayload
+    vifEpoch, stationEpoch, probeEpoch: uint32
+    station: uint8
+    tracksProbe: bool
 
   MmPsChangeIndPayload {.packed.} = object
     staIdx*: uint8
@@ -2391,6 +2393,7 @@ const
   MmAddIfReqPayloadSize = sizeof(MmAddIfReqPayload).uint32
   MmRemoveIfReqPayloadSize = sizeof(MmRemoveIfReqPayload).uint32
   MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+  MmConnLossIndSize = sizeof(MmConnLossInd).uint32
   MmPsChangeIndPayloadSize = sizeof(MmPsChangeIndPayload).uint32
   MmSetPsOptionsReqPayloadSize = sizeof(MmSetPsOptionsReqPayload).uint32
   MmSetIdleReqPayloadSize = sizeof(MmSetIdleReqPayload).uint32

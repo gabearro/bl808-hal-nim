@@ -130,8 +130,10 @@ doAssert keMsgHandlerAddress(valid) == cast[pointer](valid)
 """)
 
 
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_connection_loss_is_saved_until_idle(tmp_path: Path, mode: str) -> None:
+def connection_loss_source(check: bool = True) -> str:
+    """The real producer and mm_connection_loss_ind_handler. The indication
+    carries the VIF, AP station and probe epoch it was raised for
+    (MmConnLossInd); `check` False removes the handler's check of them."""
     source = """
 const
   TASK_SM = 4'u8
@@ -146,10 +148,12 @@ const
   KeMsgSaved = 2.cint
   VIF_TYPE_STA = 0'u8
 """
-    source += layouts("KeMsgHdr", "MmVifIdentity", "MmConnLossTag",
-                      "MmConnectionLossIndPayload")
+    source += layouts("KeMsgHdr", "MmVifIdentity", "MmConnectionLossIndPayload",
+                      "MmConnLossInd")
     source += """
-const MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+const
+  MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+  MmConnLossIndSize = sizeof(MmConnLossInd).uint32
 type
   Vif = object
     vifIdx, staIdx, vifType, state: uint8
@@ -159,7 +163,6 @@ var
   stationEpochs: array[16, uint32]
   mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   txResetEpoch: uint32
-  mmConnLossTags: ptr MmConnLossTag
   sent: seq[pointer]
   onAlloc, onSmState: proc()
   interruptsEnabled = true
@@ -177,7 +180,6 @@ proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
 proc mmConnectionLossIndView(p: pointer): ptr MmConnectionLossIndPayload =
   cast[ptr MmConnectionLossIndPayload](p)
-proc mmConnLossForget(header: pointer)
 proc ke_msg_alloc(id: uint16; destination, source: uint8; length: uint32): pointer =
   let header = cast[ptr KeMsgHdr](alloc0(sizeof(KeMsgHdr) + length.int + KeMsgTailSlack.int))
   header.id = id
@@ -187,9 +189,7 @@ proc ke_msg_alloc(id: uint16; destination, source: uint8; length: uint32): point
   result = cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
   if onAlloc != nil: onAlloc()
 proc ke_msg_free_payload(p: pointer) =
-  let header = keMsgHdrFromPayload(p)
-  mmConnLossForget(cast[pointer](header))
-  dealloc(header)
+  dealloc(keMsgHdrFromPayload(p))
 proc ke_msg_send(p: pointer) = sent.add(p)
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
@@ -219,15 +219,19 @@ proc smCleanupBegin(vif: pointer; indication: pointer = nil; disconnected = fals
   true
 """
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    for name in ["mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch",
-                 "mmConnLossTagFor", "mmPublishConnectionLoss", "mm_send_connection_loss_ind"]:
+    for name in ["mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch",
+                 "mmConnLossCurrent", "mmPublishConnectionLoss", "mm_send_connection_loss_ind"]:
         source += procedure(kernel, name)
-    source += procedure(kernel[kernel.index("proc mmConnLossForget(header: pointer) ="):],
-                        "mmConnLossForget")
     source += owned_disconnect_source()
-    source += procedure((FW / "task_handlers.nim").read_text(),
-                        "mm_connection_loss_ind_handler")
-    source += """
+    handler = procedure((FW / "task_handlers.nim").read_text(), "mm_connection_loss_ind_handler")
+    if not check:
+        old = "  if not mmConnLossCurrent(ind):\n    return KeMsgConsumed\n"
+        assert handler.count(old) == 1
+        handler = handler.replace(old, "")
+    return source + handler
+
+
+CONNECTION_LOSS_CHECKS = """
 let handler: proc(param: pointer): cint {.cdecl.} = mm_connection_loss_ind_handler
 vifs[1] = Vif(vifIdx: 1, staIdx: 2, vifType: VIF_TYPE_STA, state: 1)
 proc nextIndication(): pointer =
@@ -235,18 +239,15 @@ proc nextIndication(): pointer =
   mm_send_connection_loss_ind(addr vifs[1], 0x1234)
   doAssert sent.len == oldLength + 1
   result = sent.pop()
-  doAssert keMsgHdrFromPayload(result).paramLen == MmConnectionLossIndPayloadSize
-  doAssert mmConnLossTags != nil
+  doAssert keMsgHdrFromPayload(result).paramLen == MmConnLossIndSize
 proc release(p: pointer) =
   ke_msg_free_payload(p)
-  doAssert mmConnLossTags == nil
 
 state = SmIdleState
 let immediate = nextIndication()
 doAssert handler(immediate) == KeMsgConsumed
 doAssert state == SmDisconnectingState and disconnects == 1 and tlvCalls == 1
 doAssert lastVif == cast[pointer](addr vifs[1]) and lastReason == 0x1234
-doAssert handler(immediate) == KeMsgConsumed and disconnects == 1
 release(immediate)
 
 for invalidation in 0 .. 3:
@@ -274,19 +275,17 @@ for busyState in 1'u16 .. 10'u16:
   doAssert disconnects == count + 1 and state == SmDisconnectingState
   release(pending)
 
-for mutation in 0 .. 6:
+for mutation in 0 .. 4:
   state = SmIdleState
   let malformed = nextIndication()
   let header = keMsgHdrFromPayload(malformed)
   let ind = mmConnectionLossIndView(malformed)
   case mutation
-  of 0: ind.reason = 0x4321
-  of 1: ind.vifIdx = 255
-  of 2: header.paramLen = 3
-  of 3: header.id = 0
-  of 4: header.destId = 0
-  of 5: header.srcId = 1
-  else: header.paramLen = 5
+  of 0: ind.vifIdx = 255
+  of 1: ind.vifIdx = 0            # another VIF
+  of 2: header.paramLen = MmConnLossIndSize - 1
+  of 3: header.srcId = 1
+  else: header.paramLen = MmConnLossIndSize + 1
   let count = disconnects
   doAssert handler(malformed) == KeMsgConsumed
   doAssert disconnects == count and state == SmIdleState
@@ -300,16 +299,12 @@ doAssert handler(inactive) == KeMsgConsumed and disconnects == count
 release(inactive)
 vifs[1].state = 1
 
-let untagged = ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_SM, TASK_MM,
+# The blob's four bytes alone are not MM's indication.
+let wireOnly = ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_SM, TASK_MM,
                             MmConnectionLossIndPayloadSize)
-mmConnectionLossIndView(untagged).vifIdx = 1
-doAssert handler(untagged) == KeMsgConsumed and disconnects == count
-release(untagged)
-
-onAlloc = proc() = inc rxVifEpochs[1]
-mm_send_connection_loss_ind(addr vifs[1], 0x1234)
-doAssert sent.len == 0 and mmConnLossTags == nil
-onAlloc = nil
+mmConnectionLossIndView(wireOnly).vifIdx = 1
+doAssert handler(wireOnly) == KeMsgConsumed and disconnects == count
+release(wireOnly)
 doAssert tlvCalls == disconnects
 
 # A newer beacon or ACK retires a queued probe loss even on the same VIF.
@@ -334,12 +329,6 @@ for replay in [false, true]:
     if not recoveredHere: doAssert lastReason == 16
     release(pending)
 
-var probe = mmBeaconProbeEpochs[1]
-onAlloc = proc() = inc mmBeaconProbeEpochs[1]
-mmPublishConnectionLoss(addr vifs[1], 16, addr probe)
-doAssert sent.len == 0 and mmConnLossTags == nil
-onAlloc = nil
-
 # State 10 is published only after the cleanup has claimed the link.
 state = SmIdleState
 let atTransition = nextIndication()
@@ -351,4 +340,17 @@ doAssert handler(atTransition) == KeMsgConsumed and state == SmDisconnectingStat
 onSmState = nil
 release(atTransition)
 """
-    run_program(tmp_path, mode, source)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_connection_loss_is_saved_until_idle(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, connection_loss_source() + CONNECTION_LOSS_CHECKS)
+
+
+def test_connection_loss_check_is_load_bearing(tmp_path: Path) -> None:
+    """Without the handler's check, a loss raised for a VIF or station that
+    has since changed, or disproved by a later beacon, ends the new link."""
+    with pytest.raises(AssertionError) as failure:
+        run_program(tmp_path, "checked",
+                    connection_loss_source(check=False) + CONNECTION_LOSS_CHECKS)
+    assert "AssertionDefect" in str(failure.value)

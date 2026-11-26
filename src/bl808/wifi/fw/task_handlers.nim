@@ -849,22 +849,23 @@ proc mm_connection_loss_ind_handler*(param: pointer): cint {.exportc, cdecl, dis
   ## Blob: ke_state_get(SM), check VIF type/active, ke_state_set(SM,10),
   ## sm_connection_tlv_set, sm_disconnect_process(vif, reason, 0xFFFF).
   ## Here sm_disconnect_process enters state 10 once its cleanup has claimed
-  ## the link.
+  ## the link. The indication carries the VIF and AP station it was raised
+  ## for (MmConnLossInd); one that is no longer current is dropped,
+  ## also when it was saved while SM was busy and a new link has started.
   if param == nil: return KeMsgConsumed
-  let tag = mmConnLossTagFor(param)
-  if tag == nil:
+  let header = keMsgHdrFromPayload(param)
+  if header.srcId != TASK_MM or header.paramLen != MmConnLossIndSize:
     return KeMsgConsumed
-  # The saved-message queue can retry this indication after a new connection
-  # starts. Check its producer identity before asking the kernel to save it.
+  let ind = cast[ptr MmConnLossInd](param)
+  if not mmConnLossCurrent(ind):
+    return KeMsgConsumed
   if ke_state_get(TASK_SM) != SmIdleState:
     return KeMsgSaved
-  let vif = tag.identity.vif
-  let reason = tag.reason
-  tag.consumed = true
-  if vifChannelAt(vif).vifType != VIF_TYPE_STA or vifChannelAt(vif).state == 0:
+  let vif = vifChannelForIdx(ind.wire.vifIdx)
+  if vif.vifType != VIF_TYPE_STA or vif.state == 0:
     return KeMsgConsumed
   sm_connection_tlv_set()
-  sm_disconnect_process(vif, reason, 0xFFFF'u16)
+  sm_disconnect_process(cast[pointer](vif), ind.wire.reason, 0xFFFF'u16)
   return 0
 
 proc mm_bss_param_setting_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =

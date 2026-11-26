@@ -30,7 +30,7 @@ type
     vifIdx, staIdx, vifType, state: uint8
     beaconTimeoutBase: uint32
   Fault = enum
-    noFault, oom, healDuringAllocation, replaceDuringAllocation, ackDuringAllocation
+    noFault, oom
   Allocation = tuple[header: pointer, id: int]
 var
   vifs: array[MAX_VIFS, Vif]
@@ -38,7 +38,6 @@ var
   stationEpochs: array[4, uint32]
   txResetEpoch, nimFwDbgConnLossInd, nimFwDbgDisconnectProcess: uint32
   sm: tuple[connectInfo, connectIndMsg: pointer, saQueryActive: uint8]
-  mmConnLossTags: ptr MmConnLossTag
   allocations: seq[Allocation]
   publishingId, dispatchingId: int
   actualDisconnects: seq[int]
@@ -46,7 +45,7 @@ var
   mm: tuple[keepAliveLimit: uint32]
   macNow: uint32
 
-proc mmConnLossForget(header: pointer)
+const MmConnLossIndSize = sizeof(MmConnLossInd).uint32
 proc mm_ap_traffic_probe_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.}
 proc mmEnvView(): ptr typeof(mm) = addr mm
 proc macTimeNow(): uint32 = macNow
@@ -62,7 +61,6 @@ proc messageId(header: pointer): int =
 proc ke_msg_free(p: pointer) =
   for i in 0 ..< allocations.len:
     if allocations[i].header == p:
-      mmConnLossForget(p)
       allocations.del(i)
       dealloc(p)
       return
@@ -75,15 +73,10 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; length: uint32): pointer =
   let header = cast[ptr KeMsgHdr](alloc0(sizeof(KeMsgHdr) + length.int))
   header[] = KeMsgHdr(id: id, destId: dst, srcId: src, paramLen: length)
   allocations.add((cast[pointer](header), publishingId))
-  case action
-  of healDuringAllocation: inc mmBeaconProbeEpochs[1]
-  of replaceDuringAllocation: inc rxVifEpochs[1]
-  of ackDuringAllocation: mm_ap_traffic_probe_cfm(addr vifs[1], 0x80800000'u32)
-  else: discard
   cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
 proc ke_msg_send(p: pointer) =
   let header = keMsgHdrFromPayload(p)
-  doAssert header.paramLen == MmConnectionLossIndPayloadSize
+  doAssert header.paramLen == MmConnLossIndSize
   co_list_push_back(addr keMsgQueueSent, cast[ptr CoListHdr](header))
   ke_evt_set(KE_EVT_KE_MESSAGE)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
@@ -155,7 +148,7 @@ proc exercise(trace: string; initialBusy: bool): string =
   keTaskDescs[TASK_SM].stateCount = 11
   defer:
     ke_flush()
-    doAssert allocations.len == 0 and mmConnLossTags == nil
+    doAssert allocations.len == 0
   var model: Model
   const busy = 1'u16
   proc stateChange(value: uint16; firmwareAlreadyChanged = false) =
@@ -200,11 +193,7 @@ proc exercise(trace: string; initialBusy: bool): string =
       inc model.nextId
       let action = model.nextFault
       model.nextFault = noFault
-      case action
-      of healDuringAllocation: inc model.current.evidence
-      of replaceDuringAllocation: inc model.current.association
-      else: discard
-      if action != oom and live(report, model.current): model.ready.add(report)
+      if action != oom: model.ready.add(report)
       publishingId = report.id
       if event == 'p':
         var epoch = mmBeaconProbeEpochs[1]
@@ -225,11 +214,8 @@ proc exercise(trace: string; initialBusy: bool): string =
     of 's':
       inc model.current.station
       inc stationEpochs[2]
-    of 'o', 'a', 'c':
-      fault = case event
-        of 'o': oom
-        of 'a': healDuringAllocation
-        else: replaceDuringAllocation
+    of 'o':
+      fault = oom
       model.nextFault = fault
     of 'r':
       inc model.current.reset
@@ -275,18 +261,16 @@ def loss_firmware_source(mutation: bool = False) -> str:
                               "proc ke_msg_free(p: pointer)\n")
     # owned_disconnect_source below supplies the real smAbandon.
     fixture = fixture.replace("proc smAbandon() = discard\n", "proc smAbandon()\n")
-    tag_lookup = procedure(kernel, "mmConnLossTagFor")
+    current = procedure(kernel, "mmConnLossCurrent")
     if mutation:
-        old = ("not mmVifCurrent(tag.identity) or\n"
-               "          (tag.tracksProbe and mmConnLossProbeEpoch(tag.reason, tag.identity.index) != tag.probeEpoch):")
-        assert old in tag_lookup
-        tag_lookup = tag_lookup.replace(old, "not mmVifCurrent(tag.identity):")
-    source = fixture + layouts("MmVifIdentity", "MmConnLossTag", "MmConnectionLossIndPayload") + PLATFORM
+        old = (" and\n    (not ind.tracksProbe or\n"
+               "     mmConnLossProbeEpoch(ind.wire.reason, index) == ind.probeEpoch)")
+        assert current.count(old) == 1
+        current = current.replace(old, "")
+    source = fixture + layouts("MmVifIdentity", "MmConnectionLossIndPayload", "MmConnLossInd") + PLATFORM
     source += "".join(procedure(kernel, name) for name in
-                      ("mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch"))
-    forget = kernel.index("proc mmConnLossForget(header: pointer) =")
-    source += procedure(kernel[forget:], "mmConnLossForget")
-    source += tag_lookup + procedure(kernel, "mmPublishConnectionLoss")
+                      ("mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch"))
+    source += current + procedure(kernel, "mmPublishConnectionLoss")
     source += procedure(kernel, "mm_send_connection_loss_ind")
     source += procedure((FW / "power_save.nim").read_text(), "mm_ap_traffic_probe_cfm")
     source += owned_disconnect_source()
@@ -304,7 +288,7 @@ proc checkTrafficLoss(recovery: int; saved: bool) =
   keTaskDescs[TASK_SM].stateCount = 11
   defer:
     ke_flush()
-    doAssert allocations.len == 0 and mmConnLossTags == nil
+    doAssert allocations.len == 0
   if saved: ke_state_set(TASK_SM, 1)
   mm.keepAliveLimit = 0
   publishingId = 140
@@ -328,24 +312,12 @@ proc checkTrafficLoss(recovery: int; saved: bool) =
     doAssert states[TASK_SM] == SmIdleState
   else:
     doAssert actualDisconnects == @[140], "retired loss without a matching traffic ACK"
-  doAssert allocations.len == 0 and mmConnLossTags == nil
+  doAssert allocations.len == 0
   doAssert not wifiMessagePendingWork()
 
 for saved in [false, true]:
   for recovery in 0 .. 3:
     checkTrafficLoss(recovery, saved)
-
-setup()
-actualDisconnects.setLen(0)
-vifs[1] = Vif(vifIdx: 1, staIdx: 2, state: 1)
-keTaskDescs[TASK_SM].stateCount = 11
-mm.keepAliveLimit = 0
-macNow = 199
-fault = ackDuringAllocation
-mm_ap_traffic_probe_cfm(addr vifs[1], 0x80010700'u32)
-doAssert vifs[1].beaconTimeoutBase == 199 and mm.keepAliveLimit == 10
-doAssert allocations.len == 0 and mmConnLossTags == nil
-doAssert actualDisconnects.len == 0 and not wifiMessagePendingWork()
 ''')
 
 
@@ -357,7 +329,7 @@ def test_station_loss_queue_model(tmp_path: Path, mutation: bool) -> None:
     rng = random.Random(seed ^ 0x4C4F5353)
     short = [(f"p{''.join(suffix)}", busy) for busy in (False, True)
              for n in range(4) for suffix in product("dhbuivsrl", repeat=n)]
-    random_cases = [("".join(rng.choices("ppllddddhbisvcruoa", k=rng.randint(8, 64))),
+    random_cases = [("".join(rng.choices("ppllddddhbisvruo", k=rng.randint(8, 64))),
                      bool(rng.getrandbits(1)))
                     for _ in range(steps)]
     source += f'echo "link loss seed={seed} cases={len(short) + len(random_cases)}"\n'
