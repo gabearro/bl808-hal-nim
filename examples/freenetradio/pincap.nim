@@ -27,8 +27,9 @@
 ##
 ## Firmware only.
 
-import bl808/[dma, gpio, core, mmio, i2s]
-import ./board, ./text, ./timebase, ./i2s_out, ./i2s_ring, ./httpd
+import bl808/[dma, gpio, core, mmio, i2s, timer, irq]
+import bl808/kernel/cps
+import ./board, ./text, ./timebase, ./i2s_out, ./i2s_ring, ./httpd, ./diag
 
 const
   Items {.intdefine: "pincapItems".} = 16
@@ -465,7 +466,177 @@ when HasHwCrypto:
       t.addInt us * 1000 div (8 * RecordLen div 16)
       t.add " ns per 16-byte block)\n"
 
+# ---- Profiler ------------------------------------------------------------------
+# A timer interrupt about 2000 times a second notes where the processor was.
+# `POST /selftest/profile` starts a run of `ProfileSamples`; `GET` returns the
+# program counters as little-endian words once it is full. With `?stall` the
+# run keeps the newest samples and stops when the stall probe (start it too)
+# sees a stall of 40 ms: `GET ...?info` then says which sample is the last. Match them to
+# functions with `riscv64-unknown-elf-nm -S` on the firmware's ELF. Code
+# that runs with interrupts off shows up at the point where they come back on.
+
+const
+  ProfileSamples = 16384
+  ProfilePeriod = 19_937'u32        # timer ticks at the 40 MHz crystal: 2006 Hz
+
+var
+  profile: ptr UncheckedArray[uint32]
+  profileCount: uint32
+  profileTimer: Timer
+  profileRunning: bool
+  profileCircular: bool     ## keep the newest samples until a stall freezes the run
+  profileStallUs: uint32    ## the stall that froze it
+
+proc profileIsr() {.cdecl.} =
+  profileTimer.clearInterrupt(timerCh2, 0)
+  if profileCircular:
+    profile[profileCount mod ProfileSamples] = csrReadMepc().uint32
+    inc profileCount
+  elif profileCount < ProfileSamples:
+    profile[profileCount] = csrReadMepc().uint32
+    inc profileCount
+  else:
+    profileTimer.disable(timerCh2)
+    profileRunning = false
+
+proc profileFreeze(stallUs: uint32) =
+  ## The stall probe saw a long stall: keep what led up to it.
+  if profileRunning and profileCircular:
+    profileTimer.disable(timerCh2)
+    profileRunning = false
+    profileStallUs = stallUs
+
+proc profileStart(circular: bool): bool =
+  if profile == nil:
+    profile = cast[ptr UncheckedArray[uint32]](allocShared0(ProfileSamples * 4))
+    if profile == nil: return false
+    profileTimer = initTimer(timer0)
+    registerTrapHandler(IrqM0Timer0Ch0, profileIsr)
+  if profileRunning: return false
+  profileCount = 0
+  profileCircular = circular
+  profileStallUs = 0
+  profileRunning = true
+  profileTimer.setupPeriodic(timerCh2, ProfilePeriod, timerClkXtal)
+  irqClearPending(IrqM0Timer0Ch0)
+  irqSetLevel(IrqM0Timer0Ch0, 1)
+  irqEnable(IrqM0Timer0Ch0)
+  true
+
+# ---- Stall probe ---------------------------------------------------------------
+# A task that does nothing but yield: the time between two of its turns is
+# how long everything else together (tasks, the kernel's poll hooks, the
+# Wi-Fi stack, interrupts) kept the processor. Turns further apart than
+# `StallUs` are logged with the time they ended.
+
+const
+  ProfileStallUs = 40_000'u64     # a stall this long freezes a `?stall` profile
+  StallUs = 15_000'u64
+  StallLog = 24
+
+var
+  probeOn: bool
+  stallAtMs: array[StallLog, uint32]
+  stallUs: array[StallLog, uint32]
+  stallCount: uint32
+  probeTurns: uint32
+  probeSinceMs: uint64
+
+proc probeTask(): CpsVoidFuture {.cps.} =
+  var last = nowUs()
+  var now = last
+  while probeOn:
+    await yieldNow()
+    now = nowUs()
+    inc probeTurns
+    if now - last > ProfileStallUs: profileFreeze(uint32(now - last))
+    if now - last > StallUs:
+      stallAtMs[stallCount mod StallLog] = uint32(now div 1000)
+      stallUs[stallCount mod StallLog] = uint32(now - last)
+      inc stallCount
+    last = now
+
+proc stallReport(t: var Text[960]; start: bool) =
+  if start and not probeOn:
+    probeOn = true
+    stallCount = 0
+    probeTurns = 0
+    probeSinceMs = nowMs()
+    discard probeTask()
+    t.add "probe started\n"
+    return
+  t.add "stalls over 15 ms: "
+  t.addInt stallCount
+  t.add " in "
+  t.addInt (nowMs() - probeSinceMs) div 1000
+  t.add " s, "
+  t.addInt probeTurns
+  t.add " turns; at ms / lasting us:\n"
+  let shown = min(stallCount, StallLog.uint32)
+  for i in 0'u32 ..< shown:
+    let k = (stallCount - shown + i) mod StallLog
+    t.addInt stallAtMs[k]
+    t.add '/'
+    t.addInt stallUs[k]
+    t.add ' '
+  t.add '\n'
+  if not start: probeOn = false
+
+var sliceSinceUs: uint64
+
+proc sliceReport(t: var Text[960]) =
+  ## The longest each task has held the processor since the last read, and
+  ## the longest the audio task was kept waiting (`/stats` shows that too).
+  const Names: array[TaskSlice, string] = ["audio step", "display draw", "display frame start",
+    "display frame end", "stream step", "http step", "controls step", "ntp step", "network step"]
+  let now = nowUs()
+  let span = max(now - sliceSinceUs, 1)
+  sliceSinceUs = now
+  var accounted = 0'u64
+  for slice in TaskSlice:
+    t.add Names[slice]
+    t.add ": longest "
+    t.addInt sliceMaxUs[slice]
+    t.add " us, "
+    t.addInt sliceTotalUs[slice] * 1000 div span
+    t.add " permille of the time\n"
+    accounted += sliceTotalUs[slice]
+    sliceMaxUs[slice] = 0
+    sliceTotalUs[slice] = 0
+  t.add "everything else (kernel, Wi-Fi, idle): "
+  t.addInt (span - min(accounted, span)) * 1000 div span
+  t.add " permille over "
+  t.addInt span div 1_000_000
+  t.add " s\n"
+
 proc route(isPost: bool; path: openArray[char]; t: var Text[960]; blob: var Chunk): bool {.nimcall.} =
+  if path.has("/selftest/profile"):
+    if isPost:
+      t.add (if profileStart(circular = path.has("stall")): "profiling\n"
+             else: "busy or no memory\n")
+    elif profile != nil and not profileRunning and profileCount > 0 and path.has("info"):
+      # For a `?stall` run: the stall's length and where the newest sample is.
+      t.add "stall us "
+      t.addInt profileStallUs
+      t.add " newest "
+      t.addInt (profileCount + ProfileSamples - 1) mod ProfileSamples
+      t.add " count "
+      t.addInt profileCount
+      t.add '\n'
+    elif profile != nil and not profileRunning and profileCount > 0:
+      blob = Chunk(data: cast[ptr UncheckedArray[byte]](profile),
+                   len: int(min(profileCount, ProfileSamples)) * 4)
+    else:
+      t.add "not ready: "
+      t.addInt profileCount
+      t.add " samples\n"
+    return true
+  if path.has("/selftest/stalls"):
+    stallReport(t, isPost)
+    return true
+  if path.has("/selftest/slices"):
+    sliceReport(t)
+    return true
   if path.has("/selftest/bench"):
     when HasHwCrypto: benchReport(t, path)
     else: t.add "no hardware crypto in this build\n"

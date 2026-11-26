@@ -23,8 +23,19 @@
 /* calloc/free default to the C library (the kernel TLSF heap on the BL808)
  * and can be redirected at run time, e.g. to a PSRAM pool. */
 #define MBEDTLS_PLATFORM_MEMORY
-/* MBEDTLS_HAVE_TIME and MBEDTLS_HAVE_TIME_DATE stay off: certificate validity
- * periods are not checked and nothing reads a wall clock. */
+/* Certificate validity periods are checked against the clock given to
+ * mbedTlsSetClock (mbedtls/clock.nim). While none is set the time is the Unix
+ * epoch, before any certificate is valid, so verification fails rather than
+ * accept a certificate that cannot be dated. No C library clock is used. */
+#define MBEDTLS_HAVE_TIME
+#define MBEDTLS_HAVE_TIME_DATE
+#define MBEDTLS_PLATFORM_TIME_TYPE_MACRO long long
+#define MBEDTLS_PLATFORM_TIME_MACRO bl808_mbedtls_time
+#define MBEDTLS_PLATFORM_MS_TIME_ALT
+#define MBEDTLS_PLATFORM_GMTIME_R_ALT
+#ifndef __ASSEMBLER__
+long long bl808_mbedtls_time(long long *timer);
+#endif
 
 /* ---- Hashes -------------------------------------------------------------- */
 #define MBEDTLS_MD_C

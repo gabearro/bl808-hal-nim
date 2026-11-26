@@ -16,7 +16,7 @@
 ## Data: the FIFO runs in "L/R merged" mode, one 32-bit word per stereo
 ## frame (left in the low half), which is exactly the ring's interleaved
 ## int16 layout. DMA0 loops over the ring forever through a circular linked
-## list (a list item moves at most 4095 words, so the ring is two items).
+## list (a list item moves at most 4095 words, so the ring is several items).
 ## Left and right therefore cannot end up swapped, wherever the DMA starts.
 ##
 ## The ring lives in PSRAM behind the M0 data cache: the DMA reads the
@@ -84,7 +84,9 @@ when defined(bl808m0):
       ## -d:radioRingAddress=570739712 -d:radioRingFrames=3072 (a define
       ## takes decimal numbers only).
     DmaChannel = 0
-    LliCount = 2
+    LliCount = max(2, (RingFrames + 4094) div 4095)
+      ## A list item moves at most 4095 frames; at least two, so the list is
+      ## a loop.
     LliFrames = RingFrames div LliCount
       ## Transfers (one frame each) per list item.
     RingBytes = RingLen * 2

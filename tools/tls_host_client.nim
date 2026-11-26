@@ -4,6 +4,8 @@
 ##
 ##   tls_host_client <port> <server-name> <path> <output-file> [options]
 ##     --verify=<ca.der>   verify the server against this anchor
+##     --clock=<seconds>   the date for certificate validity, as Unix time
+##                         (0: unknown); default: this machine's clock
 ##     --trickle=<n>       the transport moves at most n bytes per call and
 ##                         reports "would block" on every other call
 ##     --pad=<n>           add n bytes of request headers (several records)
@@ -179,6 +181,8 @@ proc fetch(port: int; name, path, output: string; verify: bool; trickle, pad: in
   socket.close()
   result.add " open=" & $established & " idle=" & $heapLive & " stack=" & $stackUsed
 
+var fixedClock: BiggestInt = -1     # --clock; -1: this machine's clock
+
 proc main() =
   var positional: seq[string]
   var caFile = ""
@@ -191,6 +195,7 @@ proc main() =
     of cmdLongOption:
       case key
       of "verify": caFile = value
+      of "clock": fixedClock = parseBiggestInt(value)
       of "trickle": trickle = parseInt(value)
       of "pad": pad = parseInt(value)
       of "repeat": repeat = parseInt(value)
@@ -200,6 +205,8 @@ proc main() =
   if positional.len != 4: quit("usage: tls_host_client <port> <name> <path> <out>", 2)
 
   doAssert tlsSetAllocator(countingCalloc, countingFree)
+  if fixedClock >= 0:
+    tlsSetClock(proc(): int64 {.nimcall.} = int64(fixedClock))
   if caFile.len > 0:
     let anchor = readFile(caFile)
     doAssert tlsAddTrustAnchor(cast[seq[byte]](anchor))

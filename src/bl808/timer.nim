@@ -19,8 +19,8 @@ const
   TimerTmr3_0*      = 0x1C'u  # Timer3 match value 0
   TimerTmr3_1*      = 0x20'u  # Timer3 match value 1
   TimerTmr3_2*      = 0x24'u  # Timer3 match value 2
-  TimerTcr2*        = 0x2C'u  # Timer2 control
-  TimerTcr3*        = 0x30'u  # Timer3 control
+  TimerTcr2*        = 0x2C'u  # Timer2 counter value
+  TimerTcr3*        = 0x30'u  # Timer3 counter value
   TimerTsr2*        = 0x38'u  # Timer2 status
   TimerTsr3*        = 0x3C'u  # Timer3 status
   TimerTier2*       = 0x44'u  # Timer2 interrupt enable
@@ -43,8 +43,8 @@ const
   TimerWcr*         = 0x98'u  # Watchdog control
   TimerWfar*        = 0x9C'u  # Watchdog feed access
   TimerWsar*        = 0xA0'u  # Watchdog starve access
-  TimerTcvwr2*      = 0xA8'u  # Timer2 counter value read
-  TimerTcvwr3*      = 0xAC'u  # Timer3 counter value read
+  TimerTcvwr2*      = 0xA8'u  # Timer2 counter latch
+  TimerTcvwr3*      = 0xAC'u  # Timer3 counter latch
   TimerTcdr*        = 0xBC'u  # Timer clock divider
   TimerTcdrForce*   = 0xCC'u  # Force live divider update
 
@@ -157,9 +157,11 @@ proc forceClockDiv*(timer: Timer, ch: TimerChannel) =
   regWrite(timer.base + TimerTcdrForce, 1'u32 shl bit)
 
 proc setCountMode*(timer: Timer, ch: TimerChannel, mode: TimerCountMode) =
+  # TCMR bit 1 is the first channel's mode and bit 2 the second's (bit 0 is
+  # not a channel), as in the vendor driver's `1 << (1 + idx)`.
   let bit = case ch
-    of timerCh2: 1'u32
-    of timerCh3: 2'u32
+    of timerCh2: 1'u32 shl 1
+    of timerCh3: 1'u32 shl 2
   if mode == timerFreeRun:
     regSet(timer.base + TimerTcmr, bit)
   else:
@@ -193,9 +195,10 @@ proc disable*(timer: Timer, ch: TimerChannel) =
   regClear(timer.base + TimerTcer, 1'u32 shl bit)
 
 proc readCounter*(timer: Timer, ch: TimerChannel): uint32 =
+  # The live count; TCVWR is a latch the hardware does not keep current.
   case ch
-  of timerCh2: regRead(timer.base + TimerTcvwr2)
-  of timerCh3: regRead(timer.base + TimerTcvwr3)
+  of timerCh2: regRead(timer.base + TimerTcr2)
+  of timerCh3: regRead(timer.base + TimerTcr3)
 
 # =============================================================================
 # Interrupts
@@ -234,6 +237,9 @@ proc setupPeriodic*(timer: Timer, ch: TimerChannel, periodTicks: uint32,
   timer.setClockSource(ch, clkSrc)
   timer.setCountMode(ch, timerPreload)
   timer.setPreloadValue(ch, 0)
+  # Reload the counter when it reaches match 0; without this it only comes
+  # round again when the 32-bit counter wraps.
+  regWrite(timer.base + (if ch == timerCh2: TimerTplcr2 else: TimerTplcr3), 1)
   timer.setMatchValue(ch, 0, periodTicks)
   timer.setMatchValue(ch, 1, 0xFFFF_FFFF'u32)  # Unused
   timer.setMatchValue(ch, 2, 0xFFFF_FFFF'u32)  # Unused

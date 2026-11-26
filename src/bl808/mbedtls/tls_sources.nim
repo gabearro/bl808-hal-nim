@@ -2,8 +2,8 @@
 ## Crypto, public-key and X.509 parsing, and the TLS 1.2/1.3 client. Hashes,
 ## HMAC and AES come from crypto.nim, which a Wi-Fi image already compiles.
 
-import crypto, hw
-export crypto, hw
+import crypto, hw, clock
+export crypto, hw, clock
 
 when not MbedTlsHwP256:
   {.compile: MbedTlsLibrary & "/ecp.c".}   # otherwise through ecp_p256_hook.c

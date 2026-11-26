@@ -26,8 +26,9 @@
 ## (-d:bl808WifiMbedTlsSha1Hardware). TLS handshakes here do not use SHA-1.
 ##
 ## Certificates are not verified unless `verifyPeer` is set, and then against
-## the anchors given to `tlsAddTrustAnchor`. Validity dates are never checked:
-## the build has no wall clock.
+## the anchors given to `tlsAddTrustAnchor` and the date given by
+## `tlsSetClock`. Without a clock no certificate is in its validity period, so
+## a verified session fails until one is set.
 ##
 ## Memory comes from the Mbed TLS allocator: the C library's calloc (the
 ## kernel heap) unless `tlsSetAllocator` redirects it. An open session holds
@@ -180,6 +181,12 @@ proc tlsSetAllocator*(calloc: TlsCalloc; free: TlsFree): bool =
   ## through `calloc`/`free`, e.g. a PSRAM pool. Call before the first
   ## `tlsOpen` or `tlsAddTrustAnchor`; memory must come back zeroed.
   calloc != nil and free != nil and mbedtls_platform_set_calloc_free(calloc, free) == 0
+
+proc tlsSetClock*(now: MbedTlsClock) =
+  ## The wall clock certificate validity is checked against: a proc giving
+  ## seconds since 1970 UTC, or 0 while the time is not known (before NTP has
+  ## answered, say). Sessions opened with `verifyPeer = true` fail without it.
+  mbedTlsSetClock(now)
 
 proc tlsAddTrustAnchor*(der: openArray[byte]): bool =
   ## Add one DER-encoded CA certificate for sessions opened with

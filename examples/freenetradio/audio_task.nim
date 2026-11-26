@@ -4,7 +4,7 @@
 ## anything but the heap, and a loop to run in. Firmware only.
 
 import bl808/kernel/cps
-import ./mp3dec, ./i2s_ring, ./i2s_out, ./player
+import ./mp3dec, ./i2s_ring, ./i2s_out, ./player, ./diag
 
 type
   Audio = object
@@ -27,13 +27,27 @@ proc dacCommit(ring: var I2sRing) {.nimcall.} = i2s_out.commit(ring)
 proc dacSetSampleRate(ring: var I2sRing; rate: uint32) {.nimcall.} = i2s_out.setSampleRate(ring, rate)
 proc dacActualRate(rate: uint32): uint32 {.nimcall.} = i2s_out.actualRate(rate)
 
+const
+  UrgentFrames = 3 * 1152
+    ## With less than this queued for the DAC (78 ms at 44.1 kHz), decoding
+    ## comes before the other tasks: every task shares one processor, and a
+    ## turn of the scheduler can take longer than a frame lasts.
+  UrgentBurst = 3
+    ## At most this many frames in a row (about 15 ms) before the others run.
+
 proc audioStep(): StepResult =
   pollErrors()
-  audio.player.step()
+  result = audio.player.step()
+  var burst = 1
+  while result == srYield and burst < UrgentBurst and
+        audio.player.queuedFrames < UrgentFrames:
+    result = audio.player.step()
+    inc burst
 
 proc audioTask(): CpsVoidFuture {.cps.} =
   while true:
-    let next = audioStep()
+    var next: StepResult
+    timed(slAudio): next = audioStep()
     if next == srIdle:
       await sleepMs(20)
     elif next == srWait:

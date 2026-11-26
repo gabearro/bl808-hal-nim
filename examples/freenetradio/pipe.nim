@@ -3,9 +3,15 @@
 ## what fits and holds the rest back, which back-pressures the connection.
 
 const
-  PipeLen* = 10 * 1024
-    ## Kept at upstream's size: the buffering thresholds and the percentage
-    ## shown on screen are defined in terms of it.
+  UpstreamPipeLen* = 10 * 1024
+    ## Upstream's size; the level at which playback starts is defined by it.
+  PipeLen* {.intdefine: "radioPipeBytes".} = UpstreamPipeLen
+    ## The buffer's size, and what the percentage on screen is a share of.
+    ## More than upstream's rides out a reception stall of that many bytes
+    ## of stream (`freenetradio.nims` asks for 64 KB: four seconds at
+    ## 128 kbit/s); a server's start-up burst fills it.
+
+static: doAssert PipeLen >= UpstreamPipeLen
 
 type
   BytePipe* = object

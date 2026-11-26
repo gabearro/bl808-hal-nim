@@ -10,7 +10,7 @@ import bl808/kernel/cps
 import bl808/kernel/lwipcore
 import bl808/kernel/log
 import ./timebase, ./netstate, ./netio, ./wallclock, ./resolver
-import ./flashdev, ./presets, ./settings, ./remote, ./ir_rx
+import ./flashdev, ./presets, ./settings, ./remote, ./ir_rx, ./diag
 
 const
   ControlsPeriodMs = 5
@@ -134,7 +134,8 @@ proc ntpStep(): uint64 =
 
 proc ntpTask(): CpsVoidFuture {.cps.} =
   while true:
-    let waitMs = ntpStep()
+    var waitMs: uint64
+    timed(slNtp): waitMs = ntpStep()
     await sleepMs(waitMs)
 
 # ---- IR, digits, preset jobs, settings -------------------------------------
@@ -151,7 +152,7 @@ proc controlsStep() =
 
 proc controlsTask(): CpsVoidFuture {.cps.} =
   while true:
-    controlsStep()
+    timed(slControls): controlsStep()
     await sleepMs(ControlsPeriodMs)
 
 proc controlsStart*() =

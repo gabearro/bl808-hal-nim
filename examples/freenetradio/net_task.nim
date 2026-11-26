@@ -152,8 +152,9 @@ proc netStep() =
 
 proc netTask(): CpsVoidFuture {.cps.} =
   while true:
-    netStep()
-    sysCheckTimeouts()
+    timed(slNet):
+      netStep()
+      sysCheckTimeouts()
     await sleepMs(PollMs)
 
 proc netStart*() =

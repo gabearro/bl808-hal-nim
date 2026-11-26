@@ -12,6 +12,19 @@ switch("passC", "-DTCP_WND=10240")
 # SHA engine, like the rest of this firmware's hashing.
 switch("define", "bl808WifiMbedTlsSha1Hardware")
 
+# The DAC queue: 12288 frames (279 ms at 44.1 kHz) instead of upstream's 4096.
+# On this chip the Wi-Fi stack is polled from the same scheduler as the audio
+# task, and stretches of 50 to 100 ms in which the decoder does not get its
+# turn are normal; with 93 ms queued those were audible drop-outs. The cost
+# is that volume and equaliser changes are heard a quarter of a second later.
+switch("define", "radioRingFrames=12288")
+
+# The stream buffer: 64 KB instead of upstream's 10 KB. Playback still starts
+# at upstream's level; the rest fills from the server's start-up burst and
+# carries the radio through a few seconds without reception, which Wi-Fi has
+# and upstream's wired Ethernet did not.
+switch("define", "radioPipeBytes=65536")
+
 # The stack. The linker profile guards 8 KB at the top of on-chip RAM, which
 # a TLS handshake comes close to. This firmware leaves about 27 KB between
 # the end of .bss and the top, so the stack gets 20 KB of it; 12 KB when AES

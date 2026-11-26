@@ -75,10 +75,15 @@ proc setSynced*(unix: uint64; atMs: uint64) =
 
 proc isSynced*(): bool {.inline.} = synced
 
+proc unixNow*(): int64 =
+  ## Seconds since 1970 UTC; 0 until NTP has succeeded.
+  if not synced: return 0
+  syncUnix.int64 + int64(elapsedMs(syncAtMs, nowMs()) div 1000)
+
 proc hourMinute*(hm: var (uint8, uint8)): bool =
   ## The local time; false until NTP has succeeded.
   if not synced: return false
-  let utc = syncUnix.int64 + int64(elapsedMs(syncAtMs, nowMs()) div 1000)
+  let utc = unixNow()
   hm = localHourMinute(utc, offsetQh(), dstEnabled())
   true
 

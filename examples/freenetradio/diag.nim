@@ -4,7 +4,33 @@
 ## are always kept (they are cheap here); only the `/stats`, `/stats/reset`
 ## and `/screen/stream` routes depend on `-d:radioDiag`.
 
+import ./timebase
+
 const DiagEnabled* = defined(radioDiag)
+
+type
+  TaskSlice* = enum
+    ## One stretch of work between two points where a task lets the others
+    ## run. Every task shares the processor, so the longest of these is how
+    ## long the audio task can be kept waiting.
+    slAudio, slDraw, slFlushStart, slFlushEnd, slStream, slHttp, slControls, slNtp, slNet
+
+var sliceMaxUs*: array[TaskSlice, uint32]
+  ## Longest run of each slice since the last read (diag builds).
+var sliceTotalUs*: array[TaskSlice, uint64]
+  ## Time spent in each slice since the last read (diag builds).
+
+template timed*(slice: TaskSlice; body: untyped) =
+  ## Run `body`, and in diag builds remember the longest it has taken.
+  when DiagEnabled:
+    let sliceStart = nowUs()
+    body
+    let sliceUs = nowUs() - sliceStart
+    sliceTotalUs[slice] += sliceUs
+    if sliceUs > sliceMaxUs[slice].uint64:
+      sliceMaxUs[slice] = uint32(min(sliceUs, high(uint32).uint64))
+  else:
+    body
 
 type
   Diag* = object

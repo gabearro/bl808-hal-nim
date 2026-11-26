@@ -14,7 +14,7 @@
 # By path, not `bl808/kernel/tls`: host tests build without the repo's
 # config, so `src` is not on their module path.
 import ../../src/bl808/kernel/tls
-import ./netio
+import ./netio, ./wallclock
 
 type
   TlsLink* = object
@@ -74,6 +74,9 @@ proc opErrorClass(ctx: pointer): SecureError {.nimcall.} =
 
 proc secureOps*(link: ptr TlsLink): SecureOps =
   ## The stream client's TLS operations, running on `link`.
+  # The NTP clock dates certificates, should verification ever be switched
+  # on; as upstream, this firmware does not verify.
+  tlsSetClock(wallclock.unixNow)
   SecureOps(ctx: link, available: true, open: opOpen,
     handshakeStep: opHandshake, read: opRead, write: opWrite,
     close: opClose, lastError: opLastError, buffered: opBuffered,

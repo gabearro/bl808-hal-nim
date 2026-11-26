@@ -15,10 +15,10 @@
 import ./mp3dec, ./i2s_ring, ./eq, ./pipe, ./status, ./spectrum, ./diag, ./timebase
 
 const
-  Prebuffer* = PipeLen * 15 div 16
-    ## Start (or resume) playback once the pipe is (nearly) full and has
-    ## stayed so for `PrebufferHoldMs`, so the TCP receive buffer behind it
-    ## fills too. Starting with every buffer full matters at high bitrates:
+  Prebuffer* = UpstreamPipeLen * 15 div 16
+    ## Start (or resume) playback once the pipe holds this much (nearly
+    ## upstream's whole pipe, whatever this build's size) and has stayed so
+    ## for `PrebufferHoldMs`, so the TCP receive buffer behind it fills too. Starting with every buffer full matters at high bitrates:
     ## the buffers are sized in bytes, ~0.5 s in all at 320 kbit/s, and some
     ## servers send in ~16 KB lumps with pauses of up to ~0.5 s between them.
   PrebufferHoldMs* = 400
@@ -126,6 +126,9 @@ proc initPlayer*(p: var Player; ringBuf: ptr UncheckedArray[int16];
 func playing*(p: Player): bool {.inline.} = p.playing
 func sampleRate*(p: Player): uint32 {.inline.} = p.sampleRate
 func windowLen*(p: Player): int {.inline.} = p.windowLen
+
+func queuedFrames*(p: Player): int {.inline.} = p.ring.queuedFrames
+  ## Frames decoded and not yet played.
 
 proc fadeOut(p: var Player) {.inline.} =
   p.ring.fadeOut(p.output.readPos(), FadeFrames)

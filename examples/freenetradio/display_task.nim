@@ -156,7 +156,7 @@ proc displayTask(): CpsVoidFuture {.cps.} =
   panelOn(scr[])
 
   while true:
-    drawFrame(scr[])
+    timed(slDraw): drawFrame(scr[])
     if captureBegin(scr[]):
       while capturePending(scr[]):
         await sleepMs(1)
@@ -176,10 +176,10 @@ proc displayTask(): CpsVoidFuture {.cps.} =
         pincapBegin()
       of pwNone:
         discard
-    flushBegin(scr[])
+    timed(slFlushStart): flushBegin(scr[])
     while flushPending(scr[]):
       await sleepMs(1)
-    flushEnd(scr[])
+    timed(slFlushEnd): flushEnd(scr[])
     when DiagEnabled and defined(bl808m0):
       scr.oled.setSlow(false)
     frameDone(scr[])

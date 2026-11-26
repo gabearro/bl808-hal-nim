@@ -315,6 +315,30 @@ def test_verify_peer(pki: Path, client: Path, tmp_path: Path) -> None:
     assert unverified["status"] == "ok"            # the default: no verification, as upstream
 
 
+def test_verify_peer_checks_the_certificates_dates(pki: Path, client: Path, tmp_path: Path) -> None:
+    """The fixture's certificates are valid for thirty days from now. A
+    verified session needs a clock that falls inside that; a clock that is
+    not set (0) refuses, as a board that has not had the time yet does."""
+    now = int(time.time())
+    day = 86400
+    verify = f"--verify={pki / 'root.der'}"
+    with s_server(pki, "-tls1_3") as port:
+        def at(clock: int, *more: str) -> dict:
+            return run_client(client, port, tmp_path, "/small.bin", "localhost",
+                              f"--clock={clock}", *more)[0]
+        valid = at(now + 10 * day, verify)
+        expired = at(now + 40 * day, verify)
+        too_early = at(now - 2 * day, verify)
+        no_clock = at(0, verify)
+        unverified = at(0)
+    assert valid["status"] == "ok"
+    for refused in (expired, too_early, no_clock):
+        assert (refused["status"], refused["stage"], refused["class"]) == \
+            ("fail", "handshake", "tlsErrHandshake"), refused
+        assert refused["error"] == "-0x2700"       # MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+    assert unverified["status"] == "ok"            # no verification, no date needed
+
+
 def test_sessions_release_everything_they_allocate(pki: Path, client: Path, tmp_path: Path) -> None:
     """Three fetches in one process: the client asserts that Mbed TLS's live
     allocations return to the same level after each session."""

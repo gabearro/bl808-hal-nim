@@ -4,7 +4,7 @@
 ## TLS out (https URLs then fail with a message).
 
 import bl808/kernel/cps
-import ./netio, ./resolver, ./tcpconn, ./stream
+import ./netio, ./resolver, ./tcpconn, ./stream, ./diag
 
 const HaveTls = not defined(radioNoTls)
 
@@ -66,7 +66,8 @@ proc secureOps(): SecureOps =
 
 proc streamTask(): CpsVoidFuture {.cps.} =
   while true:
-    let hint = client[].step()
+    var hint: StepHint
+    timed(slStream): hint = client[].step()
     if hint == shYield:
       await yieldNow()
     elif hint == shWait:

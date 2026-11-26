@@ -70,7 +70,8 @@ proc httpPoll(): uint64 =
 
 proc httpTask(): CpsVoidFuture {.cps.} =
   while true:
-    let waitMs = httpPoll()
+    var waitMs: uint64
+    timed(slHttp): waitMs = httpPoll()
     await sleepMs(waitMs)
 
 proc httpStart*() =
