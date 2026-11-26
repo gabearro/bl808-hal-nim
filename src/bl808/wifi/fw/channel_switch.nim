@@ -105,9 +105,8 @@ proc chanSwitchFinish(arrived: bool) =
   # Inside a TX reset its caller still owns MM's state.
   if not txResetActive: mmLeaveHwActive()
   let current = env.currentCtxt
-  let ps = psEnvView()
   if pmSet and current != nil and chanCtxtAt(current).contextIndexOrMarker <= 2 and
-      (ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0):
+      psAwake():
     blmac_pwr_mgt_setf(0)
 
 proc chanSwitchRedirect() =

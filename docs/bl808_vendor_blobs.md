@@ -8016,6 +8016,194 @@ removed with the re-checks they exercised. The M0 HTTP server and the scan,
 cold-scan, scan-ownership, connected-scan, HAL and bad-password manifests
 built; none of this was flashed.
 
+#### Power save (ps_machine.nim)
+
+`ps_machine.nim` holds power save's transitions as one machine over an
+`Op` (`op.nim`): an explicit `MM_SET_PS_MODE_REQ` (`ps_set_mode`: PS off,
+static or dynamic), a DPSM sleep and a DPSM wake (`ps_dpsm_update`).
+`psStart` is the only `opGo` of PS's operation; `psFinish` is the only end
+of a transition (it commits it through `ps_disable_cfm_handle` or
+`ps_enable_cfm_handle`, answers the request the transition holds and
+releases TASK_MM's saved messages) and `psCancel` the only drop (MM reset,
+ME reset, `ke_flush`). A transition counts its null frames in
+`ps.pendingCount`, plus one while it is still sending them. Each frame
+carries the transition's stamp as its confirmation argument, as does the
+TX-null timer (its env word, `ps_env+44`); a confirmation or an expiry with
+another stamp changes nothing. This fixes audit items PSK-1, PS-N1, PS-N2,
+PS-N3 and PS-N4. Differences from the archive:
+
+- The confirmation argument of `ps_enable_cfm`, `ps_disable_cfm` and the
+  retry in `ps_check_tx_status.part.0` is the transition's stamp; ps.o
+  passes the VIF. The confirmation takes its VIF from the TX layer's
+  callback scope (the frame's `vifIdx`). The TX-null timer's argument is
+  the stamp too; the VIF of the last frame sent is kept in the machine and
+  updated by the commit only while it is the same VIF (`mmVifCurrent`).
+- A confirmation counts with any status. Only a frame done without an ACK
+  (bit 31 set, bit 23 clear) is sent again through
+  `ps_check_tx_status.part.0`, with its retry, PM-event and reason-21
+  limits unchanged. A frame flushed by `txl_reset` or `txl_cntrl_clear_ac`,
+  aged out or released unsent (bit 31 clear) counts without a retry, so
+  nothing is sent from inside a drain. ps.o retries every status without
+  bit 23, flushed frames included. The port had dropped flushed
+  confirmations as stale (TX reset epoch, PS serial), which stranded a
+  DPSM sleep in flight across a channel switch or MAC recovery (PSK-1).
+- A TX reset no longer ends or replays an explicit request:
+  `mmPsModeRetryAfterReset` (in `mm_force_idle_req` and `bl_reset_evt`) is
+  removed. Its flushed frames count, the transition ends and answers the
+  request once, with the PM bit already set. The port had re-run the
+  request after the reset; ps.o resends the null from inside the drain
+  (`ps_check_tx_status.part.0`), into the TX lists `txl_reset` is clearing.
+  `bl_reset_evt` still reschedules MM's saved messages. After a channel
+  departure's reset the AP is told the state anyway (next item). After a
+  MAC recovery (`bl_reset_evt`) it is not: a transition whose only null the
+  recovery flushed commits unheard. After PS off the AP keeps buffering and
+  the station, with PS off, ignores the TIM; after PS on or a DPSM sleep the
+  AP keeps sending to a dozing station. Either lasts until an uplink frame
+  carries the PM bit. The port's replay covered explicit requests here.
+- The departure (`chan_goto_idle_cb`) sends its PM=1 protection null to
+  every active STA VIF on the channel it leaves, and its self-CTS to the AP
+  VIFs, whatever PS's state; on the way home the PM bit is cleared and the
+  wake null sent while PS is awake (`psAwake`). chan.o stops at the first
+  such STA, self-CTS included, while `ps_env[0]` is set and `statusFlags`
+  bit 3 clear. Its forced idle can flush the null of a PS on or a DPSM
+  sleep in flight, which then commits unheard (above); chan.o, which sees
+  an explicit PS on still in flight as PS off, protects only that case, and
+  the port had replayed the request. When the AP already holds PM=1 the
+  extra null costs one frame and its wait.
+- `ps_tx_null_timer_handle` ends the sleep first and then flushes AC3, as
+  ps.o does (finalize at `+0x2a`, tail call at `+0x3c`). The port had
+  flushed first and re-armed the timer when the halt failed; a protection
+  completion in that flush ran a nested TX reset and the handler abandoned
+  the sleep with no owner (PS-N1). A failed halt now leaves the sleep
+  ended; its `assert_rec` recovers the MAC.
+- `ps_dpsm_update` arms the TX-null timer with the stamp before the first
+  null frame is sent; ps.o arms it inside the loop after each send, with
+  the VIF. Neither sender has an early return: a TX reset inside a frame's
+  allocation flushes the frames already sent, which count, and the held
+  count keeps the transition live until the walk ends (PS-N2).
+- `mm_set_ps_mode_req_handler` saves a request only while a transition is
+  live. The port also saved it while a request was held, during a TX
+  reset, in `HW_ACTIVE` and while a scan or ROC dwell owned PM. ps.o's
+  handler saves nothing: `ps_set_mode` parks the mode behind a live DPSM
+  transition (`ps_env+52` bit 4, mode at `+53`) and the handles replay it.
+  Here nothing is parked; the saved request runs when the transition ends
+  (`psFinish` and `psCancel` reschedule TASK_MM's saved messages, PS-N4).
+- The request is answered when its transition ends: ME's request with the
+  reply ME reserved for it, any other in place (the request becomes
+  `MM_SET_PS_MODE_CFM`), mode 3 included. ps.o sends
+  `ke_msg_send_basic(MM_SET_PS_MODE_CFM, ps_env[1], 0)`, which halts
+  without memory; the port had allocated the reply with
+  `ke_msg_send_basic_reply`.
+- The commits tell a wake from an explicit PS off, and a sleep from an
+  explicit PS on, by the transition's kind; ps.o reads `ps_env+52` bits
+  0-2 and the VIF, so its wake without a VIF turned PS off.
+- PM: `psApplyPm` records PS's choice and writes the bit unless a scan or
+  ROC dwell holds it (`statusFlags` bit 1, `psDwell`). The dwell's start
+  (`psDwellBegin`, `chan_pre_switch_channel`) clears the bit as chan.o
+  does; its end (`psDwellEnd`, `chanCtxtOpEvent`) writes PS's choice
+  instead of the value chan.o saved at `chan_pre_switch_channel+0x12c` and
+  restores at `chan_ctxt_op_evt+0x11e`. A DPSM decision during a dwell had
+  written PM in the middle of it and the restore then contradicted it
+  (PS-N3). `env.surveySnapshot` (`chan_env+126`) is no longer written.
+- A transition sends no null frame while a dwell holds the bit, so a DPSM
+  sleep or wake or an explicit request during a dwell ends where it starts.
+  `chan_is_on_channel` is true for the STA VIF that asked for the scan or
+  ROC, and the MAC marks the frame with the register's PM bit, held at 0:
+  on the AP's channel a sleep would tell the AP the station is awake. The
+  departure's PM=1 null and the way home tell the AP instead. ps.o sends the
+  frame: its DPSM writes the bit first (a sleep says sleep) and the dwell's
+  end then restores the bit saved at its start. The port had saved explicit
+  requests until the dwell ended. A dwell starts after a forced idle has
+  flushed TX, so no transition frame is out (or retried) during one.
+- `statusFlags` bit 3 mirrors PS's PM choice: set while PS wants the bit
+  clear, written only by `psApplyPm` under the IRQ lock. ps.o sets it for a
+  DPSM wake, clears it for a sleep and for every explicit mode; here PS off
+  (mode 0) sets it. PS off does not nap either way (`bl_sleep_schedule`
+  requires `ps_env[0]`). The channel scheduler's return home, abandoned
+  switch and home wake ask `psAwake()` (PS's choice) instead of
+  `ps_env[0] == 0 or statusFlags bit 3`; the two agree except while an
+  explicit transition is live, when ps.o's view still shows the old mode.
+  The departure no longer asks (above).
+- `ke_flush` resets ME (`meControlReset`) before it cancels PS's transition
+  (`psCancel`), the order of `me_init` and `mm_init`: ME forgets its
+  forwarded request before the transition holding it is cancelled, so ME
+  never keeps a request `psCancel` freed. `mmPsModeCancel`, which ran
+  first, cleared ME's reference itself.
+- `td_timer_end` re-arms its timer unless `td_cfm_set_timer` armed it for
+  the same VIF during the call (`tdCfmArmed`); td.o passes this back as
+  the non-zero return of `ps_traffic_status_update`. Traffic detection no
+  longer reads the TX reset epoch or VIF epochs, so a nested reset cannot
+  stop sampling (PS-N2).
+- The U-APSD trigger timer no longer ends at a TX reset: a reset inside a
+  trigger's submission had left `ps_env+28` set with nothing armed, and
+  `ps_uapsd_set` never armed it again (PS-N2). Its other checks stay.
+
+Removed: `psModeBuildSerial`, `psTxNullOwner` (`PsTxNullOwner`),
+`mmPsModeRequest`, `mmPsModeTxResetEpoch`, `mmPsModeCancel`,
+`mmPsModeComplete`, `mmPsModeRetryAfterReset` and its calls,
+`TxFrameIdentity.psTracked` and `psSerial` with the PS stamping in
+`txl_frame_send_null_frame`, the PS checks in `txlFrameIdentityCurrent`, the
+parked-mode replay, the `current()`/`currentMode()`/`currentVif()`/
+`stillOwned()` re-checks of `ps_set_mode`, `ps_dpsm_update`, the two
+confirmations, the two handles, `ps_tx_null_timer_handle`,
+`ps_traffic_status_update`, `ps_check_beacon`, `ps_check_tbtt`,
+`ps_check_frame` and `ps_check_tx_frame` (none of their callees can run
+power-save code or retire the VIF), `tdEpochs`, `tdCfmCommittedEpochs`,
+`tdCfmScheduled`, `tdOperationCurrent` and the unused `tdTimerActive` and
+`tdRecoveryTimerActive`. This replaces the statements in "Power-Save
+Completion Ownership", "Dynamic Power-Save Batch", "TX-Null Timeout
+Ownership", "TX-Null Arm And Drain Ownership", "Wake Completion And
+Confirmation Ownership", "Power-Save Command Cancellation", "Power-Save
+Null Frame Lease Identity", "Reset Priority And Power-Save Request Replay"
+and "Power-Save Mode And Channel Ownership" above about serials, owners,
+reset replay, re-checks, the clear-before-finalize order and saving
+requests during a dwell.
+
+Not done (stage 13): `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout` and the
+beacon-detect ROC keep their re-checks (`mmStaTimerCurrent`), `mm_tbtt_evt`
+its `mmTbttActive` guard, and the connection loss its tagged message
+(`MmConnLossTag`); `mm_ap_probe_cfm` and `mmStaBeaconProbeCfm` both remain.
+The U-APSD timer keeps its per-VIF re-checks. When the removal of a STA VIF
+leaves ME's `activeMask` or `psDisableMask` at zero, MM is still not idled
+and PS not re-enabled. A MAC recovery does not tell the AP PS's state after
+it flushed a transition's null (above).
+
+Host tests: `tools/test_wifi_ps_table.py` drives the real machine
+(`ps_machine.nim`, the transition procedures of `power_save.nim`,
+`mm_set_ps_mode_req_handler`, `mm_force_idle_req`, `chanForceIdle`) through
+explicit requests from ME and the host, sleeps and wakes with one or two
+STA VIFs, frames confirmed inline or refused, each stopped at its first
+steps and given one input (a confirmation with each status, a stale
+confirmation, the timer, an AC3 flush, a TX reset, a cancel, another
+request, traffic, a dwell, a retry refused or completed inline); after every
+step it checks that a transition is live exactly while PS is not idle, that
+it counts exactly its unconfirmed frames, that a sleep has its timer, that
+nothing is parked and that outside a dwell the PM bit is PS's choice; that
+every null frame PS sends says PS's PM choice and none goes out during a
+dwell (the scanning VIF stays on channel there); and at rest that every
+request was answered once and every stamp is stale; eleven mutations of the
+rules are each caught. Further:
+`tools/test_wifi_sm_audit_ps_keepalive.py` (PSK-1, PS-N1 to PS-N4, each also
+reverted in the source to show it fails), `tools/test_wifi_op_discipline.py`
+(one operation writer and end, the count and bits 1 and 2 only in the
+machine, stamps on frames and the timer, no TX reset epoch in the
+transition procedures, the PM bit's writers, no frame during a dwell, the
+departure independent of PS, ME reset before PS, MM's one save, the
+removed machinery stays removed), `tools/test_wifi_ps_timer_dispatch.py`,
+`tools/test_wifi_ps_confirmations.py`, `tools/test_wifi_ps_traffic.py`,
+`tools/test_wifi_ps_frame_logging.py`, `tools/test_wifi_td_timer_end.py`,
+`tools/test_wifi_td_lifecycle.py`, `tools/test_wifi_uapsd_timer.py`,
+`tools/test_wifi_ps_beacon_tim.py`, `tools/test_wifi_me_control.py` (with
+`ke_flush`'s reset order, reversed to show it fails),
+`tools/test_wifi_channel_handoff.py` (the dwell's PM hold),
+`tools/test_wifi_channel_protection.py` (the departure protects whatever
+PS's state) and `tools/test_wifi_tx_callback_session.py`. Cases that changed the VIF, the
+station, the mode or the TX reset epoch from loggers, timer clears, the PM
+event, the traffic detector or the TX path in the middle of a procedure,
+or that cancelled a transition from inside a null frame's submission, were
+removed with the re-checks they exercised. The M0 HTTP server manifest
+built; none of this was flashed.
+
 ## BLE
 
 - Local controller path: `src/bl808/libbtblecontroller_bl808_ble1m0s1bredr0.a`

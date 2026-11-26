@@ -127,7 +127,6 @@ proc observe(point: string) =
   of 4: stas[2].valid = 0
   of 5: stas[2].instNbr = 0
   of 6: inc rxVifEpochs[0]
-  of 8: inc psModeBuildSerial
   of 9: vifs[1].uapsdBitmap = 8
   of 10: triggerOnChannel = false
   else: retired = true
@@ -146,7 +145,6 @@ proc setup(irq: bool; allocatedCount: int) =
   replacement = nil
   currentFrame = nil
   sequence = 0x1000
-  psModeBuildSerial = 0
   interruptsEnabled = irq
   for i in 0 .. 1:
     vifs[i] = Vif(vifIdx: i.uint8, vifType: 0, state: 1)
@@ -327,32 +325,14 @@ for irq in [false, true]:
       else: doAssert txl_frame_push(held[0], ac) == 0
       doAssert pushes == 0 and co_list_cnt(addr frameEnv.freeList) == 1
 
+  # A PS confirmation carries its transition's stamp as its argument; the TX
+  # layer stores callback and argument verbatim and keeps no PS state
+  # (ps_machine.nim drops a stale confirmation).
   for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
-    for point in ["recovery", "power", "trace"]:
-      setup(irq, (if point == "recovery": 4 else: 0))
-      stage = point
-      action = 8
-      if point == "recovery":
-        onRecovery = proc() =
-          observe("recovery")
-          txl_frame_release(held[0], false)
-      doAssert txl_frame_send_null_frame(2, callback, 0xDEADBEEF'u32) == 1
-      doAssert fired and pushes == 0 and interruptsEnabled == irq
-      doAssert co_list_cnt(addr frameEnv.freeList) == (if point == "recovery": 1 else: 4)
     setup(irq, 0)
-    psModeBuildSerial = 42
     doAssert txl_frame_send_null_frame(2, callback, 0xDEADBEEF'u32) == 0
-    let owner = txFrameIdentities[txl_frame_desc_index(pushed[0])]
-    doAssert owner.psTracked and owner.psSerial == 42
     doAssert hostTxDescAt(pushed[0]).callback == callback
     doAssert pointerAddrU32(hostTxDescAt(pushed[0]).callbackArg) == 0xDEADBEEF'u32
-
-  setup(irq, 0)
-  stage = "power"
-  action = 8
-  doAssert txl_frame_send_null_frame(2, cast[pointer](0xFACE), 0) == 0
-  doAssert fired and pushes == 1
-  doAssert not txFrameIdentities[txl_frame_desc_index(pushed[0])].psTracked
 
   setup(irq, 0)
   doAssert txl_frame_send_null_frame(255, nil, 0) == 1

@@ -100,7 +100,7 @@ var
   generations: array[2, uint32]
   rxVifEpochs: array[2, uint32]
   stationEpochs: array[7, uint32]
-  txResetEpoch, psModeBuildSerial: uint32
+  txResetEpoch: uint32
   activeFrame: ptr HostTxDescView
   replacementDesc: HostTxDescView
   replacementHw: Hw

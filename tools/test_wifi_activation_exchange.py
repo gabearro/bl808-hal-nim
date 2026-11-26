@@ -90,13 +90,13 @@ var
   me: tuple[requesterId, psOn: uint8, activeMask, psDisableMask: uint32]
   state, meState: uint16
   rxVifEpochs: array[2, uint32]
-  txResetEpoch, psModeBuildSerial: uint32
+  txResetEpoch: uint32
   ps: tuple[flags, pendingCount: uint8, currentVif: pointer]
   stationEpochs: array[7, uint32]
   rxKeyLastChanged: array[7, uint64]
   nimFwWpaPendingMask: uint32
   keMsgQueueSent, keMsgQueueSaved: CoList
-  meControlCommand, meControlReply, apmStartRequest, apmStartReply, mmPsModeRequest: pointer
+  meControlCommand, meControlReply, apmStartRequest, apmStartReply, psHeldRequest: pointer
   meControlReplyReady, apmStartReplyPublished, meConfigInProgress: bool
   meControlEpoch: uint32
   meControlExpectedId, meControlFinalId: uint16
@@ -236,7 +236,7 @@ proc setup(vifIndex = 1'u8; staIndex = 2'u8; cipher = 0'u8; flags = 0'u32) =
   meControlCommand = nil
   meControlReply = nil
   meControlReplyReady = false
-  mmPsModeRequest = nil
+  psHeldRequest = nil
   rxVifEpochs = [1'u32, 1]
   stationEpochs = [1'u32, 1, 1, 1, 1, 1, 1]
   nimFwWpaPendingMask = 0
@@ -320,7 +320,7 @@ proc dispatchOne(): bool =
         outcome = cast[proc(p: pointer): cint {.cdecl.}](mm_set_ps_options_req_handler)(p)
       of MM_SET_PS_MODE_REQ:
         if holdMMMode:
-          mmPsModeRequest = p
+          psHeldRequest = p
           outcome = KeMsgNoFree
         else: ke_msg_send_basic_reply(p, MM_SET_PS_MODE_CFM)
       else: doAssert false
@@ -334,10 +334,10 @@ proc dispatchOne(): bool =
   elif outcome == KeMsgSaved: co_list_push_back(addr keMsgQueueSaved, cast[ptr CoListHdr](header))
   true
 proc releaseMM() =
-  ## MM completes the PS command it held (mmPsModeComplete).
-  let request = mmPsModeRequest
+  ## MM's PS transition ends and answers the request it held (psFinish).
+  let request = psHeldRequest
   doAssert request != nil
-  mmPsModeRequest = nil
+  psHeldRequest = nil
   holdMMMode = false
   ke_msg_send_basic_reply(request, MM_SET_PS_MODE_CFM)
   ke_msg_free(keMsgHdrFromPayload(request))
@@ -371,12 +371,12 @@ proc finish() =
   # finish an exchange already started.
   discard smGo(SmIdleState)
   smActivationCancel()
-  if mmPsModeRequest != nil: releaseMM()
+  if psHeldRequest != nil: releaseMM()
   drain()
   while keMsgQueueSent.first != nil: ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
   while keMsgQueueSaved.first != nil: ke_msg_free(co_list_pop_front(addr keMsgQueueSaved))
   doAssert allocated.len == 0
-  doAssert meControlCommand == nil and meControlReply == nil and mmPsModeRequest == nil
+  doAssert meControlCommand == nil and meControlReply == nil and psHeldRequest == nil
 """
 
 
@@ -607,7 +607,7 @@ finish()
 begin()
 holdMMMode = true
 drain()
-doAssert mmPsModeRequest != nil and meControlCommand != nil and smActivationLive()
+doAssert psHeldRequest != nil and meControlCommand != nil and smActivationLive()
 endAttempt()
 releaseMM()
 drain()

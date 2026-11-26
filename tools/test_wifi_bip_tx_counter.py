@@ -276,7 +276,7 @@ const InvalidFrameDescIndex = high(uint32)
 var
   ownedDescriptor: pointer
   mmBcnGeneration: uint32
-  txResetEpoch, psModeBuildSerial: uint32
+  txResetEpoch: uint32
   rxVifEpochs: array[MAX_VIFS, uint32]
   stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
   txFrameIdentities: array[1, TxFrameIdentity]

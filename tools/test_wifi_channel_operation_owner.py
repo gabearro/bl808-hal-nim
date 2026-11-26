@@ -6,7 +6,7 @@ import re
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_pm_source
 from test_wifi_message_allocation import run_program
 
 
@@ -140,6 +140,7 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     code = layouts("ChanCtxtDefView", "ChanScanPoolOverlay", "ChanScanReqPayload",
                    "ChanRocOverlay", "MmRemainOnChannelReqPayload") + PLATFORM
+    code += ps_pm_source()
     code += procedure(kernel, "chanScanDurationTicks")
     code += re.search(r"(?ms)^template chanScanChannel\(.*?(?=^proc )", kernel).group()
     for name in ("chan_scan_req", "chan_roc_req", "chanCtxtOpEvent", "chan_ctxt_op_evt"):

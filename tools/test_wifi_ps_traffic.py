@@ -1,4 +1,9 @@
-"""Exercise dynamic power-save decisions and real traffic-timer handoff."""
+"""Exercise dynamic power-save decisions and real traffic-timer handoff.
+
+The decision tests stub ps_dpsm_update; the transition tests run the real
+machine (the harness of test_wifi_ps_table.py) with the real traffic
+detector.
+"""
 
 from pathlib import Path
 
@@ -6,10 +11,10 @@ import pytest
 
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
-from test_wifi_ps_timer_dispatch import TIMER_OWNER_PLATFORM
+from test_wifi_ps_table import ps_source as machine_source
 
 
-PLATFORM = TIMER_OWNER_PLATFORM + r'''
+PLATFORM = r'''
 const
   VIF_TYPE_STA = 0'u8
   MACHW_TIMLO_REG = 0x24B00120'u
@@ -29,8 +34,7 @@ var
   vifEnv: VifEnv
   chanEnv: ChanEnv
   td_env: array[2, TdEntryView]
-  rxVifEpochs, tdEpochs, tdCfmCommittedEpochs: array[MAX_VIFS, uint32]
-  tdCfmScheduled: array[MAX_VIFS, bool]
+  tdCfmArmed: array[MAX_VIFS, bool]
   cfgElements: array[2, uint32]
   updates: seq[uint32]
   updateCalls: seq[tuple[index: uint8, status: uint32, oldFlags: uint8]]
@@ -70,32 +74,12 @@ proc regRead(address: uint): uint32 =
   doAssert address == MACHW_TIMLO_REG
   macNow
 proc macTimeNow(): uint32 = regRead(MACHW_TIMLO_REG)
-proc volatileLoad(p: ptr uint32): uint32 =
-  doAssert cast[uint](p) == 0x24B0004C'u
-  powerControl
-proc volatileStore(p: ptr uint32; value: uint32) =
-  doAssert cast[uint](p) == 0x24B0004C'u
-  powerControl = value
-proc chan_is_on_channel(p: pointer): bool = true
-proc txl_frame_send_null_frame(sta: uint8; callback: pointer; arg: uint32): uint8 =
-  sends.add((sta, callback, arg))
-  if onNullSend != nil: onNullSend(sta, callback)
-  nullSendStatus
-proc ps_disable_cfm(p: pointer; status: uint32) {.cdecl.} = discard
-proc ps_enable_cfm_handle(p: pointer) =
-  completions.add(("enable", p, ps.flags, ps.pendingCount))
-proc ps_disable_cfm_handle(p: pointer): uint32 =
-  completions.add(("disable", p, ps.flags, ps.pendingCount))
-  1
 proc mm_timer_set(timer: pointer; expiry: uint32) =
   schedules.add((timer, expiry))
   if timer == psTxNullTimer(): nullTimerArmed = true
 proc mm_timer_clear(timer: pointer) =
   doAssert timer == psTxNullTimer()
   nullTimerArmed = false
-proc txlFrameCallbackCurrent(): bool = true
-proc ps_check_tx_status_part0_nim(p, cb: pointer): uint32 =
-  raiseAssert "expected confirmed null TX"
 proc irqSave(): bool =
   result = interrupts
   interrupts = false
@@ -130,12 +114,7 @@ proc setup() =
   ps = PsEnvView(enabled: 1, flags: 1, statusFlags: 0xA0000000'u32)
   params = BlPsParamsView(trafficPeriod: 100, trafficThreshold: 1, txNullTimeout: 50)
   td_env = default(typeof(td_env))
-  rxVifEpochs = default(typeof(rxVifEpochs))
-  tdEpochs = default(typeof(tdEpochs))
-  txResetEpoch = 0
-  psModeBuildSerial = 0
-  psTxNullOwner = default(PsTxNullOwner)
-  peerEpoch = 0
+  tdCfmArmed = default(typeof(tdCfmArmed))
   for index in 0 .. 1:
     vifs[index] = Vif(vifIdx: index.uint8, state: 1, staIdx: (index + 2).uint8)
     td_env[index].vifIdx = index.uint8
@@ -164,29 +143,25 @@ proc setup() =
 '''
 
 
-def source(*, real_transition: bool = False, timer: bool = False,
-           timer_only: bool = False) -> str:
+def source(*, timer_only: bool = False) -> str:
     layout = (FW / "layout_types.nim").read_text()
     types = "type\n"
     for name in ["PsEnvView", "BlPsParamsView", "TdEntryView", "TdConfigView"]:
         types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     logger_type = (FW / "global_state/c_runtime.nim").read_text().split("# Helper:", 1)[0]
     power = (FW / "power_save.nim").read_text()
-    transition = (procedure(power, "ps_dpsm_update") if real_transition else r'''
+    transition = r'''
 proc ps_dpsm_update(enable: uint32): uint32 {.discardable.} =
   updates.add(enable)
   updateResult
-''')
+'''
     notification = (r'''
 proc ps_traffic_status_update(index: uint8; status: uint32): uint32 {.discardable.} =
   updateCalls.add((index, status, td_env[index].prevFlags))
   updateResult
 ''' if timer_only else procedure(power, "ps_traffic_status_update"))
-    result = (types + logger_type + PLATFORM + procedure(power, "ps_enable_cfm")
-              + transition + notification)
-    if timer or timer_only:
-        result += procedure((FW / "traffic_detection.nim").read_text(),
-                            "tdOperationCurrent")
+    result = types + logger_type + PLATFORM + transition + notification
+    if timer_only:
         result += procedure(power, "td_timer_end")
     return result
 
@@ -251,144 +226,121 @@ for gate in 0 .. 3:
   ps_traffic_status_update(0, 0)
   doAssert updates == @[0'u32] and lookups == 0
 
-# The state may change while logging. Vendor reloads it before deciding.
-setup()
-logging = true
-td_env[1].prevFlags = 8
-onLog = proc() = ps.flags = 9
-ps_traffic_status_update(0, 0)
-doAssert messages.len == 1 and updates.len == 0
-
-# A diagnostic callback may synchronously turn power save off or leave DPSM.
-for action in 0 .. 1:
-  setup()
-  logging = true
-  td_env[1].prevFlags = 8
-  onLog = proc() =
-    if action == 0: ps.enabled = 0
-    else: ps.flags = 0
-  doAssert ps_traffic_status_update(0, 0) == 0
-  doAssert messages.len == 1 and updates.len == 0
 ''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_real_traffic_timer_and_null_frame_transition(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source(real_transition=True, timer=True) + r'''
+    run_program(tmp_path, mode, machine_source(td=True) + r'''
 # Last active VIF becomes idle. Its old traffic flags must not keep it awake.
-setup()
-vifs[0].next = nil
-ps.flags = 9
-logging = true
-td_env[0].prevFlags = 12
-td_env[0].endActive = 1
-td_timer_end(addr td_env[0])
-doAssert td_env[0].prevFlags == 0
-doAssert ps.flags == 13 and ps.statusFlags == 0xA0000000'u32
-doAssert ps.pendingCount == 1 and ps.currentVif == cast[pointer](addr vifs[0])
-doAssert powerControl == 0xA5000004'u32
-doAssert sends == @[(2'u8, cast[pointer](ps_enable_cfm), pointerAddrU32(addr vifs[0]))]
-doAssert schedules == @[(psTxNullTimer(), 1050'u32), (cast[pointer](addr td_env[0]), 1100'u32)]
-doAssert completions.len == 0 and messages == @["Power Status nul:nul\r\n"]
+enter(2)
+discard ps_traffic_status_update(0, 4)
+doAssert ps.flags == 9 and (pmRegister and 4) == 0
+frames.setLen(0)
+let td = addr tdEntries[0]
+td.prevFlags = 12
+td.endActive = 1
+td_timer_end(td)
+doAssert td.prevFlags == 0
+doAssert ps.flags == 13 and psOwn.kind == psSleep and ps.pendingCount == 1
+doAssert (pmRegister and 4) != 0 and (ps.statusFlags and 8) == 0
+doAssert frames.len == 1 and frames[0].callback == cast[pointer](ps_enable_cfm)
+doAssert opCurrent(psOwn.op, frames[0].arg) and frames[0].pm
+doAssert nullTimerArmed and tdArms == @[(0'u8, macNow + params.trafficPeriod)]
 
-# New traffic wakes the station. No TIM override is scheduled by the stub,
-# so the periodic traffic timer must still be armed.
-setup()
-vifs[0].next = nil
-logging = true
-td_env[0].psRxCount = 1
-td_env[0].endActive = 1
-td_timer_end(addr td_env[0])
-doAssert td_env[0].prevFlags == 4 and td_env[0].psRxCount == 0
-doAssert ps.flags == 3 and ps.statusFlags == 0xA0000008'u32
-doAssert ps.pendingCount == 0 and powerControl == 0xA5000000'u32
-doAssert sends == @[(2'u8, cast[pointer](nil), 0'u32)]
-doAssert schedules == @[(cast[pointer](addr td_env[0]), 1100'u32)]
-doAssert completions == @[("disable", cast[pointer](addr vifs[0]), 3'u8, 0'u8)]
-doAssert messages == @["Power Status TX:nul\r\n"]
+# New traffic wakes the station. No TIM window is handed over (the PM word is
+# 0), so the periodic traffic timer is still armed.
+deliver(0, TxAck)
+doAssert ps.flags == 1 and psOwn.kind == psIdle
+frames.setLen(0)
+tdArms.setLen(0)
+td.psRxCount = 1
+td.endActive = 1
+td_timer_end(td)
+doAssert td.prevFlags == 4 and td.psRxCount == 0
+doAssert ps.flags == 9 and psOwn.kind == psIdle and (pmRegister and 4) == 0
+doAssert (ps.statusFlags and 8) != 0
+doAssert frames.len == 1 and frames[0].callback == nil and not frames[0].pm
+doAssert tdArms == @[(0'u8, macNow + params.trafficPeriod)]
+doAssert not tdCfmArmed[0]
 
 # An idle notification cannot start sleep while the other STA is busy.
-setup()
-ps.flags = 9
-logging = true
-td_env[0].prevFlags = 12
-td_env[0].endActive = 1
-td_env[1].prevFlags = 8
-td_timer_end(addr td_env[0])
-doAssert ps.flags == 9 and ps.pendingCount == 0
-doAssert sends.len == 0 and completions.len == 0
-doAssert schedules == @[(cast[pointer](addr td_env[0]), 1100'u32)]
-doAssert messages == @["Power Status nul:nul\r\n", "ps_traffic_status_update:1187\r\n"]
+enter(2, 2)
+discard ps_traffic_status_update(0, 4)
+frames.setLen(0)
+tdArms.setLen(0)
+tdEntries[0].prevFlags = 12
+tdEntries[0].endActive = 1
+tdEntries[1].prevFlags = 8
+td_timer_end(addr tdEntries[0])
+doAssert ps.flags == 9 and psOwn.kind == psIdle and frames.len == 0
+doAssert tdArms == @[(0'u8, macNow + params.trafficPeriod)]
 ''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_dynamic_transition_completion_skips_ap_vifs(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source(real_transition=True) + r'''
+    """With every frame refused the transition ends where it starts; the
+    commit goes to the last STA VIF on the list, never to an AP VIF."""
+    run_program(tmp_path, mode, machine_source() + r'''
 for enable in [0'u32, 1]:
   for placement in 0 .. 2:
-    setup()
+    enter(2, 2)                 # dynamic PS, asleep
+    if enable == 0:
+      discard ps_traffic_status_update(0, 4)
+      ackAll()                  # awake
+    frames.setLen(0)
     nullSendStatus = 1
+    for index in 0 .. 1: vifs[index].keyPsState = 7
     case placement
     of 0: vifs[0].vifType = 1
     of 1: vifs[1].vifType = 1
     else:
       vifs[0].vifType = 1
       vifs[1].vifType = 1
-    let expectedVif: pointer =
-      if placement == 0: addr vifs[1]
-      elif placement == 1: addr vifs[0]
-      else: nil
+    let expected =
+      if placement == 0: 1 elif placement == 1: 0 else: -1
     discard ps_dpsm_update(enable)
-    doAssert ps.pendingCount == 0 and schedules.len == 0
-    doAssert sends.len == (if expectedVif == nil: 0 else: 1)
-    doAssert completions == @[(
-      (if enable == 0: "enable" else: "disable"), expectedVif,
-      (if enable == 0: 5'u8 else: 3'u8), 0'u8)]
+    nullSendStatus = 0
+    doAssert psOwn.kind == psIdle and ps.pendingCount == 0 and not nullTimerArmed
+    doAssert frames.len == (if expected < 0: 0 else: 1)
+    for index in 0 .. 1:
+      let committed = if enable == 0: 1'u32 else: 0'u32
+      doAssert vifs[index].keyPsState == (if index == expected: committed else: 7'u32)
+    doAssert ps.flags == (if enable == 0: 1'u8 else: 9'u8)
 ''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_dynamic_null_timer_tracks_only_unfinished_batch(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source(real_transition=True) + r'''
+    """The sleep's timer is armed before its frames; frames confirmed while
+    the walk still sends only count, and the sleep ends with its last frame."""
+    run_program(tmp_path, mode, machine_source() + r'''
+proc inlineFor(mask: int): proc() =
+  result = proc() =
+    let index = frames.len - 1
+    doAssert nullTimerArmed and psOwn.kind == psSleep
+    if (mask and (1 shl (frames[index].sta.int - 2))) != 0: deliver(index, TxAck)
+    onSend = inlineFor(mask)
 for inlineMask in [3, 0, 1, 2]:
-  setup()
-  ps.flags = 9
-  onNullSend = proc(sta: uint8, cb: pointer) =
-    doAssert cb == cast[pointer](ps_enable_cfm) and completions.len == 0
-    if (inlineMask and (1 shl (sta.int - 2))) != 0:
-      ps_enable_cfm(addr vifs[sta - 2], 0x00800000)
+  enter(2, 2)
+  discard ps_traffic_status_update(0, 4)
+  frames.setLen(0)
+  onSend = inlineFor(inlineMask)
   discard ps_dpsm_update(0)
-  doAssert sends.len == 2 and interrupts
+  onSend = nil
+  doAssert frames.len == 2 and interrupts
   if inlineMask == 3:
-    doAssert completions.len == 1 and ps.pendingCount == 0
-    doAssert schedules.len == 0 and not nullTimerArmed
+    doAssert psOwn.kind == psIdle and ps.pendingCount == 0 and not nullTimerArmed
   else:
-    doAssert completions.len == 0 and nullTimerArmed
-    doAssert schedules == @[(psTxNullTimer(), 1050'u32)]
+    doAssert psOwn.kind == psSleep and nullTimerArmed
     for i in 0 .. 1:
       if (inlineMask and (1 shl i)) == 0:
-        ps_enable_cfm(addr vifs[i], 0x00800000)
+        deliver(i, TxAck)
         if ps.pendingCount != 0:
-          doAssert nullTimerArmed and completions.len == 0
-    doAssert completions.len == 1 and ps.pendingCount == 0 and not nullTimerArmed
-
-for enable in [0'u32, 1]:
-  setup()
-  onNullSend = proc(sta: uint8, cb: pointer) =
-    inc txResetEpoch
-    ps.pendingCount = 7
-  discard ps_dpsm_update(enable)
-  doAssert ps.pendingCount == 7 and sends.len == 1 and interrupts
-  doAssert completions.len == 0 and schedules.len == 0
-
-# The interface generation must be captured before the callback-bearing push.
-setup()
-vifs[0].next = nil
-onNullSend = proc(sta: uint8, cb: pointer) = inc peerEpoch
-discard ps_dpsm_update(0)
-doAssert psTxNullOwner.armed and psTxNullOwner.peer.vif == addr vifs[0]
-doAssert not mmVifCurrent(psTxNullOwner.peer)
+          doAssert nullTimerArmed and psOwn.kind == psSleep
+    doAssert psOwn.kind == psIdle and ps.pendingCount == 0 and not nullTimerArmed
+  doAssert ps.flags == 1
 ''')
 
 

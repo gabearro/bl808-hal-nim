@@ -64,7 +64,6 @@ proc vif_mgmt_reset() =
   doAssert irqLevel == 0
   steps.add("vif-reset")
 proc apmResumeHaltRollback() = doAssert irqLevel == 0
-proc mmPsModeRetryAfterReset() = doAssert irqLevel == 0
 proc ke_evt_clear(mask: uint32) =
   doAssert irqLevel == 0
   steps.add("clear:" & $mask)

@@ -162,9 +162,10 @@ proc smCleanupCancel()
 proc smAbandon()
 proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
                     disconnected = false; status = 0'u16; reason = 0'u16): bool
-proc mmPsModeCancel()
-proc mmPsModeComplete()
-proc mmPsModeRetryAfterReset()
+proc psCancel()
+proc psDwellBegin()
+proc psDwellEnd()
+proc psAwake(): bool
 proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.}
 proc staMgmtBeginRemoval(staIdx: uint8; owner: var StaQueueIdentity): pointer
 proc staMgmtFinishRemoval(owner: StaQueueIdentity): bool {.discardable.}
@@ -393,15 +394,14 @@ proc rfc_sg_stop*() {.exportc, cdecl.}
 proc rfc_rf_fsm_force*(mode: uint32) {.exportc, cdecl.}
 proc rfc_rc_fsm_force*(mode: uint32) {.exportc, cdecl.}
 proc ps_uapsd_timer_handle*() {.exportc, cdecl.}
-proc ps_tx_null_timer_handle*() {.exportc, cdecl.}
+proc ps_tx_null_timer_handle*(env: pointer) {.exportc, cdecl.}
 proc mm_ps_change_ind*(staIdx: uint8, psState: uint8) {.exportc, cdecl.}
 proc apmPsCapture(staEntry: pointer): ApmPsSession
 proc apmPsSessionCurrent(identity: ApmPsSession): bool
-proc ps_disable_cfm*(vifEntry: pointer, statusFlags: uint32) {.exportc, cdecl.}
-  ## PS disable confirmation (sends MM_SET_PS_MODE_CFM).
-  ## Forward declaration - implementation at PS section.
-proc ps_enable_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.}
-  ## PS enable confirmation. Forward declaration — impl at PS section.
+proc ps_disable_cfm*(env: pointer, statusFlags: uint32) {.exportc, cdecl.}
+proc ps_enable_cfm*(env: pointer, status: uint32) {.exportc, cdecl.}
+proc ps_check_tx_status_part0_nim*(vifEntry: pointer, completionFn: pointer): uint32
+  {.exportc: "ps_check_tx_status_part0_nim", cdecl.}
 proc ps_enable_cfm_handle*(vifEntry: pointer) {.exportc, cdecl, noinline.}
 proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.}
 proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.}

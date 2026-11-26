@@ -64,7 +64,7 @@ for vif in 0'u8 .. 1:
   psDeferred = true
   doAssert dispatchStart() == KeMsgNoFree
   drainStartup(limit = 1)
-  doAssert meState == MeBusyState and mmPsModeRequest != nil
+  doAssert meState == MeBusyState and psOwn.request != nil
   apm_start_cfm(cast[pointer](1'u))
   drainStartup()
   doAssert cfms.len == 0 and not requestFreed and channelDeletes == 0
@@ -83,9 +83,9 @@ for vif in 0'u8 .. 1:
   cfms.setLen(0)
 
   psDeferred = false
-  mmPsModeComplete()
+  psComplete()
   drainStartup()
-  doAssert meState == MeIdleState and mmPsModeRequest == nil
+  doAssert meState == MeIdleState and psOwn.request == nil
   doAssert me.activeMask == 0 and me.psDisableMask == 0
   doAssert cfms.len == 1 and cfms[0].status == 1
   doAssert requestFreed and allocated.len == 0 and channelDeletes == 1

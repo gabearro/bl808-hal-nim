@@ -613,7 +613,7 @@ proc smBssCancel() = discard
 proc smCleanupCancel() = discard
 proc smDeferredCancel() = discard
 proc smAbandon() = discard
-proc mmPsModeCancel() = discard
+proc psCancel() = discard
 proc meControlReset() = discard
 proc apmCancelPendingForVif(i: uint8) = discard
 proc mm_bcn_flush_updates(send: bool) = discard
@@ -629,7 +629,6 @@ proc mmEnvView(): ptr typeof(mm) = addr mm
 proc mm_reset() = discard
 proc vif_mgmt_reset() = discard
 proc apmResumeHaltRollback() = discard
-proc mmPsModeRetryAfterReset() = discard
 proc ke_reschedule_saved_messages(task: uint8): bool = false
 '''
     return (source + procedure(kernel, "ke_init") + procedure(kernel, "ke_flush")

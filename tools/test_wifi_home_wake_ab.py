@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_machine_source
 from test_wifi_frame_preparation import PLATFORM as TX_PLATFORM
 from test_wifi_message_allocation import run_program
 
@@ -23,6 +23,7 @@ var
   chanCtxtEpochs: array[3, uint32]
   chanEnv: tuple[currentCtxt, scheduledCtxt: pointer]
   psEnv: tuple[enabled: uint8, statusFlags: uint32]
+  psOwn: tuple[pm: bool]
   pendingTimer: ptr MmTimerView
   txEnv: tuple[packetCounter: uint32]
   events: uint32
@@ -79,7 +80,7 @@ proc checkFrame(): ptr HostTxDescView =
   let hw = hostTxHwDescAt(result.hwDesc)
   doAssert hw.ackPolicyControl == 0x200 and hw.retryLimitControl == 0
   let owner = txFrameIdentities[txl_frame_desc_index(result)]
-  doAssert owner.leased and not owner.psTracked
+  doAssert owner.leased
   when defined(bl808WifiBenchConnectedScanAB):
     doAssert result.callback == cast[pointer](chanHomeWakeComplete)
   else:
@@ -220,5 +221,6 @@ def test_home_wake_ab(tmp_path: Path, defines: tuple[str, ...]) -> None:
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", functions)))
     ) + "  nimFwDbgAutoNullSkipped: uint32\n"
+    functions += ps_machine_source("psAwake", record=False)
     code = platform[:split] + types + platform[split:] + PLATFORM + debug + functions + wake
     run_program(tmp_path, "firmware", code + CHECKS, defines=defines)

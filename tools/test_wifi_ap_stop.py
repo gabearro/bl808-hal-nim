@@ -87,7 +87,7 @@ for vif in 0'u8 .. 1:
   psDeferred = true
   doAssert consumeStop(p) == KeMsgNoFree
   drainStartup()
-  doAssert mmPsModeRequest != nil and meState == MeBusyState
+  doAssert psOwn.request != nil and meState == MeBusyState
   doAssert apmStopActive and p in allocated
   doAssert controlReplies.len == 0 and deinitialized == 0 and channelDeletes == 0
   doAssert vifs[vif].chanCtxt != nil and vifs[vif].state == 1
@@ -106,7 +106,7 @@ for vif in 0'u8 .. 1:
     doAssert me.psDisableMask == 0 and controlReplies.len == 0
     doAssert consumeStop(duplicate) == KeMsgSaved
   psDeferred = false
-  mmPsModeComplete()
+  psComplete()
   drainStartup()
   doAssert deinitialized == 1 and controlReplies.len == 1
   doAssert consumeStop(duplicate) == KeMsgConsumed

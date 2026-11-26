@@ -1,4 +1,10 @@
-"""Check traffic timer transitions against td.o's branch behavior."""
+"""Check traffic timer transitions against td.o's branch behavior.
+
+td_timer_end re-arms its own timer unless td_cfm_set_timer armed it for the
+same VIF during the traffic update (tdCfmArmed); td.o passes that back as the
+update's return value. Nothing it calls can retire its VIF or entry, and it
+does not look at the TX reset epoch.
+"""
 
 from pathlib import Path
 
@@ -31,9 +37,7 @@ var
   postCalls: int
   notifications: seq[tuple[vifIdx: uint8, status: uint32]]
   schedules: seq[uint32]
-  rxVifEpochs, tdEpochs, tdCfmCommittedEpochs: array[MAX_VIFS, uint32]
-  tdCfmScheduled: array[MAX_VIFS, bool]
-  txResetEpoch: uint32
+  tdCfmArmed: array[MAX_VIFS, bool]
   onPost, onUpdate: proc()
 proc blPsParamsView(): ptr BlPsParamsView = addr params
 proc regRead(address: uint): uint32 =
@@ -63,7 +67,7 @@ proc tdEntryForVif(index: uint8): ptr TdEntryView =
   doAssert index == 1
   addr td
 ''' + helpers + "".join(procedure((FW / "traffic_detection.nim").read_text(), name)
-                        for name in ("tdOperationCurrent", "td_cfm_set_timer")) + procedure(
+                        for name in ("td_cfm_set_timer",)) + procedure(
         (FW / "power_save.nim").read_text(), "td_timer_end")
 
 
@@ -123,29 +127,8 @@ doAssert schedules == @[0x3D8'u32]
 
 
 @pytest.mark.parametrize("mode", ["checked", "firmware"])
-def test_timer_end_aborts_after_reentrant_owner_change(tmp_path: Path, mode: str) -> None:
+def test_timer_end_rejects_invalid_entries(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
-params.trafficPeriod = 1000
-params.trafficThreshold = 2
-now = 10
-td = TdEntryView(vifIdx: 1, endActive: 1, psRxCount: 2, rxCount: 3)
-onPost = proc() =
-  inc tdEpochs[1]
-  td = TdEntryView(vifIdx: 1, active: 1, rxCount: 77)
-td_timer_end(addr td)
-doAssert td.rxCount == 77 and td.prevFlags == 0
-doAssert notifications.len == 0 and schedules.len == 0
-
-onPost = nil
-td = TdEntryView(vifIdx: 1, endActive: 1, psRxCount: 2, rxCount: 3)
-onUpdate = proc() =
-  inc rxVifEpochs[1]
-  td = TdEntryView(vifIdx: 1, active: 1, rxCount: 88)
-td_timer_end(addr td)
-doAssert notifications == @[(1'u8, 4'u32)]
-doAssert td.rxCount == 88 and td.prevFlags == 0 and schedules.len == 0
-
-onUpdate = nil
 td = TdEntryView(vifIdx: 255, endActive: 1, rxCount: 3)
 let previousPosts = postCalls
 td_timer_end(addr td)
@@ -161,34 +144,26 @@ params.trafficPeriod = 1000
 params.trafficThreshold = 3
 channel.currentCtxt = cast[pointer](0x1234'u)
 vif.chanCtxt = channel.currentCtxt
-for replacement in [false, true]:
-  schedules.setLen(0)
-  notifications.setLen(0)
-  now = 1000
-  postResult = 1
-  updateResult = 1
-  td = TdEntryView(vifIdx: 1, active: 1, endActive: 1, period: 40, rxCount: 3)
-  onUpdate = proc() =
-    td_cfm_set_timer(1, 1)
-    if replacement:
-      inc tdEpochs[1]
-      td = TdEntryView(vifIdx: 1, active: 1, rxCount: 77)
-  td_timer_end(addr td)
-  doAssert notifications == @[(1'u8, 1'u32)]
-  doAssert schedules == @[1040'u32], "periodic timer overwrote the PS confirmation"
-  if replacement:
-    doAssert td.rxCount == 77 and td.prevFlags == 0
-  else:
-    doAssert td.prevFlags == 9 and td.rxCount == 0 and td.period == 0
-    doAssert td.endActive == 1
-    onUpdate = nil
-    now = 1040
-    postResult = 0
-    updateResult = 0
-    td_timer_end(addr td)
-    doAssert notifications == @[(1'u8, 1'u32), (1'u8, 0'u32)],
-      "idle edge was not delivered to dynamic PS"
-    doAssert td.prevFlags == 0 and schedules == @[1040'u32, 2040'u32]
+schedules.setLen(0)
+notifications.setLen(0)
+now = 1000
+postResult = 1
+updateResult = 1
+td = TdEntryView(vifIdx: 1, active: 1, endActive: 1, period: 40, rxCount: 3)
+onUpdate = proc() = td_cfm_set_timer(1, 1)
+td_timer_end(addr td)
+doAssert notifications == @[(1'u8, 1'u32)]
+doAssert schedules == @[1040'u32], "periodic timer overwrote the PS confirmation"
+doAssert td.prevFlags == 9 and td.rxCount == 0 and td.period == 0
+doAssert td.endActive == 1
+onUpdate = nil
+now = 1040
+postResult = 0
+updateResult = 0
+td_timer_end(addr td)
+doAssert notifications == @[(1'u8, 1'u32), (1'u8, 0'u32)],
+  "idle edge was not delivered to dynamic PS"
+doAssert td.prevFlags == 0 and schedules == @[1040'u32, 2040'u32]
 ''')
 
 

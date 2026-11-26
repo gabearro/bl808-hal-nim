@@ -53,7 +53,6 @@ proc vif_mgmt_reset() =
 proc apmResumeHaltRollback() =
   doAssert not interrupts
   steps.add("apm")
-proc mmPsModeRetryAfterReset() = doAssert not interrupts
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert not interrupts and task == TASK_MM and state == HW_ACTIVE.uint16
   steps.add("state")

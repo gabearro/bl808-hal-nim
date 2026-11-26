@@ -41,7 +41,7 @@ var
   messages: seq[string]
   events: seq[string]
   retireOnLog, retireOnSend: bool
-  resetOnLog: bool
+  resetOnSend: bool
   replaceOnLog, clearOnArm: bool
   delivery: MmTimerMutation
   interruptsEnabled: bool
@@ -101,6 +101,10 @@ proc txlSendUapsdTrigger(station: uint8; qos: uint16; callback: pointer): uint8 
     vifs[0].flags = vifs[0].flags or 2'u32
   if retireOnSend and station == 1:
     retireFirstVif()
+  if resetOnSend:
+    # The trigger's allocation recovery flushed AC3 and a protection
+    # completion reset TX (PS-N2).
+    inc txResetEpoch
   sendResult
 
 {.emit: "#include <stdarg.h>\n#include <stdio.h>".}
@@ -119,8 +123,6 @@ proc logWrite(level: uint32; tag, file: cstring; line: cint; format: cstring)
   if retireOnLog:
     retireOnLog = false
     retireFirstVif()
-  if resetOnLog:
-    inc txResetEpoch
   if replaceOnLog:
     delivery.cancelled = true
     schedules.add(999)
@@ -152,7 +154,7 @@ proc setup() =
   events.setLen(0)
   retireOnLog = false
   retireOnSend = false
-  resetOnLog = false
+  resetOnSend = false
   replaceOnLog = false
   clearOnArm = false
   delivery = default(MmTimerMutation)
@@ -329,17 +331,20 @@ for pending in [0'u32, 8]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_reset_during_log_and_stale_timer_do_not_send(tmp_path: Path, mode: str) -> None:
+def test_tx_reset_inside_a_trigger_keeps_the_timer(tmp_path: Path, mode: str) -> None:
+    """PS-N2: a TX reset inside the trigger's submission does not end the
+    trigger timer; it was left marked active with nothing armed, and
+    ps_uapsd_set never armed it again. A stopped timer does not send."""
     run_program(tmp_path, mode, source() + r'''
 setup()
-logging = true
-resetOnLog = true
+resetOnSend = true
 vifs[0].psLastTime = 0
-clocks = @[11'u32]
+clocks = @[11'u32, 20, 30]
 ps_uapsd_timer_handle()
-doAssert txResetEpoch == 1 and sends.len == 0 and schedules.len == 0
-doAssert vifs[0].flags == 0x80000000'u32 and vifs[0].psLastTime == 0
-doAssert clockIndex == 1
+doAssert txResetEpoch == 1 and sends == @[(1'u8, 7'u16)]
+doAssert vifs[0].flags == 0x80000008'u32 and vifs[0].psLastTime == 20
+doAssert schedules == @[50'u32] and ps.uapsdTimerActive == 1
+doAssert clockIndex == 3
 
 setup()
 ps.uapsdTimerActive = 0

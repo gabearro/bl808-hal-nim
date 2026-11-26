@@ -545,7 +545,7 @@ let reserved = smOwn.reply
 let before = calls
 holdMMMode = true
 drain()
-doAssert meControlReply == reserved and mmPsModeRequest != nil and calls == before
+doAssert meControlReply == reserved and psHeldRequest != nil and calls == before
 releaseMM()
 let answer = takeReply(2)
 doAssert answer == reserved, "[SMSTRUCT-N1] the forwarded answer is not SM's reserved reply"

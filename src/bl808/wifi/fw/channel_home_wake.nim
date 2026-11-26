@@ -41,11 +41,9 @@ proc chanHomeWakeTry(wake: ptr ChanHomeWake; saved: uint32) =
   let vif = vifChannelAt(peer.vif)
   let context = chanCtxtForIdx(wake.home)
   let env = chanEnvView()
-  let ps = psEnvView()
   if vif.state == 0 or vif.vifType != VIF_TYPE_STA or vif.chanCtxt != context or
       env.currentCtxt != context or env.scheduledCtxt != nil or
-      chanCtxtEpochs[wake.home] != wake.channelEpoch or
-      (ps.enabled != 0 and (ps.statusFlags and 8'u32) == 0):
+      chanCtxtEpochs[wake.home] != wake.channelEpoch or not psAwake():
     return
   let serial = wake.serial
   template callback: pointer =

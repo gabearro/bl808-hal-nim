@@ -17,7 +17,7 @@ import pytest
 
 from test_wifi_auth_frames import layouts
 from test_wifi_connless_timer_dispatch import source as connless_source
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_pm_source
 
 
 # The fixture models request ingress, delivery of the queued idle request to
@@ -236,7 +236,7 @@ def nim_source() -> str:
     code = code.replace("  delivered.add(cast[uint](p))", '  observed.add("aux")', 1)
     code = "var observed: seq[string]\nvar owners: array[5, int]\n" + code
     worker = procedure((FW / "kernel_mac_channel.nim").read_text(), "chanCtxtOpEvent")
-    return code + BRIDGE + worker + DRIVER
+    return code + BRIDGE + ps_pm_source() + worker + DRIVER
 
 
 WRAP = 1 << 32

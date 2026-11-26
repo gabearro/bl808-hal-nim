@@ -24,12 +24,10 @@ type Station = object
   instNbr: uint8
 var
   stations: array[STA_INFO_TAB_ENTRIES, Station]
-  stationEpochs: array[STA_INFO_TAB_ENTRIES, uint32]
   resetting: bool
 proc staInfoForIdx(index: uint8): ptr Station =
   doAssert index < STA_INFO_TAB_ENTRIES
   addr stations[index]
-proc staDeleteEpoch(index: uint8): uint32 = stationEpochs[index]
 proc txlResetting(): bool = resetting
 proc prepare() =
   setup()
@@ -39,9 +37,6 @@ proc prepare() =
   vif.flags = 0xA5A50006'u32
   stations = default(typeof(stations))
   for station in stations.mitems: station.instNbr = vif.vifIdx
-  stationEpochs = default(typeof(stationEpochs))
-  rxVifEpochs = default(typeof(rxVifEpochs))
-  txResetEpoch = 0
   resetting = false
   onLog = nil
 '''
@@ -85,38 +80,12 @@ for hasLogger in [false, true]:
               doAssert messages.len == 0
               doAssert events == (if eligible: @["traffic"] else: @[])
 ''',
-    "diagnostic_reentry": r'''
-for change in 0 .. 10:
-  prepare()
-  vif.uapsdBitmap = 2
-  var expected: Vif
-  onLog = proc() =
-    case change
-    of 0: inc txResetEpoch
-    of 1: resetting = true
-    of 2: inc stationEpochs[0]
-    of 3: inc rxVifEpochs[1]
-    of 4: stations[0].instNbr = 0
-    of 5: vif.state = 0
-    of 6: vif.vifType = 2
-    of 7: ps.enabled = 0
-    of 8: vif.vifIdx = 0
-    of 9: vif.uapsdBitmap = 0
-    else: mappedVif = nil
-    vif.flags = 0x12340000
-    vif.psLastTime = 0x55667788
-    expected = vif
-  doAssert not ps_check_tx_frame(0, 0)
-  doAssert messages == @[(1097.cint, "tx frame: UAPSD\r\n")]
-  doAssert events == @["log:1097"]
-  doAssert vif == expected, "wrote PS state after the diagnostic changed its owner"
-
-# An unrelated station/VIF change must not suppress a current TX notification.
+    # The logger cannot change the station, the VIF or PS, so nothing is
+    # checked again after it (as ps.o does not); the update follows the log.
+    "log_then_update": r'''
 prepare()
 vif.uapsdBitmap = 2
-onLog = proc() =
-  inc stationEpochs[1]
-  inc rxVifEpochs[0]
+onLog = proc() = doAssert vif.flags == 0xA5A50006'u32 and vif.psLastTime == 42
 doAssert not ps_check_tx_frame(0, 0)
 doAssert events == @["log:1097", "time"]
 doAssert vif.flags == 0xA5A5000E'u32 and vif.psLastTime == macNow

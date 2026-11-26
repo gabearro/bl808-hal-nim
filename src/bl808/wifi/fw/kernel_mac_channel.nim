@@ -761,8 +761,11 @@ proc ke_flush*() {.exportc, cdecl.} =
   chanSwitchReset()
   # The flush frees every message SM waits on: drop its attempt or teardown.
   smAbandon()
-  mmPsModeCancel()
+  # ME before PS, as me_init then mm_init: meControlReset forgets ME's
+  # request before cancelling the transition that holds it, so psCancel
+  # frees only a host's.
   meControlReset()
+  psCancel()
   for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
     apmCancelPendingForVif(vifIdx)
   mm_bcn_flush_updates(false)
@@ -2864,7 +2867,6 @@ proc mm_force_idle_req*(): bool {.exportc, cdecl, discardable.} =
   let mm = mmEnvView()
   mm.previousState = 0
   mm.hardwareMode = 0
-  mmPsModeRetryAfterReset()
   true
 
 proc mm_back_to_host_idle*() {.exportc, cdecl.} =
@@ -6353,33 +6355,23 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     # then reactivates the MAC before the queued indication is dispatched.
     regWrite(MACHW_BASE + 0x220'u, 0'u32)
     scanDwellPost(MM_SCAN_CHANNEL_START_IND)
-    let saved = irqSave()
-    let ps = psEnvView()
-    ps.statusFlags = ps.statusFlags or 0x02'u32
-    irqRestore(saved)
-    # chan_pre_switch_channel+0x128 saves only the PM field for restoration.
-    env.surveySnapshot = ((regRead(MACHW_BASE + 0x4C'u) shr 2) and 1'u32).uint8
     rfPhyTraceCheckpoint(0x45'u32)
     rfPhyTraceCheckpoint(0x46'u32)
-    blmac_pwr_mgt_setf(0)
+    # The dwell holds the PM bit at 0 until it ends. chan.o saves the bit
+    # here (+0x128) and restores it at the end; PS's own choice is applied
+    # then instead (ps_machine.nim).
+    psDwellBegin()
     rfPhyTraceCheckpoint(0x47'u32)
     mm_active()
     rfPhyTraceCheckpoint(0x48'u32)
   elif contextIndexOrMarker == 4:
-    # .L232: ROC type -- IRQ-safe flag set + schedule survey
-    let saved = irqSave()
-    let ps = psEnvView()
-    ps.statusFlags = ps.statusFlags or 0x02'u32
-    irqRestore(saved)
-    env.surveySnapshot = ((regRead(MACHW_BASE + 0x4C'u) shr 2) and 1'u32).uint8
-    # Blob 0x130: blmac_pwr_mgt_setf(0) to disable power-save during ROC
-    blmac_pwr_mgt_setf(0)
+    # .L232: ROC type -- the dwell holds the PM bit at 0 (blob 0x130).
+    psDwellBegin()
     mm_active()
     waitRfUs(1000'u32)
   elif contextIndexOrMarker <= 2:
     mmReplayEdca()
-    let ps = psEnvView()
-    if ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0:
+    if psAwake():
       # Blob .L221: leave PS mode before notifying associated STA VIFs on the
       # active VIF list. The list head is vif_mgmt_env+8, not chan_env.
       blmac_pwr_mgt_setf(0)
@@ -6649,9 +6641,9 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
         outside: chan_switch_start(nextChan)
         return
   if env.currentCtxt != ctxtPtr: return
-  let ps = psEnvView()
-  ps.statusFlags = ps.statusFlags and not 0x02'u32
-  outside: blmac_pwr_mgt_setf(env.surveySnapshot.uint32)
+  # The dwell ends: PS's PM bit applies again (chan.o restores the bit saved
+  # when the dwell began).
+  outside: psDwellEnd()
   if not current(): return
   # Blob clears chan_env+0x20 (current context) for completed scan/ROC
   # context operations before retiring the context type. Without this, the

@@ -63,7 +63,6 @@ proc vif_mgmt_reset() = checkResetContext()
 proc apmResumeHaltRollback() = checkResetContext()
 template smSaQueryResetScope() = discard
 proc smSaQueryClearResetTimer() = checkResetContext()
-proc mmPsModeRetryAfterReset() = checkResetContext()
 proc ke_reschedule_saved_messages(task: uint8): bool =
   checkResetContext()
   doAssert task == TASK_MM
@@ -215,7 +214,6 @@ proc txl_reset(): bool =
 proc mm_reset() = ke_state_set(TASK_MM, 0)
 proc vif_mgmt_reset() = doAssert not interrupts
 proc apmResumeHaltRollback() = doAssert not interrupts
-proc mmPsModeRetryAfterReset() = doAssert not interrupts
 '''
     code = saved_source() + support
     code += procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt")

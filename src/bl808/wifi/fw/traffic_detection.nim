@@ -6,11 +6,6 @@ proc tdEntryForVif(vifIdx: uint8): ptr TdEntryView {.inline.} =
   cast[ptr TdEntryView](cast[uint](addr td_env[0]) +
     vifIdx.uint * sizeof(TdEntryView).uint)
 
-proc tdOperationCurrent(vifIdx: uint8; operation, vifEpoch,
-                        resetEpoch: uint32): bool {.inline.} =
-  vifIdx < MAX_VIFS.uint8 and tdEpochs[vifIdx] == operation and
-    rxVifEpochs[vifIdx] == vifEpoch and txResetEpoch == resetEpoch
-
 proc td_init*() {.exportc, cdecl.} =
   ## Initialize time domain module — blob td.o:
   ##   td_reset(0)        ; resets VIF 0 (zero-clears its slot)
@@ -33,18 +28,10 @@ proc td_start*(vifIdx: uint8) {.exportc, cdecl.} =
   let td = tdEntryForVif(vifIdx)
   if td.active != 0:
     return  # already started
-  let vifEpoch = rxVifEpochs[vifIdx]
-  let resetEpoch = txResetEpoch
-  inc tdEpochs[vifIdx]
-  let operation = tdEpochs[vifIdx]
   let macTime = regRead(MACHW_TIMLO_REG)
-  if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch) or
-      td.active != 0: return
   let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
   if printFn != nil:
     printFn("td_start idx=%d\r\n", vifIdx.cint)
-  if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch) or
-      td.active != 0: return
   td.active = 1
   td.timTime = 0
   mm_timer_set(cast[pointer](td), macTime + blPsParamsView().trafficPeriod)
@@ -59,18 +46,13 @@ proc td_reset*(vifIdx: uint8) {.exportc, cdecl.} =
   ## td[8]=self pointer (env), td[40]=vifIdx.
   if vifIdx >= MAX_VIFS.uint8: return
   let td = tdEntryForVif(vifIdx)
-  let vifEpoch = rxVifEpochs[vifIdx]
-  let resetEpoch = txResetEpoch
-  inc tdEpochs[vifIdx]
-  let operation = tdEpochs[vifIdx]
   let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
   if printFn != nil:
     printFn("td_reset idx=%d\r\n", vifIdx.cint)
-  if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch): return
   # If timer is active, clear it
   if td.active != 0:
     mm_timer_clear(cast[pointer](td))
-    if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch): return
+  tdCfmArmed[vifIdx] = false
   # Zero the entire per-VIF block
   discard c_memset(cast[pointer](td), 0, sizeof(TdEntryView).csize_t)
   # Set up timer fields. Blob stores td_timer_end directly as the callback
@@ -116,17 +98,9 @@ proc td_pack_tim_ind*(vifIdx: uint8) {.exportc, cdecl, noinline.} =
   let td = tdEntryForVif(vifIdx)
   if td.active == 0:
     return
-  let vifEpoch = rxVifEpochs[vifIdx]
-  let resetEpoch = txResetEpoch
-  inc tdEpochs[vifIdx]
-  let operation = tdEpochs[vifIdx]
   # Read MAC time and set timer
   let macTime = regRead(MACHW_TIMLO_REG)
-  if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch) or
-      td.active == 0: return
   mm_timer_set(cast[pointer](td), macTime)
-  if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch) or
-      td.active == 0: return
   # Update the period: if tim_time (offset 20) is set, use it
   if td.timTime != 0:
     td.period = td.timTime
@@ -145,19 +119,15 @@ proc td_cfm_set_timer*(vifIdx: uint8, flag: uint32) {.exportc, cdecl.} =
   ## From blob: computes per-VIF entry = td_env + vifIdx*44.
   ## If flag (a1) != 0: reads MAC time, adds period from td[16], calls mm_timer_set.
   ## Both paths: always clears td[16] (period consumed after use).
+  ## A timer armed here during the VIF's td_timer_end (a DPSM wake inside
+  ## its traffic update) replaces that sample's re-arm (tdCfmArmed); the
+  ## blob passes this back as the return value of ps_traffic_status_update.
   if vifIdx >= MAX_VIFS.uint8: return
   let td = tdEntryForVif(vifIdx)
-  let vifEpoch = rxVifEpochs[vifIdx]
-  let resetEpoch = txResetEpoch
-  inc tdEpochs[vifIdx]
-  let operation = tdEpochs[vifIdx]
   if flag != 0:
     # Set timer: read MAC time, add period from td[16]
     let macTime = regRead(MACHW_TIMLO_REG)
-    if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch): return
     mm_timer_set(cast[pointer](td), macTime + td.period)
-    if not tdOperationCurrent(vifIdx, operation, vifEpoch, resetEpoch): return
+    tdCfmArmed[vifIdx] = true
   # Always clear the period field (consumed)
   td.period = 0
-  tdCfmScheduled[vifIdx] = flag != 0
-  tdCfmCommittedEpochs[vifIdx] = operation

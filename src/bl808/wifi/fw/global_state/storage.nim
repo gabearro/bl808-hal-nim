@@ -205,11 +205,8 @@ var
   # Time domain environment (per-VIF: 44 bytes each, 2 VIFs)
   # td_env is the base; td_reset uses stride=44 to index per-VIF.
   td_env* {.exportc.}: array[22, uint32]  # 88 bytes = 22 words (2 * 44 bytes)
-  tdEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
-  tdCfmCommittedEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
-  tdCfmScheduled {.wifiCtrl.}: array[MAX_VIFS, bool]
-  tdTimerActive*: bool
-  tdRecoveryTimerActive*: bool
+  # td_cfm_set_timer armed the VIF's detector during its td_timer_end.
+  tdCfmArmed {.wifiCtrl.}: array[MAX_VIFS, bool]
 
   cfgApiEntries {.wifiCtrl.}: array[13, CfgApiElementEntryView]
 
@@ -303,10 +300,6 @@ var
   meControlExpectedId: uint16
   meControlFinalId: uint16
   meControlRequester: uint8
-  mmPsModeRequest: pointer
-  mmPsModeTxResetEpoch: uint32
-  psModeBuildSerial {.wifiCtrl.}: uint32
-  psTxNullOwner {.wifiCtrl.}: PsTxNullOwner
   mmTimIdentities {.wifiCtrl.}: ptr MmTimIdentityNode
   mmConnLossTags {.wifiCtrl.}: ptr MmConnLossTag
   staDeleteEpochs: array[STA_MGMT_FREE_STAS, uint32]

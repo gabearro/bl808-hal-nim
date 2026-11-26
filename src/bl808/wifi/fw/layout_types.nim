@@ -89,8 +89,6 @@ type
     leased: bool
     vifEpochs: array[MAX_VIFS, uint32]
     stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
-    psTracked: bool
-    psSerial: uint32
 
   TxSessionIdentity = object
     vifEpoch, stationEpoch, resetEpoch: uint32
@@ -445,7 +443,7 @@ type
     uapsdPeriod*: uint32
     txNullTimerWord*: uint32
     txNullTimerCallback*: pointer
-    currentVif*: pointer
+    txNullTimerEnv*: pointer  ## the live sleep's stamp (ps_machine.nim)
     uapsdTimerState*: uint8
     uapsdStateToFlagsPadding*: array[3, uint8]
     flags*: uint8
@@ -1554,11 +1552,6 @@ type
     epoch, stationEpoch: uint32
     index, station: uint8
     captured: bool
-
-  PsTxNullOwner = object
-    peer: MmVifIdentity
-    serial, resetEpoch: uint32
-    armed: bool
 
   MmConnLossTag = object
     next: ptr MmConnLossTag
@@ -3128,7 +3121,7 @@ static:
   doAssert offsetof(PsEnvView, uapsdPeriod) == 32
   doAssert offsetof(PsEnvView, txNullTimerWord) == 36
   doAssert offsetof(PsEnvView, txNullTimerCallback) == 40
-  doAssert offsetof(PsEnvView, currentVif) == 44
+  doAssert offsetof(PsEnvView, txNullTimerEnv) == 44
   doAssert offsetof(PsEnvView, uapsdTimerState) == 48
   doAssert offsetof(PsEnvView, uapsdStateToFlagsPadding) == 49
   doAssert offsetof(PsEnvView, flags) == 52

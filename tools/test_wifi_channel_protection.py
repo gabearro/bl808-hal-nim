@@ -116,20 +116,18 @@ for allSynchronous in [false, true]:
     doAssert departures() == 1
   finishSwitch()
 ''',
-    "power_save_station_stops_sending": r'''
-for afterFirst in [false, true]:
+    # Every STA and AP is protected whatever PS's state: the forced idle may
+    # have flushed a power-save frame, so the AP is told PM=1 again. chan.o
+    # stops sending, self-CTS included, while PS is asleep.
+    "power_save_station_is_still_protected": r'''
+for secondStation in [false, true]:
   resetSwitch()
-  if afterFirst:
-    onFrame = proc() = ps.enabled = 1
-  else:
-    ps.enabled = 1
-  beginProtection(secondStation = true)
-  if afterFirst:
-    # The first null was sent before PS was seen; it is still waited for.
-    doAssert frames.len == 1 and departures() == 0
-    completeFrame(0)
-  else:
-    doAssert frames.len == 0
+  psOwn.pm = true
+  beginProtection(secondStation = secondStation)
+  doAssert frames.len == 2 and not frames[0].ap and frames[1].ap == not secondStation
+  doAssert (pmRegister and 4) != 0 and departures() == 0
+  completeFrame(0)
+  completeFrame(1)
   doAssert departures() == 1 and channelEnv.currentCtxt == away
   finishSwitch()
 ''',

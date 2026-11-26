@@ -1,6 +1,7 @@
 """Exercise real ME/MM active and power-save transactions without a radio."""
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -109,15 +110,15 @@ psDeferred = true
 let pending = requestControl(true, 1, 1)
 doAssert stepControl() == KeMsgNoFree
 doAssert stepControl() == KeMsgNoFree
-doAssert meState == MeBusyState and mmPsModeRequest == pending
+doAssert meState == MeBusyState and psOwn.request == pending
 doAssert controlReplies.len == 0 and allocated.len == 2
 let concurrent = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
 cast[ptr array[2, uint8]](concurrent)[] = [1'u8, 0]
 doAssert me_set_active_req_handler(concurrent) == KeMsgSaved
 doAssert me.activeMask == 0 and controlReplies.len == 0
 ke_msg_free(keMsgHdrFromPayload(concurrent))
-mmPsModeComplete()
-doAssert mmPsModeRequest == nil and controlReplies.len == 0
+psComplete()
+doAssert psOwn.request == nil and controlReplies.len == 0
 let replyHeader = keMsgQueueSent.first
 replyHeader.srcId = TASK_API
 doAssert mm_set_ps_mode_cfm_handler(keMsgPayload(replyHeader)) == KeMsgConsumed
@@ -168,7 +169,7 @@ for phase in 0 .. 2:
     ke_msg_send(unrelated)
     meControlReset()
     doAssert meControlCommand == nil and meControlReply == nil
-    doAssert mmPsModeRequest == nil and me.requesterId == TASK_NONE
+    doAssert psOwn.request == nil and me.requesterId == TASK_NONE
     doAssert keMsgQueueSaved.first == nil and allocated.len == 1
     doAssert keMsgPayload(co_list_pop_front(addr keMsgQueueSent)) == unrelated
     doAssert keMsgQueueSent.first == nil
@@ -178,45 +179,78 @@ for phase in 0 .. 2:
 """
 
 CANCEL_PS = r"""
-for parked in [false, true]:
-  resetControl()
-  psDeferred = true
-  discard requestControl(true, 1, 0)
-  doAssert stepControl() == KeMsgNoFree and stepControl() == KeMsgNoFree
-  doAssert mmPsModeRequest != nil and allocated.len == 2
-  ps.flags = (if parked: 0x15'u8 else: 1'u8)
-  ps.pendingCount = 2
-  ps.currentVif = addr vifs[0]
-  let serial = psModeBuildSerial
-  meControlReset()
-  doAssert mmPsModeRequest == nil and meControlReply == nil and allocated.len == 0
-  doAssert controlReplies.len == 0 and keMsgQueueSent.first == nil
-  if parked:
-    doAssert ps.flags == 5 and ps.pendingCount == 2 and ps.currentVif == addr vifs[0]
-    doAssert psModeBuildSerial == serial
-  else:
-    doAssert ps.flags == 1 and ps.pendingCount == 0 and ps.currentVif == nil
-    doAssert psModeBuildSerial == serial + 1
-  let after = (ps, psModeBuildSerial)
-  meControlReset()
-  doAssert (ps, psModeBuildSerial) == after
+# ME's reset ends the PS transition that holds its request: the request is
+# freed unanswered (ME dropped its reply) and the transition is over.
+resetControl()
+psDeferred = true
+discard requestControl(true, 1, 0)
+doAssert stepControl() == KeMsgNoFree and stepControl() == KeMsgNoFree
+doAssert psOwn.request != nil and psOwn.kind == psExplicit and allocated.len == 2
+meControlReset()
+doAssert psOwn.request == nil and psOwn.kind == psIdle
+doAssert meControlReply == nil and allocated.len == 0
+doAssert controlReplies.len == 0 and keMsgQueueSent.first == nil
+meControlReset()
+doAssert psOwn.kind == psIdle and allocated.len == 0
 """
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_cancel_ps_owner_and_parked_request_separately(tmp_path: Path, mode: str) -> None:
+def test_me_reset_cancels_the_ps_transition_holding_its_request(tmp_path: Path, mode: str) -> None:
     run_native(tmp_path, mode, program_source() + DRIVER + CANCEL_PS)
 
 
+def flush_resets(reverse: bool = False) -> str:
+    """ke_flush's ME and PS resets, in the order the real ke_flush runs them
+    (or reversed), each followed by the check that ME keeps no freed request."""
+    body = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_flush")
+    calls = re.findall(r"^  (meControlReset|psCancel)\(\)$", body, re.M)
+    assert sorted(calls) == ["meControlReset", "psCancel"], calls
+    if reverse:
+        calls.reverse()
+    return "".join(f"  {call}()\n  meKeepsNoFreedRequest()\n" for call in calls)
+
+
+FLUSH = r"""
+proc meKeepsNoFreedRequest() =
+  doAssert meControlCommand == nil or meControlCommand in allocated,
+    "ME still points at the request PS freed"
+# PS holds ME's forwarded request, then a host's request, when ke_flush runs.
+for hostHeld in [false, true]:
+  resetControl()
+  psDeferred = true
+  if hostHeld:
+    ke_msg_send(newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1))
+  else:
+    discard requestControl(true, 1, 0)
+    doAssert stepControl() == KeMsgNoFree
+  doAssert stepControl() == KeMsgNoFree
+  doAssert psOwn.request != nil and psOwn.kind == psExplicit
+  doAssert (meControlCommand == psOwn.request) == not hostHeld
+@RESETS@
+  doAssert psOwn.request == nil and meControlCommand == nil and meControlReply == nil
+  doAssert allocated.len == 0 and controlReplies.len == 0
+"""
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_flush_drops_me_exchange_before_the_ps_transition(tmp_path: Path, mode: str) -> None:
+    """ke_flush resets ME before PS, as me_init then mm_init do: meControlReset
+    forgets ME's request before it cancels the transition holding it, so ME
+    never points at a request psCancel freed (a later meCancelQueuedPayload
+    would search the queues for that freed address)."""
+    run_native(tmp_path, mode, program_source() + DRIVER
+               + FLUSH.replace("@RESETS@\n", flush_resets()))
+
+
+def test_flush_order_check_catches_ps_first(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError):
+        run_native(tmp_path, "checked", program_source() + DRIVER
+                   + FLUSH.replace("@RESETS@\n", flush_resets(reverse=True)))
+
+
 PS_RESET = r"""
-const KE_EVT_KE_MESSAGE = 0x08000000'u32
 var txResetAllowed: bool
-var nullTimerClears: int
-proc psTxNullTimer(): pointer = addr nullTimerClears
-proc mm_timer_clear(timer: pointer) =
-  doAssert timer == psTxNullTimer()
-  inc nullTimerClears
-proc ke_evt_set(bits: uint32) = doAssert bits == KE_EVT_KE_MESSAGE
 proc ke_evt_clear(bits: uint32) = discard
 proc waitMacSoftResetClear(): bool = true
 template smSaQueryResetScope() = discard
@@ -234,66 +268,48 @@ PS_RESET_CHECKS = r"""
 proc startDeferredPs(): pointer =
   resetControl()
   psDeferred = true
-  nullTimerClears = 0
   result = requestControl(true, 1, 1)
   doAssert stepControl() == KeMsgNoFree
   doAssert stepControl() == KeMsgNoFree
-  doAssert mmPsModeRequest == result and mmPsModeTxResetEpoch == txResetEpoch
+  doAssert psOwn.request == result and psOwn.kind == psExplicit
   doAssert controlReplies.len == 0 and meState == MeBusyState
-  ps.pendingCount = 1
-  ps.flags = 0x9F
-  ps.currentVif = addr vifs[0]
 
-let original = startDeferredPs()
-let reservedReply = meControlReply
-let later = newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1)
-cast[ptr uint8](later)[] = 2
-ke_msg_send(later)
-doAssert stepControl() == KeMsgSaved
-txResetAllowed = false
-bl_reset_evt()
-doAssert mmPsModeRequest == original and nullTimerClears == 0
-doAssert keMsgQueueSent.first == nil and controlReplies.len == 0
-mmPsModeComplete() # An old completion cannot confirm after its TX epoch retired.
-doAssert mmPsModeRequest == original and controlReplies.len == 0
-txResetAllowed = true
-bl_reset_evt()
-doAssert mmPsModeRequest == nil and meControlReply == reservedReply
-doAssert nullTimerClears == 1 and ps.pendingCount == 0 and ps.currentVif == nil
-doAssert ps.flags == 0x89
-doAssert keMsgPayload(keMsgQueueSent.first) == original
-doAssert keMsgPayload(keMsgQueueSent.first.next) == later
-mmPsModeRetryAfterReset()
-doAssert nullTimerClears == 1 and controlReplies.len == 0
-psDeferred = false
-drainControl()
-doAssert psModes == @[0'u8, 0, 2]
-doAssert controlReplies.len == 2 and allocated.len == 0
-doAssert controlReplies[0].id == MM_SET_PS_MODE_CFM
-doAssert controlReplies[1].id == ME_SET_PS_DISABLE_CFM and meState == MeIdleState
-
-let paused = startDeferredPs()
-doAssert mm_force_idle_req()
-doAssert mmState == HW_ACTIVE and mmPsModeRequest == nil
-doAssert keMsgPayload(keMsgQueueSent.first) == paused
-doAssert stepControl() == KeMsgSaved and controlReplies.len == 0
-doAssert keMsgPayload(keMsgQueueSaved.first) == paused
-ke_state_set(TASK_MM, MM_IDLE)
-psDeferred = false
-drainControl()
-doAssert psModes == @[0'u8, 0] and controlReplies.len == 1 and allocated.len == 0
+# A TX reset neither ends a PS transition nor requeues its request
+# (ps_machine.nim): the transition ends through its own confirmations, a
+# flushed frame counting, and answers the request it holds. A request that
+# arrives meanwhile waits for that end.
+for forced in [false, true]:
+  let original = startDeferredPs()
+  let reservedReply = meControlReply
+  let later = newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1)
+  cast[ptr uint8](later)[] = 2
+  ke_msg_send(later)
+  doAssert stepControl() == KeMsgSaved
+  txResetAllowed = true
+  if forced: doAssert mm_force_idle_req() and mmState == HW_ACTIVE
+  else: bl_reset_evt()
+  doAssert psOwn.request == original and meControlReply == reservedReply
+  doAssert controlReplies.len == 0
+  # The reset released MM's saved requests; PS is still busy.
+  while keMsgQueueSent.first != nil: doAssert stepControl() == KeMsgSaved
+  psDeferred = false
+  psComplete()
+  if forced: ke_state_set(TASK_MM, MM_IDLE)
+  drainControl()
+  doAssert psModes == @[0'u8, 2]
+  doAssert controlReplies.len == 2 and allocated.len == 0
+  doAssert MM_SET_PS_MODE_CFM in [controlReplies[0].id, controlReplies[1].id]
+  doAssert ME_SET_PS_DISABLE_CFM in [controlReplies[0].id, controlReplies[1].id]
+  doAssert meState == MeIdleState
 """
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_mac_reset_replays_retained_ps_mode(tmp_path: Path, mode: str) -> None:
-    handlers = (FW / "task_handlers.nim").read_text()
+def test_mac_reset_leaves_the_ps_transition_its_request(tmp_path: Path, mode: str) -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     platform = (FW / "platform_bl.nim").read_text()
     code = program_source()
     code += DRIVER + PS_RESET
-    code += procedure(kernel, "co_list_push_front")
-    code += procedure(handlers, "mmPsModeRetryAfterReset")
     code += procedure(platform, "bl_reset_evt") + ("\nwhen not declared(mmConfigCancelIdle):\n  proc mmConfigCancelIdle() = discard\n" + procedure(kernel, "mm_force_idle_req"))
     run_native(tmp_path, mode, code + PS_RESET_CHECKS)
 
@@ -409,14 +425,14 @@ for nss in 0'u8 .. 8:
     doAssert allocated.len == 0
 
 # Dynamic PS completion uses the incoming request's source, not stale ps_env.
+# The request is answered in place.
 resetControl()
 ps.mode = TASK_APM
 let dynamic = newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1)
 cast[ptr uint8](dynamic)[] = 3
-doAssert mm_set_ps_mode_req_handler(dynamic) == KeMsgConsumed
+doAssert mm_set_ps_mode_req_handler(dynamic) == KeMsgNoFree
 doAssert controlReplies.len == 1 and controlReplies[0].id == MM_SET_PS_MODE_CFM
-doAssert controlReplies[0].dst == TASK_API
-ke_msg_free(keMsgHdrFromPayload(dynamic))
+doAssert controlReplies[0].dst == TASK_API and controlReplies[0].length == 0
 doAssert allocated.len == 0
 """
 
@@ -427,29 +443,24 @@ def test_me_control_transitions(tmp_path: Path, build: str) -> None:
 
 
 @pytest.mark.parametrize("build", ["checked", "release", "asan"])
-def test_ps_mode_waits_for_connectionless_pm_restore(tmp_path: Path, build: str) -> None:
+def test_ps_mode_runs_during_scan_or_roc_dwell_and_forced_idle(tmp_path: Path, build: str) -> None:
+    """A PS request is no longer saved while a scan or ROC dwell holds the PM
+    bit or MM is forced idle: PS records its PM choice and the dwell's end
+    applies it (ps_machine.nim, PS-N3). mm_task.o has no such gate either."""
     run_program(tmp_path, build, DRIVER + r'''
 for mode in 0'u8 .. 3'u8:
-  resetControl()
-  mmState = 1
-  ps.statusFlags = 6 # Active scan/ROC and an unrelated status bit.
-  let command = newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1)
-  mmSetPsModeReqView(command).mode = mode
-  ke_msg_send(command)
-  doAssert stepControl() == KeMsgSaved
-  doAssert keMsgQueueSaved.first == keMsgHdrFromPayload(command)
-  doAssert mmPsModeRequest == nil and psModes.len == 0 and controlReplies.len == 0
-
-  # Scan/ROC END restores PM; its forced-idle and active/host-idle state
-  # transitions requeue work. It still cannot run in the forced-idle state.
-  ps.statusFlags = 4
-  ke_state_set(TASK_MM, HW_ACTIVE)
-  doAssert stepControl() == KeMsgSaved
-  ke_state_set(TASK_MM, (if mode == 0: MM_IDLE.uint16 else: 1'u16))
-  drainControl()
-  doAssert psModes == (if mode == 3: @[] else: @[mode])
-  doAssert controlReplies.len == 1 and controlReplies[0].id == MM_SET_PS_MODE_CFM
-  doAssert allocated.len == 0 and ps.statusFlags == 4
+  for state in [1'u16, HW_ACTIVE.uint16]:
+    resetControl()
+    mmState = state
+    ps.statusFlags = 6 # Active scan/ROC and an unrelated status bit.
+    let command = newMessage(MM_SET_PS_MODE_REQ, TASK_MM, TASK_API, 1)
+    mmSetPsModeReqView(command).mode = mode
+    ke_msg_send(command)
+    doAssert stepControl() == KeMsgNoFree
+    doAssert keMsgQueueSaved.first == nil and psOwn.request == nil
+    doAssert psModes == (if mode == 3: @[] else: @[mode])
+    doAssert controlReplies.len == 1 and controlReplies[0].id == MM_SET_PS_MODE_CFM
+    doAssert allocated.len == 0
 ''')
 
 

@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from test_wifi_auth_frames import layouts
 from test_wifi_frame_ownership import CALLBACK_STUBS, PLATFORM as OWNERSHIP_PLATFORM
 
 
@@ -28,17 +29,8 @@ PLATFORM += r"""
 const TxlFramePayloadSize = 512'u32
 const MAX_VIFS = 2
 const STA_MGMT_FREE_STAS = 5
+""" + layouts("TxFrameIdentity", "TxFrameCallbackScope") + r"""
 type
-  TxFrameIdentity = object
-    generation, resetEpoch, psSerial: uint32
-    leased, psTracked: bool
-    vifEpochs: array[MAX_VIFS, uint32]
-    stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
-  TxFrameCallbackScope = object
-    previous: ptr TxFrameCallbackScope
-    identity: TxFrameIdentity
-    vif, station: uint8
-    tracked, beacon: bool
   HwDesc = object
     payloadStart, payloadEnd, frameLen: uint32
     chainedThd: pointer
@@ -60,7 +52,6 @@ var
   stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
   txFrameIdentities: array[4, TxFrameIdentity]
   txFrameGeneration: uint32
-  psModeBuildSerial: uint32
   txResetEpoch: uint32
   mmBcnGeneration: uint32
   txActiveFrameCallback: ptr TxFrameCallbackScope

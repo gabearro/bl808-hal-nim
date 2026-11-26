@@ -13,8 +13,6 @@ from test_wifi_tx_session import PLATFORM as SESSION_PLATFORM
 ROOT = Path(__file__).resolve().parents[1]
 
 CALLBACKS = {
-    "ps_disable_cfm": "power_save.nim",
-    "ps_enable_cfm": "power_save.nim",
     "mm_ap_traffic_probe_cfm": "power_save.nim",
     "mm_ap_probe_cfm": "kernel_mac_channel.nim",
 }
@@ -30,7 +28,6 @@ var
   effects, cleanups, nested: int
   vif: Vif
   channel: tuple[connlessDelayCount, scanDelayCount: uint8]
-  ps: tuple[flags: uint8, pendingCount: uint32]
   mm: tuple[keepAliveLimit: uint32]
   mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   onPoll, onIdle, onLog, onClear: proc()
@@ -46,20 +43,7 @@ proc chanForceIdle(): bool =
   if onIdle != nil: onIdle()
   true
 proc chan_pre_switch_channel() = inc effects
-proc psEnvView(): ptr typeof(ps) = addr ps
 proc mmEnvView(): ptr typeof(mm) = addr mm
-proc psTxNullTimer(): pointer = nil
-proc mm_timer_clear(p: pointer) =
-  inc effects
-  if onClear != nil: onClear()
-proc ps_check_tx_status_part0_nim(p, callback: pointer): uint32 =
-  inc effects
-  if onPoll != nil: onPoll()
-  1
-proc ps_disable_cfm_handle(p: pointer): uint32 =
-  inc effects
-  0
-proc ps_enable_cfm_handle(p: pointer) = inc effects
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc mmResetBeaconProbeCount(vif: ptr Vif) = vif.probeCount = 0
 proc macTimeNow(): uint32 = 123
@@ -67,15 +51,13 @@ proc mm_send_connection_loss_ind(p: pointer; reason: uint16) = inc effects
 proc mmPublishConnectionLoss(p: pointer; reason: uint16; epoch: ptr uint32) =
   mm_send_connection_loss_ind(p, reason)
 proc protocolState(): auto =
-  (effects, channel, ps, mm, vif)
+  (effects, channel, mm, vif)
 proc resetProtocol() =
   setup()
   effects = 0
   cleanups = 0
   nested = 0
   channel = (1'u8, 1'u8)
-  ps = (0'u8, 1'u32)
-  psModeBuildSerial = 0
   mm.keepAliveLimit = 0
   vif = Vif(probeCount: 17)
   onPoll = nil
@@ -86,9 +68,7 @@ proc resetProtocol() =
 
 CHECKS = r"""
 let protocolCallbacks = [
-  cast[pointer](ps_disable_cfm),
-  cast[pointer](ps_enable_cfm), cast[pointer](mm_ap_traffic_probe_cfm),
-  cast[pointer](mm_ap_probe_cfm)]
+  cast[pointer](mm_ap_traffic_probe_cfm), cast[pointer](mm_ap_probe_cfm)]
 for callback in protocolCallbacks:
   let probe = callback in [cast[pointer](mm_ap_probe_cfm), cast[pointer](mm_ap_traffic_probe_cfm)]
   for path in 0 .. 1: # queued completion, explicit failed release
@@ -144,74 +124,6 @@ for callback in protocolCallbacks:
     txlInvokeFrameCallback(callback, addr vif, 0x80800000'u32, context)
     doAssert protocolState() == retired
     txl_frame_release(frame, false)
-
-proc queueCallback(callback: pointer; status = 0'u32;
-                   tagged = false; retire = false; flush = false) =
-  let frame = hostTxDescAt(txl_frame_get(24))
-  frame.vifIdx = 0
-  frame.staInfoIdx = 0
-  frame.callback = callback
-  frame.callbackArg = addr vif
-  if tagged:
-    let slot = txl_frame_desc_index(frame)
-    txFrameIdentities[slot].psTracked = true
-    txFrameIdentities[slot].psSerial = psModeBuildSerial
-  if retire: inc psModeBuildSerial
-  hostTxHwDescAt(frame.hwDesc).confirmStatus = status
-  if flush: txl_frame_release(frame, true)
-  else:
-    txEnv.packetCounter = 1
-    co_list_push_back(addr frameEnv.usedList, addr frame.link)
-    txl_frame_evt()
-
-for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
-  for flush in [false, true]:
-    resetProtocol()
-    ps.pendingCount = 7
-    queueCallback(callback, 0x80800000'u32, tagged = true, retire = true, flush = flush)
-    doAssert ps.pendingCount == 7 and effects == 0,
-      "a delayed PS frame borrowed the replacement batch's generation"
-    doAssert co_list_cnt(addr frameEnv.freeList) == 4
-  resetProtocol()
-  queueCallback(callback, 0x80800000'u32, tagged = true)
-  doAssert ps.pendingCount == 0 and effects == 2
-
-  resetProtocol()
-  onPoll = proc() =
-    discard rxInvalidateVif(0)
-    ps.pendingCount = 7
-    effects = 0
-  queueCallback(callback)
-  doAssert ps.pendingCount == 7 and effects == 0,
-    "retry polling changed the VIF but callback still finalized PS"
-  for change in 0 .. 3:
-    resetProtocol()
-    onClear = proc() =
-      doAssert ps.pendingCount == 0
-      case change
-      of 1: ps.pendingCount = 1
-      of 2: discard rxInvalidateVif(0)
-      of 3: discard rxInvalidateVif(1)
-      else: discard
-    queueCallback(callback, 0x80800000'u32)
-    doAssert ps.pendingCount == (change == 1).uint32
-    doAssert effects == (if change in [1, 2]: 1 else: 2),
-      "PS finalized after timer clear changed its pending count or owner"
-  resetProtocol()
-  onPoll = proc() =
-    doAssert txlFrameCallbackCurrent()
-    inc psModeBuildSerial
-    ps.pendingCount = 7
-  queueCallback(callback)
-  doAssert ps.pendingCount == 7 and effects == 1,
-    "retired retry consumed the replacement mode's count"
-  resetProtocol()
-  onClear = proc() =
-    doAssert txlFrameCallbackCurrent() and ps.pendingCount == 0
-    inc psModeBuildSerial
-  queueCallback(callback, 0x80800000'u32)
-  doAssert ps.pendingCount == 0 and effects == 1,
-    "retired confirmation finalized the replacement mode after timer clear"
 
 proc cleanup(p: pointer; status: uint32) {.cdecl.} =
   inc cleanups
@@ -336,6 +248,21 @@ def test_protection_callbacks_are_owned_by_their_switch_generation() -> None:
         body = procedure(tasks, name)
         assert "txlFrameCallbackCurrent" not in body
         assert "chanProtectionDone(param, " in body
+
+
+def test_ps_callbacks_are_owned_by_their_transition() -> None:
+    """A power-save null frame's confirmation counts for its transition with
+    any status, a flush by a TX reset included; its argument is the
+    transition's stamp (ps_machine.nim), so the session veto does not apply
+    and a confirmation of an ended transition changes nothing."""
+    power = (FW / "power_save.nim").read_text()
+    for name, callback in [("ps_enable_cfm", "ps_enable_cfm"), ("ps_disable_cfm", "ps_disable_cfm")]:
+        body = procedure(power, name)
+        assert "txlFrameCallbackCurrent" not in body
+        assert f"psConfirm(env, " in body and f"cast[pointer]({callback})" in body
+    confirm = procedure((FW / "ps_machine.nim").read_text(), "psConfirm")
+    assert "if not opCurrent(psOwn.op, opEnvStamp(env)): return" in confirm
+    assert "txlFrameCallbackCurrent" not in confirm
 
 
 def test_deauth_callbacks_are_owned_by_their_teardown_wait() -> None:

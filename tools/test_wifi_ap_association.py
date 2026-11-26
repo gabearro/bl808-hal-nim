@@ -158,7 +158,7 @@ proc co_list_pop_front(queue: ptr CoList): ptr Header =
 proc ke_evt_clear(mask: uint32) = clearedEvents = mask
 proc mmConfigCancelIdle() = discard
 proc mm_bcn_flush_updates(notify: bool) = doAssert not notify
-proc mmPsModeCancel() = discard
+proc psCancel() = discard
 proc meControlReset() = discard
 proc smCleanupCancel() = discard
 proc smBssCancel() = discard

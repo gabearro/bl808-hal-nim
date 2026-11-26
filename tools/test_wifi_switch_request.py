@@ -14,7 +14,7 @@ from textwrap import indent
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_pm_source
 from test_wifi_message_allocation import run_program
 
 
@@ -194,6 +194,7 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()
     code = HARNESS.replace("proc mm_active() =", "proc rescheduleMm()\nproc mm_active() =", 1)
+    code += ps_pm_source()
     for name in KERNEL_PROCS[:4]:
         code += procedure(kernel, name)
     code += r'''
@@ -314,6 +315,7 @@ proc resetSwitch() =
   for index in 0'u8 ..< MAX_VIFS.uint8: vifs[index].vifIdx = index
   mgmt = default(typeof(mgmt))
   ps = default(typeof(ps))
+  psOwn = default(typeof(psOwn))
   mm = default(typeof(mm))
   mmState = MM_IDLE
   macState = 0

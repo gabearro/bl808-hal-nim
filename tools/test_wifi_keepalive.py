@@ -134,6 +134,8 @@ proc mmPublishConnectionLoss(vif: pointer; reason: uint16; epoch: ptr uint32) =
   mm_send_connection_loss_ind(vif, reason)
 proc ps_enable_cfm(vif: pointer; status: uint32) {.cdecl.} = discard
 proc ps_disable_cfm(vif: pointer; status: uint32) {.cdecl.} = discard
+# ps_machine.nim's live transition: a retried null carries its stamp.
+var psOwn: tuple[op: tuple[serial: uint32]] = (op: (serial: 41'u32))
 proc reset() =
   actions.setLen(0)
   lastCallback = nil
@@ -323,7 +325,7 @@ for previous in 0'u16 .. 255'u16:
             elif pending != 0:
               expected.add(("null", 2'u32))
               expectedResult = queued.uint32
-              doAssert lastCallback == callback
+              doAssert lastCallback == callback and lastCallbackArg == psOwn.op.serial
             doAssert actual == expectedResult and actions == expected
             doAssert ps.enabled == expectedEnabled and ps.pendingCount == pending
 """

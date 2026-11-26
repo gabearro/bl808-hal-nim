@@ -27,6 +27,19 @@ its stamp and every handler that takes one checks it (scanCurrent); SCANU
 takes TASK_SCAN's answer only as the request it holds (scanuTakeLower); each
 machine ends a request in one place (scanRelease, scanuComplete); and the
 dwell, lower-exchange and producer machinery they replaced must not come back.
+
+And for power save (ps_machine.nim): psStart is the only opGo of PS's
+operation and psFinish and psCancel its only ends; psOwn, the transition
+count and ps.flags bits 1 and 2 are written only there; every null frame a
+transition counts carries its stamp, as does the TX-null timer, and the
+confirmations and the timer take a delivery only through that stamp; the
+transition procs know nothing of the TX reset epoch; the MAC's PM bit is
+written by PS, a dwell's hold and the channel's departure and return only;
+no transition sends a null frame while a dwell holds the bit, and the
+departure protects every STA whatever PS's state; MM saves a request only
+while a transition is live; resets drop ME's exchange before PS's
+transition; and the serial, owner, reset-replay and traffic-epoch machinery
+they replaced must not come back.
 """
 
 from pathlib import Path
@@ -358,3 +371,187 @@ def test_scan_machinery_is_gone() -> None:
                  "scanuReleaseCompletedOwner", "cacheScanuStartRequest", "SmScanAbortPayloadSize"]:
         assert not re.search(rf"\b{name}\b", text), name
     assert not re.search(r"\bscanEarlyEnd\b", text)
+
+
+# --------------------------------------------------------------------------
+# Power save
+# --------------------------------------------------------------------------
+
+PS_MACHINE = FW / "ps_machine.nim"
+POWER = FW / "power_save.nim"
+PS_TRANSITION_PROCS = ["ps_set_mode", "ps_dpsm_update", "ps_enable_cfm", "ps_disable_cfm",
+                       "ps_tx_null_timer_handle", "ps_enable_cfm_handle",
+                       "ps_disable_cfm_handle", "ps_check_tx_status_part0_nim",
+                       "ps_traffic_status_update", "td_timer_end"]
+
+
+def ps_machine_procs() -> list[str]:
+    return re.findall(r"^proc (\w+)", PS_MACHINE.read_text(), re.M)
+
+
+def test_ps_operation_advances_only_in_start_and_ends() -> None:
+    """psOwn (its Op included) is written only in ps_machine.nim; opGo only in
+    psStart, opFinish only in psFinish and psCancel."""
+    writers = [(path.name, line.strip()) for path in all_firmware()
+               for line in code(path.read_text()).splitlines()
+               if re.search(r"\bop(Go|Finish)\(psOwn\b|\bpsOwn(\.\w+)*\s*=[^=]", line)]
+    assert {name for name, _ in writers} == {"ps_machine.nim"}, writers
+    machine = PS_MACHINE.read_text()
+    assert "opGo(psOwn.op)" in procedure(machine, "psStart")
+    ends = [name for name in ps_machine_procs()
+            if "opFinish(psOwn.op)" in code(procedure(machine, name))]
+    assert ends == ["psFinish", "psCancel"], ends
+
+
+def test_ps_count_and_transition_bits_belong_to_the_machine() -> None:
+    """ps.pendingCount is written only by the machine; ps.flags bits 1 and 2
+    (a wake or a sleep is live) are set by psStart and cleared by psFinish and
+    psCancel, and the other writers of ps.flags leave them alone."""
+    for path in all_firmware():
+        for line in code(path.read_text()).splitlines():
+            if re.search(r"\b(ps|psEnvView\(\))\.pendingCount\s*=[^=]|"
+                         r"\b(inc|dec) (ps|psEnvView\(\))\.pendingCount", line):
+                assert path.name == "ps_machine.nim", (path.name, line)
+    flag_writes = [(name, line.strip()) for name in PS_TRANSITION_PROCS + ["ps_init"]
+                   for line in code(procedure(POWER.read_text(), name)).splitlines()
+                   if re.search(r"\bps\.flags\s*=[^=]", line)]
+    assert sorted(flag_writes) == sorted([
+        ("ps_set_mode", "ps.flags = (ps.flags and 0x06'u8) or uint8(mode == 2)"),
+        ("ps_disable_cfm_handle", "ps.flags = ps.flags or 8'u8"),
+        ("ps_enable_cfm_handle", "ps.flags = ps.flags and not 0x08'u8"),
+    ]), flag_writes
+    machine = PS_MACHINE.read_text()
+    assert "ps.flags = ps.flags or 0x02'u8" in procedure(machine, "psStart")
+    assert "ps.flags = ps.flags or 0x04'u8" in procedure(machine, "psStart")
+    for name in ["psFinish", "psCancel"]:
+        assert "ps.flags = ps.flags and not 0x06'u8" in procedure(machine, name), name
+    # Elsewhere, no proc that binds PS's environment writes its flags.
+    others = []
+    for path in all_firmware():
+        if path.name in ("ps_machine.nim", "power_save.nim"):
+            continue
+        text = code(path.read_text())
+        assert not re.search(r"\bpsEnvView\(\)\.flags\s*=[^=]", text), path.name
+        for body in re.split(r"(?m)^(?=proc )", text):
+            if "= psEnvView()" in body and re.search(r"\bps\.flags\s*=[^=]", body):
+                others.append((path.name, body.split("(", 1)[0]))
+    assert others == [], others
+
+
+def test_ps_deliveries_carry_the_transition_stamp() -> None:
+    machine = PS_MACHINE.read_text()
+    power = POWER.read_text()
+    assert "txl_frame_send_null_frame(vifChannelAt(vifEntry).staIdx, callback, stamp)" in \
+        procedure(machine, "psSend")
+    assert "txl_frame_send_null_frame(vif.staIdx, completionFn, psOwn.op.serial)" in \
+        procedure(power, "ps_check_tx_status_part0_nim")
+    assert "if not opCurrent(psOwn.op, opEnvStamp(env)): return" in procedure(machine, "psConfirm")
+    timer = code(procedure(power, "ps_tx_null_timer_handle"))
+    statements = [line.strip() for line in timer.splitlines() if line.strip()]
+    assert statements[1] == "if not opCurrent(psOwn.op, opEnvStamp(env)): return"
+    assert timer.index("psFinish(") < timer.index("txl_cntrl_clear_ac(3)")
+    dpsm = code(procedure(power, "ps_dpsm_update"))
+    assert "ps.txNullTimerEnv = opStampEnv(stamp)" in dpsm
+    assert dpsm.index("mm_timer_set(psTxNullTimer()") < dpsm.index("psSend(")
+    for name in ["ps_enable_cfm", "ps_disable_cfm"]:
+        assert code(procedure(power, name)).strip().splitlines()[-1].strip().startswith(
+            "psConfirm(env, "), name
+    # The senders hold the count for the walk and release it last.
+    for name in ["ps_set_mode", "ps_dpsm_update"]:
+        body = code(procedure(power, name))
+        assert body.strip().splitlines()[-1].strip() == "psCount(lastSta)", name
+        assert "return" not in body.split("psStart(", 1)[1], f"{name} returns before psCount"
+
+
+def test_ps_transitions_ignore_the_tx_reset_epoch() -> None:
+    assert "txResetEpoch" not in code(PS_MACHINE.read_text())
+    for name in PS_TRANSITION_PROCS + ["ps_check_beacon", "ps_check_tbtt", "ps_check_frame",
+                                       "ps_check_tx_frame", "ps_uapsd_timer_handle"]:
+        body = code(procedure(POWER.read_text(), name))
+        for removed in ["txResetEpoch", "txlFrameCallbackCurrent", "psModeBuildSerial",
+                        "mmPsModeRequest"]:
+            assert removed not in body, (name, removed)
+    detector = code((FW / "traffic_detection.nim").read_text())
+    assert "txResetEpoch" not in detector and "rxVifEpochs" not in detector
+
+
+def test_pm_bit_writers() -> None:
+    """PS writes the PM bit (psApplyPm) and a dwell holds it (psDwellBegin,
+    psDwellEnd); outside ps_machine.nim only the channel scheduler's departure
+    sets it for its protection frames and its return and abandonment clear it
+    while PS is awake."""
+    calls = [(path.name, line.strip()) for path in all_firmware()
+             for line in code(path.read_text()).splitlines()
+             if "blmac_pwr_mgt_setf(" in line and "proc blmac_pwr_mgt_setf" not in line]
+    outside = sorted(call for call in calls if call[0] != "ps_machine.nim")
+    assert outside == sorted([
+        ("task_handlers.nim", "blmac_pwr_mgt_setf(1)"),
+        ("kernel_mac_channel.nim", "blmac_pwr_mgt_setf(0)"),
+        ("channel_switch.nim", "blmac_pwr_mgt_setf(0)"),
+    ]), outside
+    assert "if psAwake():" in code(procedure((FW / "kernel_mac_channel.nim").read_text(),
+                                             "chan_pre_switch_channel"))
+    assert "psAwake()" in code(procedure((FW / "channel_switch.nim").read_text(), "chanSwitchFinish"))
+    assert "0x24B0004C" not in code(POWER.read_text())
+    for path in all_firmware():
+        assert "surveySnapshot" not in code(path.read_text()) or path.name == "layout_types.nim", path
+
+
+def test_ps_sends_no_null_frame_during_a_dwell() -> None:
+    """The MAC marks a null frame with the register's PM bit, which a dwell
+    holds at 0, and the scanning STA's VIF is on channel during its dwell. So
+    both transition walks skip their frames while a dwell holds the bit
+    (psDwell), and psApplyPm only records PS's choice then. Behaviour:
+    test_wifi_ps_table.py (dwell_request, dwell_traffic and the
+    dwell_sends_* mutations)."""
+    machine = PS_MACHINE.read_text()
+    assert "(psEnvView().statusFlags and 2'u32) != 0" in code(procedure(machine, "psDwell"))
+    assert "if not psDwell(): blmac_pwr_mgt_setf(pm.uint32)" in code(procedure(machine, "psApplyPm"))
+    power = POWER.read_text()
+    explicit = code(procedure(power, "ps_set_mode"))
+    assert explicit.count("psSend(") == 1
+    assert "if not psDwell(): psSend(node, callback, stamp)" in explicit
+    dpsm = code(procedure(power, "ps_dpsm_update"))
+    assert "if vif.state != 0 and chan_is_on_channel(node) and not psDwell():" in dpsm
+    walk = dpsm.split("and not psDwell():", 1)[1]
+    assert walk.count("txl_frame_send_null_frame(") == 1 and walk.count("psSend(") == 1
+
+
+def test_departure_protects_whatever_ps_state() -> None:
+    """chan_goto_idle_cb sends its PM=1 null to every active STA VIF on the
+    channel it leaves, and its self-CTS to the AP VIFs, without asking PS:
+    its forced idle may just have flushed (and so ended) a power-save
+    transition the AP never heard."""
+    body = code(procedure((FW / "task_handlers.nim").read_text(), "chan_goto_idle_cb"))
+    for name in ["psAwake", "psOwn", "psEnvView", "break build"]:
+        assert name not in body, name
+
+
+def test_resets_drop_me_before_ps() -> None:
+    """ke_flush, like me_init then mm_init, resets ME's exchange before it
+    cancels PS's transition, so ME never keeps the request psCancel frees."""
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    flush = code(procedure(kernel, "ke_flush"))
+    assert flush.count("meControlReset()") == 1 and flush.count("psCancel()") == 1
+    assert flush.index("meControlReset()") < flush.index("psCancel()")
+    reset = code(procedure((FW / "task_handlers.nim").read_text(), "mm_reset_req_handler"))
+    assert reset.index("me_init()") < reset.index("mm_init()")
+
+
+def test_mm_saves_a_ps_request_only_while_a_transition_is_live() -> None:
+    body = code(find_procedure("mm_set_ps_mode_req_handler"))
+    assert body.count("KeMsgSaved") == 1
+    assert "if psOwn.kind != psIdle:\n    return KeMsgSaved" in body
+    assert "psHold(param)" in body and "psAnswer(param)" in body
+
+
+def test_ps_machinery_is_gone() -> None:
+    text = "".join(code(path.read_text()) for path in all_firmware())
+    for name in ["psModeBuildSerial", "psTxNullOwner", "PsTxNullOwner", "mmPsModeRequest",
+                 "mmPsModeTxResetEpoch", "mmPsModeRetryAfterReset", "mmPsModeCancel",
+                 "mmPsModeComplete", "psTracked", "psSerial", "tdEpochs",
+                 "tdCfmCommittedEpochs", "tdCfmScheduled", "tdTimerActive",
+                 "tdRecoveryTimerActive", "tdOperationCurrent", "deferredMode"]:
+        hits = [path.name for path in all_firmware()
+                if re.search(rf"\b{name}\b", code(path.read_text()))]
+        assert hits in ([], ["layout_types.nim"]), (name, hits)

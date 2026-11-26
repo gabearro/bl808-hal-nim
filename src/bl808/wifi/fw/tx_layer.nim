@@ -3096,8 +3096,7 @@ proc txlFrameLeaseMatches(desc: ptr HostTxDescView; generation: uint32): bool =
 proc txlFrameIdentityCurrent(identity: TxFrameIdentity; vif, station: uint8;
                              resetEpoch = txResetEpoch): bool =
   if not identity.leased or identity.resetEpoch != resetEpoch or vif >= MAX_VIFS.uint8 or
-      identity.vifEpochs[vif] != rxVifEpochs[vif] or
-      (identity.psTracked and identity.psSerial != psModeBuildSerial):
+      identity.vifEpochs[vif] != rxVifEpochs[vif]:
     return false
   station >= STA_MGMT_FREE_STAS.uint8 or
     identity.stationEpochs[station] == staDeleteEpoch(station)
@@ -3699,7 +3698,6 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   ## are stored verbatim at desc+208/212 for txl_frame_cfm.
   let saved = irqSave()
   defer: irqRestore(saved)
-  let psSerial = psModeBuildSerial
   if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
     return 1
   var nfRA {.noinit.}: uint32
@@ -3725,14 +3723,6 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   let generation = txlFrameLeaseToken(desc)
   desc.staInfoIdx = staIdx
   desc.vifIdx = vifIdx
-  if cfmCallback == cast[pointer](ps_enable_cfm) or
-      cfmCallback == cast[pointer](ps_disable_cfm):
-    let slot = txl_frame_desc_index(frame)
-    if slot == InvalidFrameDescIndex: return 1
-    # Allocation recovery and TX power hooks can replace the PS mode.
-    # Stamp the serial from entry, never the one observed after allocation.
-    txFrameIdentities[slot].psTracked = true
-    txFrameIdentities[slot].psSerial = psSerial
   if not txlFramePreparationCurrent(desc, identity, generation):
     return 1
   tpc_update_frame_tx_power(vifEntry, frame)

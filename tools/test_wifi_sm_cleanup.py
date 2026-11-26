@@ -393,9 +393,9 @@ psDeferred = true
 sm_disconnect_process(addr vifs[0], 19, 3)
 driveOne()
 driveOne()
-doAssert mmPsModeRequest != nil and smState == 10 and notifications.len == 1
+doAssert psOwn.request != nil and smState == 10 and notifications.len == 1
 doAssert not wifiMainHasPendingWork() and callbackCalls == 1
-mmPsModeComplete()
+psComplete()
 drain()
 completed()
 ''',
@@ -599,7 +599,7 @@ sm_disconnect_process(addr vifs[0], 7, 7)
 driveOne()
 driveOne()
 doAssert smOwn.answer != nil and smState == SmDisconnectingState
-doAssert mmPsModeRequest != nil and meState == MeBusyState
+doAssert psOwn.request != nil and meState == MeBusyState
 let reconnect = newMessage(0x1000, TASK_SM, TASK_API, 32)
 co_list_push_back(addr keMsgQueueSaved, keMsgHdrFromPayload(reconnect))
 retireVif(0)
@@ -608,10 +608,10 @@ doAssert smState == SmIdleState and not cleanupActive() and smOwn.answer == nil
 # SM idle releases the saved connect.
 doAssert keMsgQueueSaved.first == nil and keMsgQueueSent.first == keMsgHdrFromPayload(reconnect)
 discard co_list_pop_front(addr keMsgQueueSent)
-mmPsModeComplete()
+psComplete()
 drain()
 doAssert smState == SmIdleState and not cleanupActive() and interruptsEnabled
-doAssert mmPsModeRequest == nil and meState == MeIdleState
+doAssert psOwn.request == nil and meState == MeIdleState
 doAssert notifications.len == 1 and callbackCalls == 1 and removed.len == 0
 doAssert deleteNames.len == 0 and stations[2].valid == 1
 doAssert vifs[0].state == 1 and me.activeMask == 2 and me.psDisableMask == 2
@@ -666,12 +666,12 @@ psDeferred = true
 sm_delete_resources(addr vifs[0])
 driveOne()
 driveOne()
-doAssert meState == MeBusyState and mmPsModeRequest != nil
+doAssert meState == MeBusyState and psOwn.request != nil
 smCleanupCancel()
 smGo(SmIdleState)
-mmPsModeComplete()
+psComplete()
 while keMsgQueueSent.first != nil: driveOne()
-doAssert meState == MeIdleState and mmPsModeRequest == nil and me.psDisableMask == 2
+doAssert meState == MeIdleState and psOwn.request == nil and me.psDisableMask == 2
 doAssert smState == SmIdleState and commands == @[ME_SET_PS_DISABLE_REQ]
 doAssert allocated.len == 0
 ''',
@@ -1065,7 +1065,7 @@ proc captureNotification(p: pointer) =
     action()
 """
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "co_list_init")
-    code += procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_forward_and_change_id")
+    # program_source() already has ke_msg_forward_and_change_id (PS answers in place).
     delivery = (FW / "rx_host_delivery.nim").read_text()
     code += """
 template rxHostIrqSave(): uint32 = irqSave()

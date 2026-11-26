@@ -16,30 +16,6 @@ proc meCancelQueuedPayload(payload: pointer) =
       # A free callback may reuse this address in the other queue.
       return
 
-proc mmPsModeCancel() =
-  let request = block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    let held = mmPsModeRequest
-    if held == nil: return
-    mmPsModeRequest = nil
-    if meControlCommand == held:
-      meControlCommand = nil
-    let ps = psEnvView()
-    if (ps.flags and 0x10) != 0:
-      # Only the parked command is canceled; DPSM still owns the transition.
-      ps.flags = ps.flags and not 0x10'u8
-    else:
-      inc psModeBuildSerial
-      ps.pendingCount = 0
-      ps.currentVif = nil
-      ps.flags = ps.flags and not 0x06'u8
-    held
-  ke_msg_free(keMsgHdrFromPayload(request))
-  # A second request saved behind the held one must not wait for an
-  # unrelated MM state change.
-  discard ke_reschedule_saved_messages(TASK_MM)
-
 proc meControlReset() =
   inc meControlEpoch
   meConfigInProgress = false
@@ -53,8 +29,8 @@ proc meControlReset() =
     apmStartReply = nil
     apmStartReplyPublished = false
   meEnvView().requesterId = TASK_NONE
-  if command == mmPsModeRequest:
-    mmPsModeCancel()
+  if command != nil and command == psOwn.request:
+    psCancel()
   else:
     meCancelQueuedPayload(command)
   if ready:
@@ -154,37 +130,6 @@ proc meCompleteControl(reply: pointer, expectedId: uint16): cint =
   defer: irqRestore(saved)
   if meControlEpoch == epoch and ke_state_get(TASK_ME) == MeBusyState:
     ke_state_set(TASK_ME, MeIdleState)
-
-proc mmPsModeComplete() =
-  let request = mmPsModeRequest
-  if request == nil:
-    ke_msg_send_basic(MM_SET_PS_MODE_CFM, psEnvView().mode, TASK_MM)
-    return
-  if mmPsModeTxResetEpoch != txResetEpoch: return
-  mmPsModeRequest = nil
-  ke_msg_send_basic_reply(request, MM_SET_PS_MODE_CFM)
-  ke_msg_free(keMsgHdrFromPayload(request))
-  discard ke_reschedule_saved_messages(TASK_MM)
-
-proc mmPsModeRetryAfterReset() =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let request = mmPsModeRequest
-  let previous = mmPsModeTxResetEpoch
-  let epoch = txResetEpoch
-  if request == nil or previous == epoch: return
-  mm_timer_clear(psTxNullTimer())
-  if txResetEpoch != epoch or mmPsModeRequest != request or
-      mmPsModeTxResetEpoch != previous: return
-  let ps = psEnvView()
-  ps.pendingCount = 0
-  ps.currentVif = nil
-  ps.flags = ps.flags and not 0x16'u8 # abandoned transitions and deferred mode
-  mmPsModeRequest = nil
-  # Keep the original command and reply ownership. Requests saved behind it
-  # must not overtake it when MM releases the saved queue during reset.
-  co_list_push_front(addr keMsgQueueSent, cast[ptr CoListHdr](keMsgHdrFromPayload(request)))
-  ke_evt_set(KE_EVT_KE_MESSAGE)
 
 # --- MM Task Handlers (mm_task.o) ---
 
@@ -678,18 +623,19 @@ proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## (PS_MODE_ON_DYN): iterates linked list of VIFs from vif_mgmt_env+8.
   ## For each STA (vif[86]==0) and active (vif[88]!=0) VIF, calls
   ## ps_polling_frame. When the list is exhausted, sends MM_SET_PS_MODE_CFM.
-  ## If ps_mode != 3: forwards to ps_set_mode.
+  ## If ps_mode != 3: forwards to ps_set_mode and consumes the request.
+  ##
+  ## Here a request waits, saved, while a power-save transition is live
+  ## (ps_machine.nim), and its transition then holds it until it answers it
+  ## in place (or with ME's reserved reply); the end of every transition
+  ## releases MM's saved requests.
   if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetPsModeReqPayloadSize:
     return KeMsgConsumed
-  # Scan/ROC owns the PM register until its end restores the saved value.
-  # The return-to-channel or host-idle state transition requeues this command.
-  if mmPsModeRequest != nil or txlResetting() or ke_state_get(TASK_MM) == HW_ACTIVE.uint16 or
-      (psEnvView().statusFlags and 0x02'u32) != 0:
+  if psOwn.kind != psIdle:
     return KeMsgSaved
   let mode = mmSetPsModeReqView(param).mode
   if mode != 3:
-    mmPsModeRequest = param
-    mmPsModeTxResetEpoch = txResetEpoch
+    psHold(param)
     ps_set_mode(mode, keMsgHdrFromPayload(param).srcId)
     return KeMsgNoFree
   # PS_MODE_ON_DYN: iterate active VIF linked list from vif_mgmt_env.
@@ -703,9 +649,8 @@ proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       # STA VIF that supports PS - poll for PS frame (blob: ps_polling_frame)
       discard ps_polling_frame(vifNode)
     vifNode = vif.next  # Follow linked list
-  # Dynamic PS confirm goes back to the requester stored in ps_env[1].
-  ke_msg_send_basic_reply(param, MM_SET_PS_MODE_CFM)
-  KeMsgConsumed
+  psAnswer(param)
+  KeMsgNoFree
 
 proc mm_set_ps_mode_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   meCompleteControl(param, MM_SET_PS_MODE_CFM)
@@ -3201,8 +3146,11 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
   ## protection generation. Frames are counted before they are sent, a
   ## refused one is uncounted, and frames that finish while this is still
   ## sending only count (chanSw.building); the tail then waits or departs.
-  ## A PS-enabled STA ends sending early, as in the blob, but frames already
-  ## sent are still waited for. A failed forced idle asks MM again after the
+  ## Every active STA VIF on the channel gets its PM=1 null whatever PS's
+  ## state, so the AP is told the station sleeps even when the forced idle
+  ## flushed a power-save frame (ps_machine.nim). The blob stops sending,
+  ## AP self-CTS included, at the first STA while ps_env[0] is set and
+  ## statusFlags bit 3 clear. A failed forced idle asks MM again after the
   ## recovery it posted.
   let env = chanEnvView()
   # Clear CCA busy flag
@@ -3247,43 +3195,39 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
     if refused: dec pending
     else: accepted = true
   var selfctsDurationMs = 0'u16
-  let ps = psEnvView()
   let vifMgmt = vifMgmtEnvView()
-  block build:
-    # Loop 1: iterate STA VIFs and send null frames
-    var vifNode = cast[pointer](vifMgmt.activeList.first)
-    while vifNode != nil:
-      let vif = vifChannelAt(cast[pointer](vifNode))
-      let vifType = vif.vifType
-      let vifChanCtxt = vif.chanCtxt
-      if vifType == VIF_TYPE_STA and vifChanCtxt != nil:
-        let durationMs = (chanCtxtAt(vifChanCtxt).schedSlot.uint32 shl 10) div 1000
-        selfctsDurationMs = (durationMs and 0xFFFF'u32).uint16
-        # STA VIF with channel context
-        if cast[uint](vifChanCtxt) == curChanAddr:
-          let active = vif.state
-          let staIdx = vif.staIdx
-          if active != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
-            if ps.enabled != 0 and (ps.statusFlags and 8) == 0:
-              break build
-            protect(env.scanDelayCount,
-                    txl_frame_send_null_frame(staIdx, cast[pointer](chan_sta_tx_cfm), token))
-      vifNode = vif.next
-    # Loop 2: iterate AP VIFs and send self-CTS
-    vifNode = cast[pointer](vifMgmt.activeList.first)
-    while vifNode != nil:
-      let vif = vifChannelAt(cast[pointer](vifNode))
-      let vifType = vif.vifType
-      let vifChanCtxt = vif.chanCtxt
-      if vifType == VIF_TYPE_AP and vifChanCtxt != nil:
-        if cast[uint](vifChanCtxt) == curChanAddr and env.ctxtCount == 2 and
-            selfctsDurationMs != 0:
-          let active = vif.state
-          if active != 0:
-            if vif.postponedStaHead != nil:
-              protect(env.connlessDelayCount, txl_frame_send_selfcts_frame(
-                vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), token))
-      vifNode = vif.next
+  # Loop 1: iterate STA VIFs and send null frames
+  var vifNode = cast[pointer](vifMgmt.activeList.first)
+  while vifNode != nil:
+    let vif = vifChannelAt(cast[pointer](vifNode))
+    let vifType = vif.vifType
+    let vifChanCtxt = vif.chanCtxt
+    if vifType == VIF_TYPE_STA and vifChanCtxt != nil:
+      let durationMs = (chanCtxtAt(vifChanCtxt).schedSlot.uint32 shl 10) div 1000
+      selfctsDurationMs = (durationMs and 0xFFFF'u32).uint16
+      # STA VIF with channel context
+      if cast[uint](vifChanCtxt) == curChanAddr:
+        let active = vif.state
+        let staIdx = vif.staIdx
+        if active != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
+          protect(env.scanDelayCount,
+                  txl_frame_send_null_frame(staIdx, cast[pointer](chan_sta_tx_cfm), token))
+    vifNode = vif.next
+  # Loop 2: iterate AP VIFs and send self-CTS
+  vifNode = cast[pointer](vifMgmt.activeList.first)
+  while vifNode != nil:
+    let vif = vifChannelAt(cast[pointer](vifNode))
+    let vifType = vif.vifType
+    let vifChanCtxt = vif.chanCtxt
+    if vifType == VIF_TYPE_AP and vifChanCtxt != nil:
+      if cast[uint](vifChanCtxt) == curChanAddr and env.ctxtCount == 2 and
+          selfctsDurationMs != 0:
+        let active = vif.state
+        if active != 0:
+          if vif.postponedStaHead != nil:
+            protect(env.connlessDelayCount, txl_frame_send_selfcts_frame(
+              vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), token))
+    vifNode = vif.next
   chanSw.building = false
   if env.scanDelayCount != 0 or env.connlessDelayCount != 0:
     # Frames sent: mark context as PAUSED and reactivate

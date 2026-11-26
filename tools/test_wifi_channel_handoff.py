@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from test_wifi_deferred_auth import run_nim
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_machine_source, ps_pm_source
 from test_wifi_message_allocation import run_program
 from test_wifi_mm_timer_lifetime import source as mm_timer_source
 from test_wifi_switch_request import run_case as run_switch_case
@@ -60,6 +60,7 @@ type
 var
   env: Env
   ps: PsEnv
+  psOwn: tuple[pm: bool]
   mgmt: VifMgmt
   tx: TxEnv
   vifs: array[2, Vif]
@@ -117,6 +118,7 @@ proc reset() =
   env = default(Env)
   resetProtection()
   ps = default(PsEnv)
+  psOwn = default(typeof(psOwn))
   vifs = default(typeof(vifs))
   contexts = default(typeof(contexts))
   sends.setLen(0)
@@ -177,11 +179,12 @@ for count in 1'u8 .. 3:
           chanCtxtAt(home).status = oldStatus
           nullResult = nullRefused
           ctsResult = ctsRefused
-          if blockedPs: ps.enabled = 1
+          if blockedPs: psOwn.pm = true
           chan_switch_start(away)
           settle()
-          let apSent = count == 2 and not blockedPs
-          let nullSent = not blockedPs
+          # PS's state does not matter: the departure always protects.
+          let apSent = count == 2
+          let nullSent = true
           let pendingNull = nullSent and nullRefused == 0
           let pendingCts = apSent and ctsRefused == 0
           doAssert channelEnv.scanDelayCount == pendingNull.uint8
@@ -383,7 +386,7 @@ proc lastPhy(): int =
   result = -1
   for event in events:
     if event.kind == "phy": result = event.value.int
-""" + home_wake_source()
+""" + ps_pm_source(declare=False) + home_wake_source()
 
 
 def test_preswitch_honors_scan_and_roc_priority(tmp_path: Path) -> None:
@@ -489,7 +492,7 @@ for replace in 0 .. 6:
   of 3: inc chanCtxtEpochs[0]
   of 4: env.currentCtxt = addr contexts[3]
   of 5: env.scheduledCtxt = addr contexts[3]
-  else: ps.enabled = 1
+  else: psOwn.pm = true
   fireNextHomeTimer()
   doAssert sends.len == 0 and homeDeadlines.len == 0
 
@@ -540,7 +543,7 @@ var
   vif = Vif(state: 1, chanCtxt: addr home)
   env = (currentCtxt: cast[pointer](addr home), scheduledCtxt: pointer(nil))
   tx: tuple[freeList: CoList]
-  ps = (enabled: 0'u8, statusFlags: 0'u32)
+  psOwn: tuple[pm: bool]
   rxVifEpochs: array[MAX_VIFS, uint32]
   chanCtxtEpochs: array[5, uint32]
   txResetEpoch, nimFwDbgAutoNullSkipped: uint32
@@ -550,7 +553,6 @@ proc vifChannelForIdx(index: uint8): ptr Vif =
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc chanCtxtForIdx(index: uint8): pointer = addr home
 proc chanEnvView(): ptr typeof(env) = addr env
-proc psEnvView(): ptr typeof(ps) = addr ps
 proc txFrameEnv(): ptr typeof(tx) = addr tx
 proc staDeleteEpoch(index: uint8): uint32 = 0
 proc txlResetting(): bool = false
@@ -564,6 +566,7 @@ proc txl_frame_send_null_frame(sta: uint8; cb: pointer; argument: uint32): uint8
     code += "".join(procedure(kernel, name) for name in (
         "mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaOwnerCurrent", "mmStaTimerCurrent",
     ))
+    code += ps_machine_source("psAwake", record=False)
     code += (FW / "channel_home_wake.nim").read_text()
     run_program(tmp_path, mode, code + r"""
 now = high(uint32) - 1000
@@ -603,27 +606,39 @@ for prev in [-1, 0, 3, 4]:
             + checks)
 
 
-def test_scan_and_roc_restore_only_saved_pm_bit(tmp_path: Path) -> None:
+def test_scan_and_roc_dwell_holds_pm_bit_for_ps(tmp_path: Path) -> None:
+    """A scan or ROC dwell holds the PM bit at 0 and hands it back as PS last
+    chose it (ps_machine.nim). chan.o saves the bit at
+    chan_pre_switch_channel+0x128 and restores that value at
+    chan_ctxt_op_evt+0x11e, which a DPSM decision during the dwell
+    contradicts (PS-N3)."""
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     platform = PLATFORM.replace(procedure(PLATFORM, "blmac_pwr_mgt_setf"), "")
+    # The real PM setter needs the platform's register model; the PM-bit procs
+    # and the home wake follow it.
+    pre_switch = PRE_SWITCH_PLATFORM.replace(ps_pm_source(declare=False) + home_wake_source(), "")
     checks = r"""
 for flags in [8'u8, 4'u8]:
-  for initial in [0'u32, 1, 4, 5, 0xFFFFFFFB'u32, high(uint32)]:
-    reset()
-    env.flags = flags
-    macControl = initial
-    chan_pre_switch_channel()
-    # chan.o:chan_pre_switch_channel+0x128 extracts bit 2 before clearing it.
-    doAssert env.surveySnapshot == ((initial shr 2) and 1).uint8
-    doAssert macControl == (initial and not 4'u32)
-    # The completion at chan_ctxt_op_evt+0x11e uses the live register.
-    macControl = macControl xor 0x80'u32
-    blmac_pwr_mgt_setf(env.surveySnapshot.uint32)
-    doAssert macControl == (initial xor 0x80'u32)
+  for psPm in [false, true]:
+    for initial in [0'u32, 1, 4, 5, 0xFFFFFFFB'u32, high(uint32)]:
+      reset()
+      env.flags = flags
+      macControl = initial
+      psOwn.pm = psPm
+      ps.statusFlags = 0x0C
+      chan_pre_switch_channel()
+      doAssert macControl == (initial and not 4'u32)
+      doAssert ps.statusFlags == 0x0E
+      # The dwell's end writes the live register with PS's choice.
+      macControl = macControl xor 0x80'u32
+      psDwellEnd()
+      doAssert macControl == (((initial xor 0x80'u32) and not 4'u32) or (psPm.uint32 shl 2))
+      doAssert ps.statusFlags == 0x0C
 """
-    run_nim(tmp_path, platform + PRE_SWITCH_PLATFORM + CFM_STUBS
+    run_nim(tmp_path, platform + pre_switch
             + "proc assert_err(a, b: cstring; line: cint) = doAssert false\n"
-            + procedure(kernel, "blmac_pwr_mgt_setf")
+            + procedure(kernel, "blmac_pwr_mgt_setf") + ps_pm_source(declare=False)
+            + home_wake_source() + CFM_STUBS
             + procedure(kernel, "chan_pre_switch_channel") + checks)
 
 

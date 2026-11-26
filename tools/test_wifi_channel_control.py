@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from test_wifi_deferred_auth import run_nim
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, ps_pm_source
 
 
 PLATFORM = r"""
@@ -396,6 +396,7 @@ proc mm_force_idle_req(): bool =
 proc chanForceIdle(): bool = mm_force_idle_req()
 proc mm_back_to_host_idle() = events.add(("host-idle", 0'u))
 proc chan_cde_evt(p: pointer) = events.add(("cde", cast[ptr uint8](p)[].uint))
+""" + ps_pm_source() + r"""
 proc filterIrqEvents() =
   var observed: seq[Event]
   for event in events:
@@ -457,7 +458,9 @@ for marker in [3'u8, 4, 5, 255]:
           reset()
           env.ctxtCount = count
           env.flags = flags
-          env.surveySnapshot = pm
+          # The dwell's end applies PS's PM choice (not a value saved at
+          # its start, as chan.o does).
+          psOwn.pm = pm != 0
           let selected = if marker < 5: marker.int else: 0
           env.currentCtxt = addr contexts[selected]
           env.activeList.first = addr contexts[1].hdr

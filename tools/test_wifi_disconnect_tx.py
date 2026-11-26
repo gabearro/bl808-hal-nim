@@ -309,6 +309,32 @@ def scan_machine_source(*names: str, record: bool = True) -> str:
     return code
 
 
+def ps_machine_source(*names: str, record: bool = True) -> str:
+    """ps_machine.nim's owner record (PsKind, PsOwner, psOwn; `record`) and its
+    named procs, in file order. op.nim and the MmVifIdentity layout must
+    already be in the program; the fixture supplies the calls the procs make."""
+    machine = (FW / "ps_machine.nim").read_text().replace(" {.wifiCtrl.}", "")
+    code = ""
+    if record:
+        code += machine[machine.index("type\n  PsKind"):machine.index("proc psStart")]
+    order = re.findall(r"^proc (\w+)", machine, re.M)
+    for name in order:
+        if name in names:
+            code += procedure(machine, name)
+    missing = set(names) - set(order)
+    assert not missing, missing
+    return code
+
+
+def ps_pm_source(declare: bool = True) -> str:
+    """ps_machine.nim's PM-bit procs (psDwellBegin, psDwellEnd, psAwake) over a
+    minimal record, for channel fixtures: `psOwn.pm = true` is a station PS
+    keeps asleep. The fixture supplies psEnvView (statusFlags), irqSave,
+    irqRestore and blmac_pwr_mgt_setf, and `psOwn` itself unless `declare`."""
+    return (("\nvar psOwn: tuple[pm: bool]\n" if declare else "\n")
+            + ps_machine_source("psDwellBegin", "psDwellEnd", "psAwake", record=False))
+
+
 def scanu_request_current() -> str:
     """scan_machine.nim's scanuRequestCurrent, for fixtures that model SCANU's
     operation as `scanuOwn: tuple[op: tuple[serial: uint32]]`: a new SCANU

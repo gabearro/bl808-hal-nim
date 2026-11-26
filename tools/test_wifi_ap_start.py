@@ -9,6 +9,7 @@ import pytest
 
 from test_wifi_ap_teardown import procedure
 from test_wifi_beacon_frames import AP_EXTRAS_PLATFORM
+from test_wifi_disconnect_tx import procedure as fw_procedure, ps_machine_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +97,8 @@ type
     beaconRegister, apStopped: pointer
   PlatformLogFunc = proc(level, severity: uint32; file: pointer;
     line: uint32) {.cdecl, varargs.}
+  PsKind = enum
+    psIdle, psExplicit, psSleep, psWake
 var
   apm: Apm
   vifs: array[2, VifChannelView]
@@ -117,8 +120,10 @@ var
   apmStopActive: bool
   apmStopVifIdx: uint8
   apmStopRequest: pointer
-  meControlCommand, meControlReply, mmPsModeRequest: pointer
-  txResetEpoch, mmPsModeTxResetEpoch, psModeBuildSerial: uint32
+  meControlCommand, meControlReply: pointer
+  # ps_machine.nim's record, as far as an explicit transition needs it.
+  psOwn: tuple[kind: PsKind, request: pointer]
+  txResetEpoch: uint32
   meControlReplyReady: bool
   meControlExpectedId, meControlFinalId: uint16
   meControlRequester: uint8
@@ -305,7 +310,22 @@ proc ke_state_get(task: uint8): uint16 =
 proc mm_active() = ke_state_set(TASK_MM, 1)
 proc hal_machw_idle_req() = inc idleRequests
 proc mmConfigCancelIdle() = discard
-proc mmPsModeComplete()
+proc psAnswer(request: pointer)
+proc psComplete() =
+  ## psFinish of the live explicit transition: answer its request and
+  ## release MM's saved requests.
+  let request = psOwn.request
+  psOwn = default(typeof(psOwn))
+  if request != nil: psAnswer(request)
+  discard ke_reschedule_saved_messages(TASK_MM)
+proc psCancel() =
+  ## ps_machine.nim's psCancel: free the request unanswered and release
+  ## MM's saved requests.
+  let request = psOwn.request
+  psOwn = default(typeof(psOwn))
+  if request != nil: ke_msg_free(keMsgHdrFromPayload(request))
+  discard ke_reschedule_saved_messages(TASK_MM)
+proc psHold(request: pointer) = psOwn.request = request
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
 proc smStaleRequest(request: pointer): bool = false
 proc smAwaits(request: pointer): bool = false
@@ -313,9 +333,10 @@ proc smTakeReply(request: pointer; id: uint16): pointer = nil
 proc smActivationConfirmed() = discard
 proc smActivationCancel() = discard
 proc ps_set_mode(mode, requester: uint8) =
+  psOwn.kind = psExplicit
   ps.mode = requester
   psModes.add(mode)
-  if not psDeferred: mmPsModeComplete()
+  if not psDeferred: psComplete()
 proc ps_polling_frame(p: pointer): uint8 = 0
 proc phy_get_nss(): uint8 = phyNss
 proc vifMgmtEnvView(): ptr typeof(vifMgmt) = addr vifMgmt
@@ -459,8 +480,7 @@ proc reset(vif: uint8; secure = true) =
   meControlCommand = nil
   meControlReply = nil
   meControlReplyReady = false
-  mmPsModeRequest = nil
-  psModeBuildSerial = 0
+  psOwn = default(typeof(psOwn))
   ps = default(typeof(ps))
   psDeferred = false
   psModes.setLen(0)
@@ -864,11 +884,14 @@ def program_source() -> str:
     for name in ["ke_msg_alloc_reply", "ke_msg_send_basic_reply", "mmBeaconChangeConfirm"]:
         bodies += procedure(kernel, name)
     bodies += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
-    for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
+    for name in ["meControlMessageMatches", "meCancelQueuedPayload",
                  "meControlReset", "meTakeControlReply", "meReserveControl", "meForwardControl",
-                 "meBeginControl", "meCompleteControl",
-                 "mmPsModeComplete"]:
+                 "meBeginControl", "meCompleteControl"]:
         bodies += procedure(handlers, name)
+    bodies += ("\nwhen not declared(ke_msg_forward_and_change_id):\n"
+               + "\n".join("  " + line for line in
+                            fw_procedure(kernel, "ke_msg_forward_and_change_id").splitlines()) + "\n")
+    bodies += ps_machine_source("psAnswer", record=False)
     for name in ["apm_embedded_enabled", "me_rate_translate", "me_get_basic_rates", "me_add_chan_ctx",
                  "meBeaconFrameLength", "apmFreeStartBuffers", "apmFinishStop", "apmContinueStartRollback", "apmBeginStartRollback", "apmResumeHaltRollback",
                  "apmVifNeedsStop", "apmBeginStop", "apmPrepareVifRemoval", "apm_stop",
