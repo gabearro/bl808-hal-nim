@@ -35,7 +35,6 @@ const
 var
   keTaskDescs: array[10, KeTaskDesc]
   keMsgQueueSent, keMsgQueueSaved: CoList
-  mmState: uint8
   rx: RxEnv
   assertions, reschedules, handled, tableReads, frees, eventUpdates: int
   interrupts = true
@@ -136,7 +135,6 @@ proc setup() =
   handlerResult = KeMsgConsumed
   keMsgQueueSent = default(CoList)
   keMsgQueueSaved = default(CoList)
-  mmState = 7
   rx.processingFlag = 1
   rx.queue = default(CoList)
   mm_default_handler = KeMsgHandlerDesc(handlers: cast[pointer](handler), numHandlers: 1)
@@ -169,7 +167,7 @@ let previous = reschedules
 ke_state_set(TASK_SM, 10)
 doAssert reschedules == previous
 ke_state_set(TASK_MM, 0)
-doAssert mmState == MM_IDLE and rx.processingFlag == 0
+doAssert rx.processingFlag == 0
 ''')
 
 
@@ -182,7 +180,7 @@ for previous in [0'u16, 1'u16]:
   rx.queue.first = addr queued
   keTaskDescs[TASK_MM].statePtr[] = previous
   ke_state_set(TASK_MM, 0)
-  doAssert rx.processingFlag == 0 and mmState == MM_IDLE
+  doAssert rx.processingFlag == 0
   doAssert (rxEvents and 0x00100000'u32) != 0 and interrupts
 
 setup()
@@ -218,18 +216,18 @@ for task in [7'u8, 9'u8, 10'u8, 255'u8]:
   ke_state_set(task, 0)
   doAssert ke_state_get(task) == high(uint16)
   doAssert assertions == 2 and reschedules == 0
-  doAssert mmState == 7 and rx.processingFlag == 1
+  doAssert rx.processingFlag == 1
 setup()
 keTaskDescs[TASK_MM].statePtr = nil
 ke_state_set(TASK_MM, 0)
 doAssert ke_state_get(TASK_MM) == high(uint16)
-doAssert assertions == 2 and mmState == 7 and rx.processingFlag == 1
+doAssert assertions == 2 and rx.processingFlag == 1
 setup()
 keTaskDescs[TASK_MM].instanceCount = 0
 ke_state_set(TASK_MM, 0)
 doAssert ke_state_get(TASK_MM) == high(uint16)
 doAssert assertions == 2 and reschedules == 0
-doAssert mmState == 7 and rx.processingFlag == 1
+doAssert rx.processingFlag == 1
 ''')
 
 
@@ -274,7 +272,7 @@ setup()
 onAssert = proc() = keTaskDescs[TASK_MM].statePtr[] = 2
 ke_state_set(TASK_MM, 4)
 doAssert assertions == 1 and keTaskDescs[TASK_MM].statePtr[] == 2
-doAssert reschedules == 0 and mmState == 7 and rx.processingFlag == 1
+doAssert reschedules == 0 and rx.processingFlag == 1
 setup()
 keTaskDescs[TASK_MM].statePtr[] = 4
 onAssert = proc() =

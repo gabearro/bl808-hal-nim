@@ -102,7 +102,6 @@ proc sm_delete_resources(value: pointer) =
   calls.add("delete")
   sm_state = 0
   fwStatus = 0
-proc smDrainStaleSentMessages() = calls.add("prune")
 proc bl_send_reset(hw: ptr BlHw): cint =
   calls.add("reset")
   apEnabled = false

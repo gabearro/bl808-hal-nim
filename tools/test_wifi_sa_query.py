@@ -605,6 +605,7 @@ proc co_list_pop_front(q: ptr TestQueue): pointer = nil
 proc ke_evt_clear(mask: uint32) = discard
 proc mmConfigCancelIdle() = runResetHook()
 proc scanRelease(failed = false) = discard
+proc scanuAbandon() = discard
 proc smActivationCancel() = discard
 proc chanSwitchReset() = discard
 proc keTimerCancelMutations(all: bool) = discard

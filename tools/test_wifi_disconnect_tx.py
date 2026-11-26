@@ -360,6 +360,9 @@ when not declared(mm_timer_set):
   proc mm_timer_set(timer: pointer; target: uint32) = smGuardArmed = true
 when not declared(macTimeNow):
   proc macTimeNow(): uint32 = 0
+when not declared(smDeauthPostponed):
+  var smDeauthOffChannel: bool  # the VIF is away from its channel
+  proc smDeauthPostponed(): bool = smDeauthOffChannel
 '''
 # smGo frees a reply SM reserved and no replier took, and a deferred
 # auth/assoc request still parked (station_sm.nim).

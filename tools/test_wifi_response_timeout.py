@@ -46,11 +46,6 @@ type
     taskId: uint8
     time: uint32
     stamp: uint32
-  KeTimerMutation = object
-    previous: ptr KeTimerMutation
-    id: uint16
-    task: uint8
-    cancelled: bool
   KeMsgHdr = object
     next: ptr CoListHdr
     id: uint16
@@ -70,9 +65,6 @@ var
   enabled = true
   live: seq[pointer]
   keTimerQueue, messages: CoList
-  keTimerMutationTop: ptr KeTimerMutation
-  keTimerScheduling, keTimerExpiryCurrent: bool
-  keTimerExpiryKey: tuple[id: uint16, task: uint8]
   rxVifEpochs: array[2, uint32]
   txResetEpoch: uint32
   stationEpochs: array[7, uint32]
@@ -223,7 +215,7 @@ proc finish() =
   onTimeout = nil
   while keTimerQueue.first != nil: heapFree(co_list_pop_front(addr keTimerQueue))
   while messages.first != nil: ke_msg_free(co_list_pop_front(addr messages))
-  doAssert live.len == 0 and keTimerMutationTop == nil and not keTimerScheduling
+  doAssert live.len == 0
 '''
 
 
@@ -231,8 +223,7 @@ def source() -> str:
     code = PLATFORM
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     for name in ["co_list_pop_front", "co_list_insert", "co_list_push_back", "ke_queue_extract",
-                 "cmp_abs_time", "cmp_timer_id", "keTimerCancelMutations", "keTimerBeginMutation",
-                 "keTimerEndMutation", "ke_timer_try_set", "ke_timer_set", "keTimerClearLocked", "ke_timer_clear",
+                 "cmp_abs_time", "cmp_timer_id", "ke_timer_try_set", "ke_timer_set", "ke_timer_clear",
                  "keTimerExpired", "keTimerRequeue", "ke_timer_schedule", "ke_timer_active"]:
         code += procedure(kernel, name).split("\nconst\n", 1)[0] + "\n"
     code += station_sm_source("smGo", "smArmResponse", "smResponseExpiry") + SENDERS
@@ -364,15 +355,6 @@ discard smGo(SmIdleState)
 deliver(old)
 doAssert assocRetries == 0 and failures == 0 and keTimerQueue.first == nil
 ''',
-    "allocator_replacement": r'''
-setup()
-discard arm()
-onAlloc = replaceAttempt
-now = 150
-ke_timer_schedule()
-doAssert messages.first == nil and authRetries == 0
-doAssert ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
-''',
     "send_replacement": r'''
 setup()
 discard arm()
@@ -409,14 +391,6 @@ let stamp = arm()
 doAssert stamp != 0
 deliver(expire())
 doAssert authRetries == 1
-''',
-    "allocator_clear": r'''
-setup()
-discard arm()
-onAlloc = proc() = ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-now = 150
-ke_timer_schedule()
-doAssert messages.first == nil and live.len == 0
 ''',
     "message_allocation_failure": r'''
 setup()

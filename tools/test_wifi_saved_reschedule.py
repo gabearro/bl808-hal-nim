@@ -65,6 +65,7 @@ proc smActivationCancel() = discard
 proc mmConfigCancelIdle() = discard
 proc chanSwitchReset() = discard
 proc scanRelease(failed = false) = discard
+proc scanuAbandon() = discard
 proc smRspTimerReset() = discard
 template smSaQueryResetScope() = discard
 proc smBssCancel() = discard

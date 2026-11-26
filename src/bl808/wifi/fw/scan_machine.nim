@@ -266,6 +266,17 @@ proc scanuComplete(status: uint8; replayed = false) =
   # Idle after the answer is queued, ahead of any saved request it releases.
   scanuGo(ScanuIdleState)
 
+proc scanuAbandon() =
+  ## Drop SCANU's request unanswered and go idle: scanu_init, and ke_flush,
+  ## which flushes the lower answer SCANU waits on. The requester is reset
+  ## with it (SM by sm_init or smAbandon); a host requester is not answered,
+  ## as in the blob, which drops the pointer with scanu_init's memset.
+  let request = scanu_env.paramPtr
+  scanu_env.paramPtr = nil
+  scanu_env.pendingJoinRxuMgtInd = nil
+  scanuGo(ScanuIdleState)
+  if request != nil: ke_msg_free(keMsgHdrFromPayload(request))
+
 proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
   ## Send the scan or join confirmation and end the request (58 instrs).
   ## Blob: allocates SCANU_JOIN_CFM twice in join mode (to the requester and

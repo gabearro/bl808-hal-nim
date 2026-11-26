@@ -250,12 +250,9 @@ proc scan_get_chan*(): pointer {.exportc, cdecl.} =
 
 proc scanu_init*() {.exportc, cdecl.} =
   ## Initialize upper MAC scan module. A request still held is freed: its
-  ## requester, SM, is reset next by me_init, and the host is not answered,
-  ## as in the blob, which drops the pointer with the memset.
-  scanuGo(ScanuIdleState)
-  let request = scanu_env.paramPtr
+  ## requester, SM, is reset next by me_init (scanuAbandon).
+  scanuAbandon()
   discard c_memset(cast[pointer](addr scanu_env), 0, sizeof(ScanuEnvObj).csize_t)
-  if request != nil: ke_msg_free(keMsgHdrFromPayload(request))
   scanu_env.probeIeCopyDst = addr scanuAddIeView().ieData[0]
   scanuJoinHandler = cast[pointer](scanu_frame_handler)
   scanuResultCount = 0

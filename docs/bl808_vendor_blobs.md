@@ -7260,6 +7260,8 @@ below) ends with `smGo(SmIdleState)`. The disconnect handoff (`SmDisconnectHando
   have. A postponed frame whose context never returns is not aged on a
   STA-only device. On expiry the guard runs the frame's own callback with
   `0x40000000`, as a flush would. The frame's later confirmation is stale.
+  While the VIF is away from its channel the guard waits longer, up to 9 s
+  (see "Sweep" below).
 - `sm_connect_ind` does nothing once a teardown has started, so a late
   activation reply or response timeout cannot end the attempt twice. A
   deauthentication wait ends through its frame's confirmation
@@ -7352,8 +7354,9 @@ tags, kernel dispatch hook and re-queue protocol), the `smRsp*` hooks in
 and the TX identity in the auth expectation. `ke_timer_try_set` lost its
 guard, context and continuation parameters. SA Query (`smSaQueryArmCurrent`)
 and the scan probe repeat checked the same predicate just before the call,
-and nothing inside the call can run their code; a set or clear nested in
-another of the same timer is still resolved by `KeTimerMutation`.
+and nothing inside the call can run their code. (`KeTimerMutation`, which
+resolved a set or clear nested in another of the same timer, was removed
+later; see "Sweep" below.)
 
 Host tests: `tools/test_wifi_response_timeout.py` (rewritten for stamps),
 `tools/test_wifi_station_tx_build.py`, `tools/test_wifi_auth_response.py`,
@@ -7722,8 +7725,8 @@ imports them.
 
 Not done: retiring a removed VIF's stations (they stay valid until
 `MM_RESET`, see above), and unlinking its channel context (the host's job, as in the blob). `MM_SET_VIF_STATE_REQ`
-activating a STA VIF without an AP station still reads `sta_info_tab[0xFF]`
-as the blob does; the fix is more than one line.
+activating a STA VIF without an AP station no longer reads `sta_info_tab[0xFF]`
+(see "Sweep" below).
 
 Host tests: `tools/test_wifi_sm_table.py` (a removal row for every state:
 the request/answer states 1 to 3, the series states 4 and 9 at each
@@ -7926,7 +7929,8 @@ the archive:
 - `scan_init` answers a request still running (`scanRelease`); the blob
   drops it with its memset. On `MM_RESET_REQ` SCANU was reset just before
   and drops the answer. `chan_init` and `ke_init` no longer reset TASK_SCAN;
-  `ke_flush` calls `scanRelease`, whose answer is flushed with the queues.
+  `ke_flush` calls `scanRelease`, whose answer is flushed with the queues,
+  and then drops SCANU's request (`scanuAbandon`, see "Sweep" below).
 - `scan_set_channel_request` no longer sets state 2: `scanDwellBegin`
   enters it before the request is submitted. `scan_ie_download` always
   submits the dwell; an IE length beyond the buffer (refused at admission)
@@ -8203,6 +8207,106 @@ event, the traffic detector or the TX path in the middle of a procedure,
 or that cancelled a transition from inside a null frame's submission, were
 removed with the re-checks they exercised. The M0 HTTP server manifest
 built; none of this was flashed.
+
+#### Sweep (stage 13)
+
+Differences from the archive and from the port before:
+
+- Kernel timers: `ke_timer_try_set`, `ke_timer_clear` and
+  `ke_timer_schedule` no longer keep a mutation stack (`KeTimerMutation`,
+  `keTimerMutationTop`, `keTimerCancelMutations`), the key of the expiry
+  being posted (`keTimerExpiryKey`, `keTimerExpiryCurrent`) or a scheduling
+  flag (`keTimerScheduling`), and `keTimerClearLocked` is folded into
+  `ke_timer_clear`. They resolved a set or clear of the same timer nested
+  inside the heap, the timer hardware programming or an expiry's
+  allocation. Kernel timers are set, cleared and expired only by firmware
+  handlers, nothing those calls reach runs firmware code, and the firmware
+  step is not reentered, so no such nesting exists; `ke_timer.o` has none of
+  this. The heap is still called with the IRQ lock released. Unchanged: an
+  expiry that cannot be allocated is retried on its entry 1 ms later, and
+  clearing the head with an overdue successor schedules it without the
+  blob's assert 214. `MmTimerMutation` (MM timers) stays: an MM timer
+  callback clears or re-arms MM timers, its own included, and
+  `mm_sta_timer_bcn_timeout` and the U-APSD trigger read whether their own
+  delivery was cancelled.
+- `ke_flush` (a vendor export with no caller in this tree) also drops
+  SCANU's request (`scanuAbandon`, shared with `scanu_init`). It answered
+  TASK_SCAN's request in place and then freed that answer with the queues,
+  which left SCANU in state 1 or 2 waiting for it.
+- `MM_SET_VIF_STATE_REQ` activating a STA VIF while SM is in state 9: a VIF
+  without an AP station (deleted by the host after the registration, which
+  sets `staIdx` to 0xFF, or another STA VIF) only takes the state and is
+  answered. The blob arms the TBTT timer and writes the AID and listen
+  window through `sta_info_tab[0xFF]`, past the table. SM's activation finds
+  its station gone at that answer and ends the attempt (`sm_connect_ind(5)`).
+- `vif_mgmt_unregister` clears a STA VIF's `securityTimer` (the data-timeout
+  timer at VIF+172) before its memset, as it already cleared the keep-alive
+  timer; `MM_SET_VIF_STATE_REQ(0)` clears both. Pinned
+  `vif_mgmt_unregister` clears only the TBTT and beacon-timeout timers. No
+  code in this tree arms the data-timeout timer.
+- The deauthentication wait's guard (state 10, see "SM teardown") ends the
+  wait at 3 s only while the VIF is on its channel. While the VIF still has
+  a channel context and TX is not admitted for it (`txl_cntrl_tx_check`),
+  its frame is postponed and goes out when the channel comes back, so the
+  guard re-arms until 9 s after the wait began, measured from its start (`smDeauthPostponed`).
+  Before, a deauthentication postponed by an off-channel period longer than
+  3 s (a long remain-on-channel, another context) ended the wait unsent and
+  the cleanup then deleted the station and the frame with it. The blob waits
+  for the frame without bound.
+- Removed: `sm_drain_stale_sent_messages` (`smDrainStaleSentMessages`, a
+  port-only export with no caller; it freed every queued TASK_SM message,
+  including requests and answers SM holds pointers to) and the write-only
+  `mmState`. `nimfw_dbg_sm_orphan_drained` stays, no longer written:
+  `examples/m0_allcore_wasm_cps_live_test.nim` reads it.
+
+Kept after review: `rxlControlActive`, the guard against `rxl_cntrl_evt`
+running inside itself, which can happen (an RX upper delivery reaches the
+supplicant, whose result can build a frame whose `txl_frame_get` recovery
+completes a channel protection frame, and the departure's RX drain calls
+`rxl_cntrl_evt`); `TxDmaOwner` (now two scopes, `txActiveDmaOwner` and
+`txActiveTriggerOwner`, shared with the TX IRQ path);
+`wifi_nimfw_reconcile_postponed_count`, which repairs the postponed-frame
+count and was not shown to be redundant; and the
+`ke_reschedule_saved_messages(TASK_MM)` calls, including the load-bearing
+one in `bl_reset_evt`.
+
+Not done (stage 13): the remaining message tags (`mmTim`, `rxMgt`,
+`chanUpdate`, `chanBcnRequest`, `mmEdca`, `smDisconnect` in `ke_msg_free`)
+and the connection loss's `MmConnLossTag` list (the plan's payload
+`{vif, sta, staEpoch, reason}`); `MM_SET_VIF_STATE_REQ` raising a STA VIF
+while SM is not in state 9 still changes nothing and is not answered, as in
+pinned `mm_hw_config_handler` (+0x3d0 clears s2 and returns through the
+state restore at +0x22a without a confirmation); `mm_sta_tbtt`, `mm_sta_timer_bcn_timeout`, the
+beacon-detect ROC and the U-APSD trigger keep their re-checks and lock
+juggling, `mm_tbtt_evt` its `mmTbttActive`, and `mm_ap_probe_cfm` and
+`mmStaBeaconProbeCfm` both remain; the `statusFlags` bit-3 mirror; SA Query
+on an `Op`; `scan_probe_req_tx`'s stamp check after `txl_frame_get` and
+`scanu_frame_handler`'s re-checks and IRQ masks; ME idling MM and
+re-enabling PS when the removal of a STA VIF leaves `activeMask` or
+`psDisableMask` at zero; retiring a removed VIF's stations; restricting
+`irqSave` to a whitelist and `txResetEpoch` to `tx_layer.nim`; and ending a
+rate trial on the first confirmation of any frame (`rc_update_counters`)
+rather than only when a frame reached the trial slot.
+
+Host tests: `tools/test_wifi_timer_lifetime.py` (cases that set, cleared or
+flushed a timer from the allocator, the free, the hardware programming or an
+expiry's allocation were removed with the machinery; a dropped retry is
+caught; a lint keeps the machinery removed), `tools/test_wifi_response_timeout.py`
+and `tools/test_wifi_kernel_message_timer.py` (fixtures; the latter pinned
+the blob's assert 214, which the port had already replaced),
+`tools/test_wifi_scan_table.py` (a `ke_flush` input from every stop point of
+the three runs, using the real procedure's scan lines; dropping
+`scanuAbandon` is caught), `tools/test_wifi_sm_audit_sm_connect.py` (the
+real activating branch with the AP station deleted, and the guard while
+off channel, each also with the change reverted),
+`tools/test_wifi_beacon_lifetime.py` (the real `vif_mgmt_unregister` with
+the data-timeout timer linked; reverted, the list is cut),
+`tools/test_wifi_vif_lifetime.py` (its keep-alive mutation now covers both
+STA timers), `tools/test_wifi_task_state.py` (no longer pins `mmState`) and
+`tools/test_wifi_mgt_message_lifetime.py` (its drain case went with
+`sm_drain_stale_sent_messages`). The model fuzzers passed with seed 808
+(256 steps) and seed 13013 (1024 steps). The M0 HTTP server manifest built;
+none of this was flashed.
 
 ## BLE
 

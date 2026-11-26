@@ -124,15 +124,9 @@ type
     id: uint16
     taskId: uint8
     time: uint32
-  KeTimerMutation = object
-    previous: ptr KeTimerMutation
-    id: uint16
-    task: uint8
-    cancelled: bool
 const KE_EVT_KE_TIMER = 0x20000000'u32
 var
   keTimerQueue: CoList
-  keTimerMutationTop: ptr KeTimerMutation
   first, second: KeTimerEntry
   now, events, hardwareTarget: uint32
   frees, diagnostics: int
@@ -172,7 +166,6 @@ proc setup(secondTime, currentTime: uint32) =
   first.next = addr second
   keTimerQueue = CoList(first: cast[ptr CoListHdr](addr first),
                         last: cast[ptr CoListHdr](addr second))
-  keTimerMutationTop = nil
   now = currentTime
   events = 0
   hardwareTarget = 100
@@ -180,8 +173,7 @@ proc setup(secondTime, currentTime: uint32) =
   diagnostics = 0
   interrupts = true
 ''' + "\n".join(procedure(kernel, name) for name in (
-        "keTimerCancelMutations", "keTimerBeginMutation",
-        "keTimerEndMutation", "keTimerClearLocked", "ke_timer_clear"))
+        "ke_timer_clear",))
 
 
 @pytest.mark.parametrize("mode", ["checked", "release"])
@@ -190,8 +182,9 @@ def test_clear_head_schedules_overdue_successor(tmp_path: Path, mode: str) -> No
 setup(200, 250)
 ke_timer_clear(0x40, 3)
 doAssert events == KE_EVT_KE_TIMER and hardwareTarget == 200
-doAssert diagnostics == 1 and frees == 1 and interrupts
-doAssert keTimerMutationTop == nil
+# The blob asserts 214 here (a debug halt); in this port an assert is a MAC
+# recovery, so the overdue successor is only scheduled (KTX-4).
+doAssert diagnostics == 0 and frees == 1 and interrupts
 doAssert keTimerQueue.first == cast[ptr CoListHdr](addr second)
 
 setup(200, 150)

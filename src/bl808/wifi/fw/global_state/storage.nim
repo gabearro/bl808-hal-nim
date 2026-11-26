@@ -14,9 +14,6 @@ var
   keMsgQueueSent* {.wifiCtrl.}: CoList
   keMsgQueueSaved* {.wifiCtrl.}: CoList
   keTimerQueue* {.wifiCtrl.}: CoList
-  keTimerMutationTop {.wifiCtrl.}: ptr KeTimerMutation
-  keTimerScheduling, keTimerExpiryCurrent {.wifiCtrl.}: bool
-  keTimerExpiryKey {.wifiCtrl.}: tuple[id: uint16, task: uint8]
   keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE
   keSavedReschedMask* {.wifiCtrl.}: uint16
   keSavedReschedRemaining {.wifiCtrl.}: array[TASK_API.int, uint32]
@@ -51,7 +48,6 @@ var
   #   offset 0x20: word 8  (10 = keep-alive count limit)
   #   offset 0x34: word 13 (0xFA0 = 4000 = max AMPDU duration)
   mm_env* {.exportc.}: array[17, uint32]  # 68 bytes = 17 words
-  mmState*: uint8
   mmBcnInitDone*: bool
   mmBcnStopping*: bool
   mmBcnGeneration: uint32

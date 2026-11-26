@@ -499,7 +499,22 @@ def harness() -> str:
     code += writer + "".join(procedure(SCAN, name).split("\ntype ProbeIeWriter", 1)[0]
                              for name in BUILDER)
     code += "".join(procedure(TASKS, name) for name in TASK_HANDLERS)
-    return code + tables() + DRIVER
+    return code + tables() + DRIVER + flush_driver()
+
+
+def flush_driver() -> str:
+    """ke_flush's scan lines, extracted from the real procedure, then its
+    flush of the kernel queues and timers (every answer queued is freed)."""
+    flush = procedure(KERNEL, "ke_flush")
+    start = flush.index("  # The lower scan's answer is flushed")
+    end = flush.index("  scanuAbandon()\n", start) + len("  scanuAbandon()\n")
+    return ("proc keFlushScan() =\n" + flush[start:end] + r'''
+  for p in queue & saved: ke_msg_free(keMsgHdrFromPayload(p))
+  queue.setLen(0)
+  saved.setLen(0)
+  timer.armed = false
+  smRequest = nil       # smAbandon: SM forgets the request it sent
+''')
 
 
 # --------------------------------------------------------------------------
@@ -548,6 +563,8 @@ failCount = 1
 if scanSlot.slot == 0xFF: scanSlot.slot = 4   # another user of the singleton slot
 ''',
     "mm_reset": "mmReset()\n",
+    # ke_flush: every queued message, a lower answer included, is freed.
+    "ke_flush": "keFlushScan()\n",
     "host_scan": "discard newUpper(SCANU_START_REQ, HostTask, 1)\n",
     "host_join": "discard newUpper(SCANU_JOIN_REQ, HostTask, 1)\n",
 }
@@ -813,6 +830,8 @@ MUTATIONS = {
                        "  if answer == nil: return false\n"),
     # A dwell whose END is already queued is asked to leave its channel again.
     "leave_once": ("machine", "  scanOwn.finish != nil\n", "  true\n"),
+    # ke_flush frees the lower answer but leaves SCANU waiting for it.
+    "flush_scanu": ("flush", "  scanRelease()\n  scanuAbandon()\n", "  scanRelease()\n"),
     # SM's abort no longer checks that the scan is SM's.
     "abort_owner": ("task", "  if param != nil and keMsgHdrFromPayload(param).srcId == TASK_SM and\n      not smAbortOwnsLowerScan():",
                     "  if false:"),

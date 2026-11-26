@@ -462,6 +462,94 @@ doAssert disconnects == 1 and not smGuardArmed and failures == 0
 ''')
 
 
+@pytest.mark.parametrize("mutation", [False, True], ids=["waits", "unconditional"])
+def test_deauth_guard_waits_while_the_vif_is_off_channel(tmp_path: Path, mutation: bool) -> None:
+    """Stage 13 leftover 4. The 3 s guard ended a deauthentication wait whose
+    frame was only postponed because the VIF was away from its channel (a
+    long ROC or another context); the cleanup then deleted the station and
+    the frame with it, so the AP was never told. The blob waits for the frame
+    without bound. The guard now waits on while the VIF is off its channel,
+    up to 9 s after the wait began, and ends it at once on the channel."""
+    code = r'''
+var guardTarget: uint32
+proc mm_timer_set(timer: pointer; target: uint32) = guardTarget = target
+''' + deauth_source()
+    guard = "  if smDeauthPostponed() and elapsed"
+    assert code.count(guard) == 1
+    if mutation:
+        code = code.replace(guard, "  if false and elapsed")
+    code += r'''
+proc expireGuard() =
+  now = guardTarget + 100  # the fixture's MAC time; expiries are served late
+  cast[proc(env: pointer) {.cdecl.}](smOwn.guard.callback)(cast[pointer](smOwn.guard.env.uint))
+proc startAbort() =
+  prepare(0)
+  currentState = SmAuthenticatingState
+  now = 1000
+  sm_handle_connection(1, 24, cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](failed))
+  doAssert smOwn.teardown == tdDeauthWait and guardTarget == 1000'u32 + 3_000_000
+startAbort()
+smDeauthOffChannel = true
+for round in 1 .. 2:
+  expireGuard()
+  doAssert failures == 0 and smOwn.teardown == tdDeauthWait,
+    "the guard ended a postponed deauthentication after " & $(3 * round) & " s"
+  # The limit counts from the start of the wait, whatever the lateness.
+  doAssert guardTarget == min(now + 3_000_000, 1000'u32 + 9_000_000)
+doAssert guardTarget == 1000'u32 + 9_000_000
+expireGuard()  # 9 s after the wait began
+doAssert failures == 1 and failureStatus == 23 and smOwn.teardown == tdCleanup
+startAbort()
+smDeauthOffChannel = false
+expireGuard()
+doAssert failures == 1 and failureStatus == 23 and smOwn.teardown == tdCleanup
+'''
+    if mutation:
+        with pytest.raises(AssertionError):
+            run_nim(tmp_path, code)
+    else:
+        run_nim(tmp_path, code)
+
+
+@pytest.mark.parametrize("mutation", ["", "inverted", "no_context", "always"])
+def test_deauth_postponed_reads_the_teardown_vifs_channel(tmp_path: Path, mutation: str) -> None:
+    """The guard's predicate itself: a frame is postponed only while the
+    teardown's VIF has a channel context and may not transmit on it."""
+    predicate = procedure((FW / "station_sm.nim").read_text(), "smDeauthPostponed")
+    body = "  vifChannelAt(vif).chanCtxt != nil and not txl_cntrl_tx_check(vif)\n"
+    assert predicate.count(body) == 1
+    if mutation:
+        predicate = predicate.replace(body, {
+            "inverted": "  vifChannelAt(vif).chanCtxt != nil and txl_cntrl_tx_check(vif)\n",
+            "no_context": "  not txl_cntrl_tx_check(vif)\n",
+            "always": "  true\n",
+        }[mutation])
+    code = r'''
+type Vif = object
+  chanCtxt: pointer
+  txAllowed: bool
+var vifs: array[2, Vif]
+var context: int
+proc smDeauthVif(): pointer = addr vifs[1]
+proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
+proc txl_cntrl_tx_check(vif: pointer): bool = cast[ptr Vif](vif).txAllowed
+''' + predicate + r'''
+# The other VIF is off its channel throughout: it must not be read.
+vifs[0].chanCtxt = addr context
+vifs[1].txAllowed = false
+doAssert not smDeauthPostponed(), "no channel context: nothing brings the frame out"
+vifs[1].chanCtxt = addr context
+doAssert smDeauthPostponed(), "off channel with a context: the frame is postponed"
+vifs[1].txAllowed = true
+doAssert not smDeauthPostponed(), "on channel: the frame is not postponed"
+'''
+    if mutation:
+        with pytest.raises(AssertionError):
+            run_nim(tmp_path, code)
+    else:
+        run_nim(tmp_path, code)
+
+
 # --- Re-initialisation with an attempt parked in SM ---------------------------
 
 def test_connect_admitted_after_sm_init(tmp_path: Path) -> None:
@@ -805,6 +893,42 @@ vifs[1].staIdx = 0xFF
 stations[2].initialRateConfig = 0
 doAssert beaconInterval(addr request) == MM_SET_BEACON_INT_CFM
 doAssert stations == default(typeof(stations)) and apIntervals == 0
+'''
+    if mutation:
+        with pytest.raises(AssertionError):
+            run_nim(tmp_path, code)
+    else:
+        run_nim(tmp_path, code)
+
+
+# --- MM_SET_VIF_STATE_REQ activating a STA VIF without its AP station ---------
+
+@pytest.mark.parametrize("mutation", [False, True], ids=["guarded", "unguarded"])
+def test_activation_without_ap_station_indexes_no_station(tmp_path: Path, mutation: bool) -> None:
+    """Stage 13 leftover 3. While SM is in state 9, pinned
+    mm_hw_config_handler activates any STA VIF through sta_info_tab[vif.staIdx]
+    (TBTT timer, AID, listen window). The host can delete the AP station
+    while SM's MM_SET_VIF_STATE_REQ is queued; mm_sta_del then sets the VIF's
+    staIdx to 0xFF and the blob writes past the table. The real activating
+    branch now only sets the state and answers; SM's activation finds the
+    station gone at that answer and ends the attempt (5)."""
+    from test_wifi_activation_mm import source
+    code = source()
+    guard = "if vif.staIdx < STA_INFO_TAB_ENTRIES.uint8:"
+    assert code.count(guard) == 1
+    if mutation:
+        code = code.replace(guard, "if true:")
+    code += r'''
+begin()
+stations[2] = default(typeof(stations[2]))
+inc stationEpochs[2]
+vifs[1].staIdx = 0xFF
+doAssert dispatchOne()
+doAssert events[^1].id == MM_SET_VIF_STATE_CFM, "the request was not answered"
+doAssert vifs[1].state == 1 and vifs[1].tbttTimer == 0 and macReads == 0
+drain()
+doAssert failures == @[(5'u16, 0xFFFF'u16)] and connected == 0
+finish()
 '''
     if mutation:
         with pytest.raises(AssertionError):

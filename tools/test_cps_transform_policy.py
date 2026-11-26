@@ -6127,18 +6127,17 @@ def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
     assert "var drained = 0'u32" in timer_body
     assert "while drained < WifiTimerDrainLimit:" in timer_body
     assert "while true:" not in timer_body
-    assert "let expiredTimerEntry = block:" in timer_body
+    assert "let entry = block:" in timer_body
     assert "cast[ptr KeTimerEntry](co_list_pop_front(addr keTimerQueue))" in timer_body
-    assert "keTimerExpiryKey = (entry.id, entry.taskId)" in timer_body
-    assert "if keTimerScheduling: return" in timer_body
-    assert "id == SCAN_PROBE_TIMER and dest == TASK_SCAN" in timer_body
-    assert "ke_msg_try_alloc(id, dest, 0xFF, if stamp != 0: 4'u32 else: 0'u32)" in timer_body
+    # No nested set or clear can reach a kernel timer (stage 13).
+    assert "keTimerExpiryKey" not in timer_body
+    assert "keTimerScheduling" not in timer_body
+    assert "entry.id == SCAN_PROBE_TIMER and entry.taskId == TASK_SCAN" in timer_body
+    assert "ke_msg_try_alloc(entry.id, entry.taskId, 0xFF," in timer_body
     # An expiry that cannot be allocated is retried, not asserted.
-    assert "ke_msg_alloc(id, dest, 0xFF, 0)" not in timer_body
-    assert "keTimerRequeue(expiredTimerEntry, 1000)" in timer_body
-    assert "if keTimerExpiryCurrent:" in timer_body
-    assert "ke_msg_free(keMsgHdrFromPayload(message))" in timer_body
-    assert "platformFree(cast[pointer](expiredTimerEntry))" in timer_body
+    assert "ke_msg_alloc(" not in timer_body
+    assert "keTimerRequeue(entry, 1000)" in timer_body
+    assert "platformFree(cast[pointer](entry))" in timer_body
     assert "inc drained" in timer_body
     assert "nimFwDbgKeTimerYieldHead = nextTimer.time" in timer_body
     assert "if keTimerExpired(nextTimer):" in timer_body

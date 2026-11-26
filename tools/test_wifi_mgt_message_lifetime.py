@@ -282,13 +282,6 @@ ke_msg_send(plain)
 ke_task_schedule()
 doAssert handled == 1 and live.len == 0 and rxMgtIdentities == nil
 
-setup()
-for destination in [4'u8, 3, 4]:
-  ke_msg_send(rxMgtAllocMessage(addr frame, destination, 68))
-smDrainStaleSentMessages()
-doAssert frees == 2 and live.len == 1
-ke_task_schedule()
-doAssert handled == 1 and live.len == 0 and rxMgtIdentities == nil
 """
 
 
@@ -396,7 +389,7 @@ def run_lifetime(tmp_path: Path, mode: str, checks: str, *, rx_admission: bool =
     else:
         source += "\nproc rxMgtAllocMessage(frame: pointer; dest: uint8; size: uint32): pointer =\n  ke_msg_alloc(RXU_MGT_IND, dest, TASK_RXU, size)\n"
     for name in ["ke_msg_send", "ke_msg_forward_and_change_id", "ke_queue_extract",
-                 "cmp_dest_id", "smDrainStaleSentMessages", "ke_task_schedule"]:
+                 "cmp_dest_id", "ke_task_schedule"]:
         source += procedure(kernel, name)
     run_program(tmp_path, mode, source + checks)
 

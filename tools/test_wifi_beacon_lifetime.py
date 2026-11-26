@@ -275,11 +275,16 @@ for removed in 0'u8 .. 1:
     co_list_push_back(addr env.activeList, cast[ptr CoListHdr](addr vifs[0]))
     co_list_push_back(addr env.activeList, cast[ptr CoListHdr](addr vifs[1]))
     let watchdog = cast[ptr CoListHdr](addr vifs[removed].keepAliveTimer)
+    let security = cast[ptr CoListHdr](addr vifs[removed].securityTimer)
     let unrelated = cast[ptr CoListHdr](addr vifs[removed xor 1].beaconTimeoutTimer)
     co_list_init(addr timerQueue)
     if kind == VIF_TYPE_STA:
       co_list_push_back(addr timerQueue, watchdog)
     co_list_push_back(addr timerQueue, unrelated)
+    if kind == VIF_TYPE_STA:
+      # Linked after the survivor: a removal that zeroes it while linked
+      # leaves it as the list's tail.
+      co_list_push_back(addr timerQueue, security)
     stopHook = proc() =
       doAssert rxVifEpochs[removed] == epoch + 1
       vif_mgmt_unregister(removed)
@@ -314,7 +319,7 @@ for removed in 0'u8 .. 1:
     doAssert vifs[removed].vifType == 4
     doAssert timerQueue.first == unrelated and timerQueue.last == unrelated and
       unrelated.next == nil, "VIF removal did not preserve the unrelated timer"
-    doAssert clearedTimers == (if kind == VIF_TYPE_STA: 3 else: 2) and resets == 1
+    doAssert clearedTimers == (if kind == VIF_TYPE_STA: 4 else: 2) and resets == 1
     doAssert env.activeList.first == cast[ptr CoListHdr](addr vifs[removed xor 1])
     doAssert env.freeList.first == cast[ptr CoListHdr](addr vifs[removed])
     let before = events

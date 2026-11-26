@@ -406,33 +406,37 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
       let activating = ke_task_sm_activating()
       if activating:
         inc nimFwDbgSetVifStateAct
-        # Activating STA: set up TBTT timer, beacon tracking, etc.
-        let staIdx = vif.staIdx
-        let sta = staInfoForIdx(staIdx)
-        let tbttTime = macTimeNow()
-        mm_timer_set(addr vif.tbttTimer, tbttTime + sta.initialRateConfig)
-        # Store AID and vendor beacon timing helper.
-        sta.aid = req.aid
-        let listenWindow = mm.listenWindow.uint32 + 20'u32
-        sta.listenWindowDuration =
-          ((listenWindow * sta.initialRateConfig) div 1_000_000'u32).uint16
-        # Clear VIF beacon tracking state
-        vif.listenInterval = 0
-        vif.psOptions = 0
-        let psTime = macTimeNow()
-        vif.probeCount = 0
-        vif.beaconCrc = 0
-        vif.psLastTime = psTime
-        vif.flags = vif.flags or 1'u32
-        let beaconTime = macTimeNow()
-        vif.tbttCount = 0
-        vif.beaconLossCount = 0
-        vif.beaconTimeoutBase = beaconTime
-        mm.keepAliveLimit = 10
-        vif.beaconRxCount = 0
-        vif.beaconLossWindow = 0
-        vif.lastBeaconMacTime = 0
-        chan_bcn_detect_start(cast[pointer](vifU))
+        # Activating STA: set up TBTT timer, beacon tracking, etc. A STA VIF
+        # without an AP station (deleted since the registration, or another
+        # STA VIF) only takes the state; the blob indexes sta_info_tab[0xFF].
+        # SM's activation finds its station gone at this answer.
+        if vif.staIdx < STA_INFO_TAB_ENTRIES.uint8:
+          let staIdx = vif.staIdx
+          let sta = staInfoForIdx(staIdx)
+          let tbttTime = macTimeNow()
+          mm_timer_set(addr vif.tbttTimer, tbttTime + sta.initialRateConfig)
+          # Store AID and vendor beacon timing helper.
+          sta.aid = req.aid
+          let listenWindow = mm.listenWindow.uint32 + 20'u32
+          sta.listenWindowDuration =
+            ((listenWindow * sta.initialRateConfig) div 1_000_000'u32).uint16
+          # Clear VIF beacon tracking state
+          vif.listenInterval = 0
+          vif.psOptions = 0
+          let psTime = macTimeNow()
+          vif.probeCount = 0
+          vif.beaconCrc = 0
+          vif.psLastTime = psTime
+          vif.flags = vif.flags or 1'u32
+          let beaconTime = macTimeNow()
+          vif.tbttCount = 0
+          vif.beaconLossCount = 0
+          vif.beaconTimeoutBase = beaconTime
+          mm.keepAliveLimit = 10
+          vif.beaconRxCount = 0
+          vif.beaconLossWindow = 0
+          vif.lastBeaconMacTime = 0
+          chan_bcn_detect_start(cast[pointer](vifU))
       else:
         runCommonVifStateUpdate = false
 

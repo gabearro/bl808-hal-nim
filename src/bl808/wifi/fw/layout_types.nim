@@ -5156,10 +5156,6 @@ proc markInvalid(ctxt: ptr ChanCtxtView) {.inline.} =
   ctxt.contextIndexOrMarker = 0xFF'u8
 
 type
-  KeEvtEntry* = object
-    handler*: pointer       # function pointer
-    param*: pointer         # event-specific context
-
   KeTimerEntry* = object
     next*: ptr KeTimerEntry
     id*: uint16             # task_id in bits [15:10], msg in bits [9:0]
@@ -5172,11 +5168,9 @@ type
     timer: pointer
     cancelled, delivering: bool
 
-  KeTimerMutation = object
-    previous: ptr KeTimerMutation
-    id: uint16
-    task: uint8
-    cancelled: bool
+  KeEvtEntry* = object
+    handler*: pointer       # function pointer
+    param*: pointer         # event-specific context
 
 # Kernel message handler descriptor (8 bytes)
 # Used by ke_handler_search: pairs a handler table pointer with its entry count.

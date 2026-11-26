@@ -14,7 +14,8 @@
 #                 confirmation argument. The frame's callback, with any status
 #                 (sent, not acknowledged, flushed by a TX reset or aged out),
 #                 ends the wait. So does a guard timer, in case the frame is
-#                 postponed on a channel that never comes back.
+#                 postponed on a channel that never comes back: after 3 s,
+#                 or while the VIF is still away from its channel after 9 s.
 #   tdCleanup     station_cleanup.nim releases the link through ME and MM, one
 #                 request at a time like the series of states 4 and 9 below,
 #                 and ends with smGo(SmIdleState). The guard timer then
@@ -77,11 +78,16 @@ type
     answer: pointer   ## what ends the wait: the request itself or its reply
     vif: uint8        ## state 10: the VIF whose link the teardown ends
     deauthCallback: pointer  ## the waited frame's callback, run by the guard
+    deauthSince: uint32      ## MAC time the deauthentication wait started
     guard: MmTimerView  ## state 10's timer: the deauth guard, the cleanup's retry
 
-const SmDeauthGuardUs = 3_000_000'u32
-  ## Longer than any off-channel period (a full passive scan is about 1.5 s),
-  ## shorter than the host's 10 s disconnect wait.
+const
+  SmDeauthGuardUs = 3_000_000'u32
+    ## Longer than a usual off-channel period (a full passive scan is about
+    ## 1.5 s), shorter than the host's 10 s disconnect wait.
+  SmDeauthGuardLimitUs = 9_000_000'u32
+    ## The longest wait while the VIF is away from its channel, where its
+    ## frame is postponed and goes out when the channel comes back.
 
 var smOwn {.wifiCtrl.}: SmOwner
 
@@ -215,9 +221,25 @@ proc smTeardown(vif: pointer; indication: pointer = nil; disconnected = false;
     smAbandon()
   false
 
+proc smDeauthPostponed(): bool =
+  ## The teardown's VIF is away from its channel: its frames are postponed
+  ## and go out when the channel comes back (txl_cntrl_tx_check).
+  let vif = smDeauthVif()
+  vifChannelAt(vif).chanCtxt != nil and not txl_cntrl_tx_check(vif)
+
 proc smDeauthGuardExpired(env: pointer) {.cdecl.} =
-  ## No confirmation came: complete the wait as a flushed frame would.
+  ## No confirmation came: complete the wait as a flushed frame would. While
+  ## the frame can still go out when the VIF's channel returns, wait longer,
+  ## up to SmDeauthGuardLimitUs; the blob waits without bound.
   if not smDeauthConfirmed(env): return
+  let now = macTimeNow()
+  let elapsed = now - smOwn.deauthSince
+  if smDeauthPostponed() and elapsed < SmDeauthGuardLimitUs:
+    # The limit is measured from the start of the wait, so a late expiry
+    # cannot shorten it.
+    mm_timer_set(addr smOwn.guard,
+                 now + min(SmDeauthGuardUs, SmDeauthGuardLimitUs - elapsed))
+    return
   cast[proc(env: pointer; status: uint32) {.cdecl.}](smOwn.deauthCallback)(
     env, 0x40000000'u32)
 
@@ -232,7 +254,8 @@ proc smDeauthWait(vifIdx: uint8; callback: pointer): uint32 =
   result = smGo(SmDisconnectingState, tdDeauthWait)
   smOwn.guard.callback = cast[pointer](smDeauthGuardExpired)
   smOwn.guard.env = result
-  mm_timer_set(addr smOwn.guard, macTimeNow() + SmDeauthGuardUs)
+  smOwn.deauthSince = macTimeNow()
+  mm_timer_set(addr smOwn.guard, smOwn.deauthSince + SmDeauthGuardUs)
 
 proc smStaVifRetired(vifIdx: uint8) =
   ## vif_mgmt_unregister has retired STA VIF `vifIdx`. The attempt on it, or

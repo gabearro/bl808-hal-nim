@@ -1,4 +1,10 @@
-"""Exercise timer ordering, reentrant mutation, and entry ownership."""
+"""Exercise kernel timer ordering, expiry delivery and entry ownership.
+
+Kernel timers are set, cleared and expired only by firmware handlers and the
+firmware step is never reentered, so no case changes a timer from inside the
+heap, the timer hardware or an expiry's allocation: the cases that did were
+removed with the KeTimerMutation machinery they exercised (stage 13).
+"""
 
 from pathlib import Path
 import shutil
@@ -28,16 +34,8 @@ type
     taskId: uint8
     time: uint32
     stamp: uint32
-  KeTimerMutation = object
-    previous: ptr KeTimerMutation
-    id: uint16
-    task: uint8
-    cancelled: bool
 var
   keTimerQueue: CoList
-  keTimerMutationTop: ptr KeTimerMutation
-  keTimerScheduling, keTimerExpiryCurrent: bool
-  keTimerExpiryKey: tuple[id: uint16, task: uint8]
   now: uint32
   enabled = true
   failAlloc, missingAllocator: bool
@@ -136,6 +134,7 @@ var
 template smSaQueryResetScope() = discard
 proc mmConfigCancelIdle() = discard
 proc scanRelease(failed = false) = discard
+proc scanuAbandon() = discard
 proc chanSwitchReset() = discard
 proc smActivationCancel() = discard
 proc smBssCancel() = discard
@@ -163,7 +162,6 @@ proc deadline(id: uint16; task = 4'u8): uint32 =
     node = node.next
   doAssert false, "timer not found"
 proc flushTimers() =
-  keTimerCancelMutations(all = true)
   while keTimerQueue.first != nil:
     let p = co_list_pop_front(addr keTimerQueue)
     platformFree(p)
@@ -174,7 +172,7 @@ proc finish() =
   onMessage = nil
   onEvent = nil
   flushTimers()
-  doAssert live.len == 0 and keTimerMutationTop == nil and not keTimerScheduling
+  doAssert live.len == 0
 '''
 
 CASES = {
@@ -189,92 +187,12 @@ ke_timer_schedule()
 doAssert delivered == @[(1'u16, 4'u8)]
 doAssert queueIds() == @[3'u16, 2]
 ''',
-    "same_key_set": r'''
-now = 1000
-onAlloc = proc() = ke_timer_set(1, 4, 200)
-ke_timer_set(1, 4, 100)
-doAssert queueIds() == @[1'u16] and deadline(1) == 1200,
-  "older allocation replaced the newer timer"
-doAssert live.len == 1
-''',
-    "same_key_clear": r'''
-onAlloc = proc() = ke_timer_clear(1, 4)
-ke_timer_set(1, 4, 100)
-doAssert queueIds().len == 0 and live.len == 0,
-  "older allocation revived a cleared timer"
-''',
-    "reset_during_allocation": r'''
-onAlloc = proc() = flushTimers()
-ke_timer_set(1, 4, 100)
-doAssert queueIds().len == 0 and live.len == 0
-''',
-    "different_key": r'''
-now = 1000
-onAlloc = proc() = ke_timer_set(2, 4, 200)
-ke_timer_set(1, 4, 100)
-doAssert queueIds() == @[1'u16, 2] and live.len == 2
-''',
-    "different_task": r'''
-onAlloc = proc() = ke_timer_set(1, 3, 200)
-ke_timer_set(1, 4, 100)
-doAssert queueIds() == @[1'u16, 1] and live.len == 2
-doAssert deadline(1, 4) == 100 and deadline(1, 3) == 200
-''',
-    "sa_query_keeps_serial_when_rearmed": r'''
-doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 100, stamp = 29)
-onFree = proc() =
-  doAssert saExpiries == @[29'u32]
-  doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 200, stamp = 30)
-now = 100
-ke_timer_schedule()
-doAssert saExpiries == @[29'u32] and delivered.len == 0
-now = 300
-ke_timer_schedule()
-doAssert saExpiries == @[29'u32, 30] and delivered.len == 0 and live.len == 0
-''',
-    "clear_during_hardware": r'''
-onHardware = proc() = ke_timer_clear(1, 4)
-ke_timer_set(1, 4, 100)
-doAssert queueIds().len == 0 and live.len == 0
-''',
-    "replace_during_hardware": r'''
-onHardware = proc() = ke_timer_set(1, 4, 200)
-ke_timer_set(1, 4, 100)
-doAssert queueIds() == @[1'u16] and deadline(1) == 200 and live.len == 1
-''',
-    "clear_reentrant_free": r'''
-ke_timer_set(1, 4, 100)
-onFree = proc() = ke_timer_set(1, 4, 200)
-ke_timer_clear(1, 4)
-doAssert queueIds() == @[1'u16] and deadline(1) == 200 and live.len == 1
-''',
-    "locked_clear_detaches_before_free": r'''
-ke_timer_set(1, 4, 100)
-onFree = proc() =
-  doAssert enabled and queueIds().len == 0
-  ke_timer_set(1, 4, 200)
-let saved = irqSave()
-keTimerClearLocked(1, 4, saved)
-doAssert enabled and queueIds() == @[1'u16] and deadline(1) == 200
-doAssert live.len == 1
-now = 201
-ke_timer_schedule()
-doAssert delivered == @[(1'u16, 4'u8)] and live.len == 0
-''',
     "expires_during_programming": r'''
 ke_timer_set(1, 4, 100)
 now = 0
 onHardware = proc() = now = 101
 ke_timer_schedule()
 doAssert delivered == @[(1'u16, 4'u8)] and live.len == 0
-''',
-    "schedule_head_replacement": r'''
-ke_timer_set(1, 4, 100)
-onHardware = proc() =
-  ke_timer_clear(1, 4)
-  ke_timer_set(2, 4, 200)
-ke_timer_schedule()
-doAssert delivered.len == 0 and queueIds() == @[2'u16]
 ''',
     "message_rearms": r'''
 ke_timer_set(1, 4, 10)
@@ -339,18 +257,6 @@ doAssert delivered.len == WifiTimerDrainLimit.int
 doAssert queueIds() == @[1'u16] and (events and KE_EVT_KE_TIMER) != 0
 doAssert nimFwDbgKeTimerYield == 1
 ''',
-    "recursive_schedule": r'''
-proc rearmAndDrain() =
-  now += 100
-  ke_timer_set(1, 4, 1)
-  onMessage = rearmAndDrain
-  ke_timer_schedule()
-onMessage = rearmAndDrain
-ke_timer_set(1, 4, 1)
-now = 100
-ke_timer_schedule()
-doAssert delivered.len == WifiTimerDrainLimit.int and live.len == 1
-''',
     "interrupt_state": r'''
 for initial in [false, true]:
   enabled = initial
@@ -363,7 +269,7 @@ for initial in [false, true]:
   ke_timer_set(1, 4, 100)
   now += 101
   onExpiryAlloc = proc() = doAssert enabled == initial
-  onMessage = proc() = doAssert not enabled
+  onMessage = proc() = doAssert enabled == initial
   onFree = proc() = doAssert enabled == initial
   ke_timer_schedule()
   doAssert enabled == initial and live.len == 0
@@ -376,15 +282,6 @@ for base in [0'u32, 0x7FFFFFFF'u32, 0xFFFFFF00'u32]:
     ke_timer_set((index + 1).uint16, 4, delay)
   doAssert queueIds() == @[3'u16, 5, 1, 4, 2, 6]
   flushTimers()
-''',
-    "new_head_during_clear": r'''
-ke_timer_set(1, 4, 100)
-ke_timer_set(2, 4, 200)
-onHardware = proc() =
-  ke_timer_clear(2, 4)
-  ke_timer_set(3, 4, 300)
-ke_timer_clear(1, 4)
-doAssert queueIds() == @[3'u16] and assertions == 0
 ''',
     "fallible_set": r'''
 failAlloc = true
@@ -399,51 +296,6 @@ doAssert queueIds() == @[1'u16]
 missingAllocator = true
 ke_timer_set(1, 4, 100)
 doAssert assertions == 1 and allocations == 0 and live.len == 0
-''',
-    "flush_during_expiry_allocation": r'''
-ke_timer_set(1, 4, 100)
-now = 100
-onExpiryAlloc = proc() =
-  ke_flush()
-  ke_timer_set(1, 4, 200)
-ke_timer_schedule()
-doAssert delivered.len == 0 and expiryMessageFrees == 1 and not messageOwned
-doAssert frees == 1 and live.len == 1 and deadline(1) == 300
-now = 300
-ke_timer_schedule()
-doAssert delivered == @[(1'u16, 4'u8)] and expiryMessageFrees == 1
-doAssert frees == 2 and live.len == 0
-''',
-    "clear_during_expiry_allocation": r'''
-ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
-now = 100
-onExpiryAlloc = proc() =
-  doAssert not ke_timer_active(SCAN_PROBE_TIMER, TASK_SCAN)
-  ke_timer_clear(SCAN_PROBE_TIMER, TASK_SCAN)
-ke_timer_schedule()
-doAssert delivered.len == 0, "canceled probe expiry escaped the allocator"
-doAssert expiryMessageFrees == 1 and not messageOwned and live.len == 0
-''',
-    "rearm_during_expiry_allocation": r'''
-ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
-now = 100
-onExpiryAlloc = proc() = ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 200)
-ke_timer_schedule()
-doAssert delivered.len == 0, "superseded probe expiry reached the replacement dwell"
-doAssert expiryMessageFrees == 1 and deadline(SCAN_PROBE_TIMER, TASK_SCAN) == 300
-now = 300
-ke_timer_schedule()
-doAssert delivered == @[(SCAN_PROBE_TIMER, TASK_SCAN)] and live.len == 0
-''',
-    "unrelated_clear_during_expiry_allocation": r'''
-ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
-now = 100
-onExpiryAlloc = proc() =
-  ke_timer_clear(SCAN_PROBE_TIMER, TASK_SM)
-  ke_timer_clear(SCAN_PROBE_TIMER + 1, TASK_SCAN)
-ke_timer_schedule()
-doAssert delivered == @[(SCAN_PROBE_TIMER, TASK_SCAN)]
-doAssert expiryMessageFrees == 0 and not messageOwned and live.len == 0
 ''',
     "optional_probe_expiry_out_of_memory": r'''
 ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
@@ -489,10 +341,10 @@ doAssert delivered == @[(2'u16, TASK_SM)] and live.len == 0 and assertions == 0
 
 MUTATIONS = {
     "order": ("let diff = ta.time - tb.time", "let diff = tb.time - ta.time", "ordering"),
-    "newer_mutation": ("  keTimerCancelMutations(id, task)", "  discard", "same_key_set"),
-    "reset": ("if all or (operation.id == id and operation.task == task):", "if not all and (operation.id == id and operation.task == task):", "reset_during_allocation"),
     "budget": ("while drained < WifiTimerDrainLimit:", "while drained <= WifiTimerDrainLimit:", "drain_budget"),
-    "unowned_expiry": ("if all or keTimerExpiryKey == (id, task):", "if all:", "rearm_during_expiry_allocation"),
+    # An expiry that cannot be posted is dropped instead of retried.
+    "requeue": ("        keTimerRequeue(entry, 1000)\n        continue\n", "        discard\n",
+                "ordinary_expiry_out_of_memory"),
 }
 
 
@@ -502,13 +354,8 @@ def program_source(mutation: str = "") -> str:
     for name in ["co_list_pop_front", "co_list_insert", "ke_queue_extract",
                  "cmp_abs_time", "cmp_timer_id"]:
         code += procedure(kernel, name).split("\nconst\n", 1)[0] + "\n"
-    for name in ["keTimerCancelMutations", "keTimerBeginMutation", "keTimerEndMutation", "ke_timer_try_set"]:
-        if "proc " + name in kernel:
-            code += procedure(kernel, name)
-    if "proc keTimerCancelMutations" not in kernel:
-        code += "\nproc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard\n"
-    for name in ["ke_timer_set", "keTimerClearLocked", "ke_timer_clear", "keTimerExpired", "keTimerRequeue", "ke_timer_schedule",
-                 "ke_timer_active"]:
+    for name in ["ke_timer_try_set", "ke_timer_set", "ke_timer_clear", "keTimerExpired",
+                 "keTimerRequeue", "ke_timer_schedule", "ke_timer_active"]:
         code += procedure(kernel, name)
     code += FLUSH_PLATFORM + procedure(kernel, "ke_flush")
     code += HELPERS
@@ -548,7 +395,13 @@ def test_timer_guards(tmp_path: Path, mutation: str) -> None:
     run_case(tmp_path, MUTATIONS[mutation][2], "checked", mutation)
 
 
-def test_timer_reset_hooks() -> None:
-    kernel = (FW / "kernel_mac_channel.nim").read_text()
-    for name in ["ke_init", "ke_flush"]:
-        assert "keTimerCancelMutations(all = true)" in procedure(kernel, name)
+def test_timer_mutation_machinery_stays_removed() -> None:
+    """No nested set or clear can reach a kernel timer, so the mutation
+    stack, the expiry key and the scheduling flag are gone (stage 13)."""
+    for path in [FW / "kernel_mac_channel.nim", FW / "layout_types.nim",
+                 FW / "global_state" / "storage.nim"]:
+        text = path.read_text()
+        for name in ["KeTimerMutation", "keTimerMutationTop", "keTimerCancelMutations",
+                     "keTimerExpiryKey", "keTimerExpiryCurrent", "keTimerScheduling",
+                     "keTimerClearLocked"]:
+            assert name not in text, (path.name, name)

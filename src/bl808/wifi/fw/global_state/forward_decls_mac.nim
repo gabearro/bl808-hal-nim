@@ -123,6 +123,7 @@ proc smActivationConsumeSuccess(station: uint8): bool
 proc smAwaits(request: pointer): bool
 proc scanDwellPost(id: uint16)
 proc scanRelease(failed = false)
+proc scanuAbandon()
 proc smTakeReply(request: pointer; id: uint16): pointer
 proc txlRebasePostponedLeases()
 proc smSaQueryQueueTimeout(serial: uint32)
@@ -143,7 +144,6 @@ proc smDisconnectStorageLength(id: uint16; destination: uint8; length: uint32): 
 proc smDisconnectRegister(header: ptr KeMsgHdr)
 proc smDisconnectForget(header: pointer)
 proc smDisconnectStamp(header: ptr KeMsgHdr)
-proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false)
 proc chanForceIdle(): bool
 proc smJoinPeer(vifIdx: uint8; station: var uint8; peer: var MacAddrView): bool
 proc smAuthRecordResponse(stamp: uint32; algorithm: uint8; txSequence: uint16): bool

@@ -164,6 +164,7 @@ proc smCleanupCancel() = discard
 proc smBssCancel() = discard
 proc chanSwitchReset() = discard
 proc scanRelease(failed = false) = discard
+proc scanuAbandon() = discard
 proc smActivationCancel() = discard
 proc smRspTimerReset() = discard
 template smSaQueryResetScope() = discard

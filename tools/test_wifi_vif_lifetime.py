@@ -255,12 +255,15 @@ def vif_lifetime_source(mutation: str | None = None,
                     "hw": "mm_hw_ap_info_reset(0)",
                     "timer1": "mm_timer_clear(addr vif.tbttTimer)",
                     "timer2": "mm_timer_clear(addr vif.beaconTimeoutTimer)",
-                    "watchdog": "mm_timer_clear(addr vif.keepAliveTimer)",
                     "td": "td_reset(vifIdx)",
                 }.get(mutation)
                 if mutation == "deinit":
                     old = "        if not current():\n          return true\n"
                     new = ""
+                elif mutation == "watchdog":
+                    # The STA timers (keep-alive, data timeout) clear in one loop.
+                    old = "      mm_timer_clear(timer)\n      if not current():\n        return true\n"
+                    new = "      mm_timer_clear(timer)\n"
                 elif mutation == "stop":
                     old = ("      return false\n"
                            "    if not current():\n      return true\n\n"
@@ -268,7 +271,7 @@ def vif_lifetime_source(mutation: str | None = None,
                     new = ("      return false\n\n"
                            "  if vifType == VIF_TYPE_AP and env.apCount == 0:")
                 else:
-                    indent = "    " if mutation in ["stop", "hw", "watchdog"] else "  "
+                    indent = "    " if mutation in ["stop", "hw"] else "  "
                     old = f"{indent}{call}\n{indent}if not current():\n{indent}  return true\n"
                     new = f"{indent}{call}\n"
             assert body.count(old) == 1, (mutation, old)

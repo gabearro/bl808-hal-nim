@@ -332,10 +332,13 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
   if not current():
     return true
   if vifType == VIF_TYPE_STA:
-    # Direct removal can bypass STA deactivation and leave the watchdog linked.
-    mm_timer_clear(addr vif.keepAliveTimer)
-    if not current():
-      return true
+    # Direct removal can bypass STA deactivation (MM_SET_VIF_STATE_REQ(0))
+    # and leave its timers linked; the memset below would cut the list. The
+    # blob clears only the two above.
+    for timer in [addr vif.keepAliveTimer, addr vif.securityTimer]:
+      mm_timer_clear(timer)
+      if not current():
+        return true
 
   # Reset traffic detection for this VIF
   td_reset(vifIdx)
