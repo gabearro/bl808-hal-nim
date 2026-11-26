@@ -1,0 +1,13 @@
+FreeNetRadio|Alexander Horner|MIT
+bl808-hal|Gabriel|MIT
+nanomp3-core|Robert B. Langer|MIT/Apache-2.0
+minimp3|lieff|CC0-1.0
+embedded-graphics|James Waples|MIT/Apache-2.0
+micromath|Tony Arcieri|MIT/Apache-2.0
+misc-fixed fonts|Markus Kuhn, X.Org|Public Domain
+lwIP|Adam Dunkels and contributors|BSD-3-Clause
+Mbed TLS|The Mbed TLS Contributors|Apache-2.0
+wpa_supplicant|Jouni Malinen and contributors|BSD-3-Clause
+bl_iot_sdk|Bouffalo Lab|Apache-2.0
+Nim|Andreas Rumpf and contributors|MIT
+libgcc|Free Software Foundation|GPL-3.0 + GCC exception

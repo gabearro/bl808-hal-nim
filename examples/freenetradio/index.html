@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeNetRadio</title>
+<style>
+:root { --bg: #f4f4f5; --fg: #18181b; --muted: #71717a; --line: #d4d4d8; --card: #ffffff; --accent: #18181b; --accent-fg: #ffffff; --bar: #3f3f46; --bar-bg: #e4e4e7; --err: #b91c1c; }
+@media (prefers-color-scheme: dark) { :root { --bg: #18181b; --fg: #f4f4f5; --muted: #a1a1aa; --line: #3f3f46; --card: #27272a; --accent: #f4f4f5; --accent-fg: #18181b; --bar: #d4d4d8; --bar-bg: #3f3f46; --err: #f87171; } }
+body { font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: grid; place-items: start center; min-height: 100vh; }
+main { width: min(32rem, 100% - 2rem); padding: 2rem 0; }
+h1 { margin: 0 0 1.5rem; line-height: 0; }
+.logo { max-width: 100%; height: auto; }
+h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 .8rem; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: .8rem; padding: 1.2rem; margin-bottom: 1rem; }
+.row { display: flex; gap: .5rem; }
+input[type=url], input[type=text] { flex: 1; min-width: 0; font: inherit; padding: .55rem .7rem; border: 1px solid var(--line); border-radius: .5rem; background: transparent; color: inherit; }
+button { font: inherit; padding: .55rem 1.2rem; border: 0; border-radius: .5rem; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+button.secondary { background: transparent; color: inherit; border: 1px solid var(--line); }
+.vol { display: flex; align-items: center; gap: .8rem; margin-top: 1rem; }
+.vol input { flex: 1; }
+.vol output { min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
+.state { font-weight: 600; text-transform: capitalize; }
+.title { font-size: 1.15rem; margin: .4rem 0 .2rem; overflow-wrap: anywhere; }
+.station, .fmt, .small { color: var(--muted); font-size: .9rem; overflow-wrap: anywhere; }
+.message { color: var(--err); font-size: .9rem; margin-top: .5rem; }
+.meter { height: .5rem; background: var(--bar-bg); border-radius: .25rem; overflow: hidden; margin: .8rem 0 .3rem; }
+.meter div { height: 100%; width: 0; background: var(--bar); transition: width .3s; }
+.small { display: flex; justify-content: space-between; }
+.hint { color: var(--muted); font-size: .85rem; margin: .6rem 0 0; }
+.presets { list-style: none; margin: 0; padding: 0; }
+.presets li { display: flex; align-items: center; gap: .5rem; padding: .45rem 0; border-top: 1px solid var(--line); }
+.presets li:first-child { border-top: 0; }
+.presets .num { width: 1.6rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.presets .pname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.presets .empty { color: var(--muted); font-style: italic; }
+.presets button { padding: .3rem .8rem; font-size: .9rem; }
+.presets form { flex: 1; display: grid; gap: .4rem; }
+.presets form .row { flex-wrap: wrap; }
+.presets-foot { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .8rem; }
+.remote { width: 200px; margin: .4rem auto 0; padding: 26px 20px 30px; border-radius: 30px; background: linear-gradient(160deg, #343434, #161616 55%, #0e0e0e); box-shadow: inset 0 0 0 3px #050505, inset 0 2px 0 4px #2a2a2a, 0 8px 22px rgba(0,0,0,.35); }
+.remote form { display: contents; }
+.keys { display: grid; grid-template-columns: repeat(3, 48px); gap: 12px 14px; justify-content: center; }
+.remote button { width: 48px; height: 48px; padding: 0; border-radius: 50%; font: 700 20px/1 system-ui, sans-serif; touch-action: manipulation; user-select: none; -webkit-user-select: none; cursor: pointer; transition: transform .06s, filter .06s; }
+.remote button:active, .remote button.pressed { transform: scale(.92); filter: brightness(.85); }
+.k-white { background: radial-gradient(circle at 50% 35%, #fff, #e4e4e4); color: #111; border: 3px solid #1b1b1b; box-shadow: 0 0 0 2px #9a9a9a; }
+.k-red { background: radial-gradient(circle at 50% 35%, #ff4d6a, #d0123a); color: #fff; border: 3px solid #1b1b1b; box-shadow: 0 0 0 2px #7a0f22; }
+.k-blue { background: radial-gradient(circle at 50% 35%, #3fb0ff, #1479c9); color: #fff; border: 0; font-size: 16px; }
+.dpad { display: grid; grid-template-columns: repeat(3, 50px); grid-template-rows: repeat(3, 50px); gap: 4px; place-items: center; justify-content: center; margin-top: 20px; }
+.dpad .k-red { font-size: 16px; border: 0; box-shadow: none; }
+.k-blue svg { display: block; width: 20px; height: 20px; margin: auto; }
+.dpad .right svg { transform: rotate(90deg); } .dpad .down svg { transform: rotate(180deg); } .dpad .left svg { transform: rotate(-90deg); }
+.dpad .up { grid-column: 2; grid-row: 1; } .dpad .left { grid-column: 1; grid-row: 2; } .dpad .ok { grid-column: 2; grid-row: 2; }
+.dpad .right { grid-column: 3; grid-row: 2; } .dpad .down { grid-column: 2; grid-row: 3; }
+.foot { text-align: center; margin-bottom: 1rem; }
+dialog { width: min(34rem, 100% - 2rem); max-height: 80vh; padding: 1.2rem; border: 1px solid var(--line); border-radius: .8rem; background: var(--card); color: var(--fg); }
+dialog::backdrop { background: rgba(0, 0, 0, .5); }
+dialog[open] { display: flex; flex-direction: column; }
+dialog h2 { margin-bottom: .5rem; }
+dialog p { margin: .2rem 0; overflow-wrap: anywhere; }
+dialog a { color: inherit; }
+.libs { list-style: none; margin: .8rem 0; padding: 0; overflow-y: auto; flex: 1; border-top: 1px solid var(--line); }
+.libs li { display: grid; grid-template-columns: 1fr auto; gap: 0 .8rem; padding: .4rem 0; border-bottom: 1px solid var(--line); font-size: .9rem; }
+.libs .by { grid-column: 1; color: var(--muted); font-size: .8rem; }
+.libs .lic { grid-row: 1; grid-column: 2; text-align: right; }
+</style>
+</head>
+<body>
+<main>
+<h1><svg class="logo" viewBox="0 0 123 34" width="246" height="68" role="img" aria-label="FreeNetRadio" shape-rendering="crispEdges" fill="currentColor"><path fill-opacity="1.00" d="M16 11h3v1h-3zM15 12h5v1h-5zM14 13h7v1h-7zM14 14h7v1h-7zM14 15h7v1h-7zM15 16h5v1h-5zM16 17h3v1h-3z"/><path fill-opacity="0.96" d="M45 8h2v1h-2zM51 8h2v1h-2zM75 8h6v1h-6zM101 8h2v1h-2zM45 9h3v1h-3zM51 9h2v1h-2zM75 9h2v1h-2zM80 9h2v1h-2zM101 9h2v1h-2z"/><path fill-opacity="0.92" d="M11 9h1v1h-1zM23 9h1v1h-1zM10 10h2v1h-2zM23 10h2v1h-2zM45 10h3v1h-3zM51 10h2v1h-2zM67 10h2v1h-2zM75 10h2v1h-2zM81 10h2v1h-2zM101 10h2v1h-2zM108 10h2v1h-2zM10 11h2v1h-2zM23 11h2v1h-2zM45 11h4v1h-4zM51 11h2v1h-2zM67 11h2v1h-2zM75 11h2v1h-2zM81 11h2v1h-2zM101 11h2v1h-2zM108 11h2v1h-2zM9 12h2v1h-2zM24 12h2v1h-2zM9 13h2v1h-2zM24 13h2v1h-2zM9 14h2v1h-2zM24 14h2v1h-2zM9 15h2v1h-2zM24 15h2v1h-2zM9 16h2v1h-2zM24 16h2v1h-2zM10 17h2v1h-2zM23 17h2v1h-2zM10 18h2v1h-2zM23 18h2v1h-2zM11 19h1v1h-1zM23 19h1v1h-1z"/><path fill-opacity="0.88" d="M45 12h4v1h-4zM51 12h2v1h-2zM67 12h2v1h-2zM75 12h2v1h-2zM81 12h2v1h-2zM101 12h2v1h-2zM45 13h2v1h-2zM48 13h2v1h-2zM51 13h2v1h-2zM57 13h4v1h-4zM65 13h6v1h-6zM75 13h2v1h-2zM81 13h2v1h-2zM87 13h5v1h-5zM97 13h3v1h-3zM101 13h2v1h-2zM106 13h4v1h-4zM117 13h4v1h-4z"/><path fill-opacity="0.84" d="M45 0h4v1h-4zM51 0h3v1h-3zM57 0h4v1h-4zM63 0h4v1h-4zM45 1h1v1h-1zM51 1h1v1h-1zM54 1h1v1h-1zM57 1h1v1h-1zM63 1h1v1h-1zM45 2h3v1h-3zM51 2h1v1h-1zM54 2h1v1h-1zM57 2h3v1h-3zM63 2h3v1h-3zM45 3h1v1h-1zM51 3h3v1h-3zM57 3h1v1h-1zM63 3h1v1h-1zM45 4h1v1h-1zM51 4h1v1h-1zM53 4h1v1h-1zM57 4h1v1h-1zM63 4h1v1h-1zM45 5h1v1h-1zM51 5h1v1h-1zM54 5h1v1h-1zM57 5h4v1h-4zM63 5h4v1h-4zM45 14h2v1h-2zM48 14h2v1h-2zM51 14h2v1h-2zM56 14h2v1h-2zM60 14h2v1h-2zM67 14h2v1h-2zM75 14h2v1h-2zM80 14h2v1h-2zM86 14h2v1h-2zM91 14h2v1h-2zM96 14h2v1h-2zM100 14h3v1h-3zM108 14h2v1h-2zM116 14h2v1h-2zM120 14h2v1h-2zM45 15h2v1h-2zM49 15h4v1h-4zM55 15h2v1h-2zM61 15h2v1h-2zM67 15h2v1h-2zM75 15h6v1h-6zM91 15h2v1h-2zM95 15h2v1h-2zM101 15h2v1h-2zM108 15h2v1h-2zM115 15h2v1h-2zM121 15h2v1h-2z"/><path fill-opacity="0.80" d="M45 16h2v1h-2zM49 16h4v1h-4zM55 16h8v1h-8zM67 16h2v1h-2zM75 16h2v1h-2zM79 16h2v1h-2zM86 16h7v1h-7zM95 16h2v1h-2zM101 16h2v1h-2zM108 16h2v1h-2zM115 16h2v1h-2zM121 16h2v1h-2zM45 17h2v1h-2zM50 17h3v1h-3zM55 17h2v1h-2zM67 17h2v1h-2zM75 17h2v1h-2zM80 17h2v1h-2zM85 17h2v1h-2zM91 17h2v1h-2zM95 17h2v1h-2zM101 17h2v1h-2zM108 17h2v1h-2zM115 17h2v1h-2zM121 17h2v1h-2z"/><path fill-opacity="0.76" d="M7 7h2v1h-2zM27 7h2v1h-2zM7 8h2v1h-2zM27 8h2v1h-2zM6 9h2v1h-2zM28 9h2v1h-2zM6 10h2v1h-2zM28 10h2v1h-2zM5 11h3v1h-3zM28 11h3v1h-3zM5 12h2v1h-2zM29 12h2v1h-2zM5 13h2v1h-2zM29 13h2v1h-2zM5 14h2v1h-2zM29 14h2v1h-2zM5 15h2v1h-2zM29 15h2v1h-2zM5 16h2v1h-2zM29 16h2v1h-2zM5 17h2v1h-2zM29 17h2v1h-2zM5 18h3v1h-3zM28 18h3v1h-3zM45 18h2v1h-2zM50 18h3v1h-3zM55 18h2v1h-2zM67 18h2v1h-2zM75 18h2v1h-2zM80 18h2v1h-2zM85 18h2v1h-2zM91 18h2v1h-2zM95 18h2v1h-2zM101 18h2v1h-2zM108 18h2v1h-2zM115 18h2v1h-2zM121 18h2v1h-2zM6 19h2v1h-2zM28 19h2v1h-2zM45 19h2v1h-2zM51 19h2v1h-2zM56 19h2v1h-2zM61 19h2v1h-2zM67 19h2v1h-2zM71 19h2v1h-2zM75 19h2v1h-2zM81 19h2v1h-2zM85 19h2v1h-2zM91 19h2v1h-2zM96 19h2v1h-2zM100 19h3v1h-3zM108 19h2v1h-2zM116 19h2v1h-2zM120 19h2v1h-2zM6 20h2v1h-2zM28 20h2v1h-2zM7 21h2v1h-2zM27 21h2v1h-2zM7 22h2v1h-2zM27 22h2v1h-2z"/><path fill-opacity="0.71" d="M45 20h2v1h-2zM51 20h2v1h-2zM57 20h5v1h-5zM68 20h4v1h-4zM75 20h2v1h-2zM81 20h2v1h-2zM86 20h5v1h-5zM92 20h1v1h-1zM97 20h3v1h-3zM101 20h2v1h-2zM105 20h8v1h-8zM117 20h4v1h-4z"/><path fill-opacity="0.55" d="M3 4h3v1h-3zM29 4h3v1h-3zM2 5h3v1h-3zM30 5h3v1h-3zM2 6h2v1h-2zM31 6h2v1h-2zM1 7h3v1h-3zM31 7h3v1h-3zM1 8h2v1h-2zM32 8h2v1h-2zM1 9h2v1h-2zM32 9h2v1h-2zM0 10h3v1h-3zM32 10h3v1h-3zM0 11h2v1h-2zM33 11h2v1h-2zM0 12h2v1h-2zM33 12h2v1h-2zM0 13h2v1h-2zM33 13h2v1h-2zM0 14h2v1h-2zM33 14h2v1h-2zM0 15h2v1h-2zM33 15h2v1h-2zM0 16h2v1h-2zM33 16h2v1h-2zM0 17h2v1h-2zM33 17h2v1h-2zM0 18h3v1h-3zM32 18h3v1h-3zM1 19h2v1h-2zM32 19h2v1h-2zM1 20h2v1h-2zM32 20h2v1h-2zM1 21h3v1h-3zM31 21h3v1h-3zM2 22h2v1h-2zM31 22h2v1h-2z"/><path fill-opacity="0.66" d="M2 23h3v1h-3zM30 23h3v1h-3z"/><path fill-opacity="0.60" d="M3 24h3v1h-3zM29 24h3v1h-3zM45 24h2v1h-2zM51 24h2v1h-2zM57 24h5v1h-5zM68 24h4v1h-4zM75 24h2v1h-2zM81 24h2v1h-2zM86 24h5v1h-5zM92 24h1v1h-1zM97 24h3v1h-3zM101 24h2v1h-2zM105 24h8v1h-8zM117 24h4v1h-4z"/><path fill-opacity="0.54" d="M45 25h2v1h-2zM51 25h2v1h-2zM56 25h2v1h-2zM61 25h2v1h-2zM67 25h2v1h-2zM71 25h2v1h-2zM75 25h2v1h-2zM81 25h2v1h-2zM85 25h2v1h-2zM91 25h2v1h-2zM96 25h2v1h-2zM100 25h3v1h-3zM108 25h2v1h-2zM116 25h2v1h-2zM120 25h2v1h-2z"/><path fill-opacity="0.47" d="M45 26h2v1h-2zM50 26h3v1h-3zM55 26h2v1h-2zM67 26h2v1h-2zM75 26h2v1h-2zM80 26h2v1h-2zM85 26h2v1h-2zM91 26h2v1h-2zM95 26h2v1h-2zM101 26h2v1h-2zM108 26h2v1h-2zM115 26h2v1h-2zM121 26h2v1h-2z"/><path fill-opacity="0.41" d="M45 27h2v1h-2zM50 27h3v1h-3zM55 27h2v1h-2zM67 27h2v1h-2zM75 27h2v1h-2zM80 27h2v1h-2zM85 27h2v1h-2zM91 27h2v1h-2zM95 27h2v1h-2zM101 27h2v1h-2zM108 27h2v1h-2zM115 27h2v1h-2zM121 27h2v1h-2z"/><path fill-opacity="0.35" d="M45 28h2v1h-2zM49 28h4v1h-4zM55 28h8v1h-8zM67 28h2v1h-2zM75 28h2v1h-2zM79 28h2v1h-2zM86 28h7v1h-7zM95 28h2v1h-2zM101 28h2v1h-2zM108 28h2v1h-2zM115 28h2v1h-2zM121 28h2v1h-2z"/><path fill-opacity="0.29" d="M45 29h2v1h-2zM49 29h4v1h-4zM55 29h2v1h-2zM61 29h2v1h-2zM67 29h2v1h-2zM75 29h6v1h-6zM91 29h2v1h-2zM95 29h2v1h-2zM101 29h2v1h-2zM108 29h2v1h-2zM115 29h2v1h-2zM121 29h2v1h-2z"/><path fill-opacity="0.23" d="M45 30h2v1h-2zM48 30h2v1h-2zM51 30h2v1h-2zM56 30h2v1h-2zM60 30h2v1h-2zM67 30h2v1h-2zM75 30h2v1h-2zM80 30h2v1h-2zM86 30h2v1h-2zM91 30h2v1h-2zM96 30h2v1h-2zM100 30h3v1h-3zM108 30h2v1h-2zM116 30h2v1h-2zM120 30h2v1h-2z"/><path fill-opacity="0.16" d="M45 31h2v1h-2zM48 31h2v1h-2zM51 31h2v1h-2zM57 31h4v1h-4zM65 31h6v1h-6zM75 31h2v1h-2zM81 31h2v1h-2zM87 31h5v1h-5zM97 31h3v1h-3zM101 31h2v1h-2zM106 31h4v1h-4zM117 31h4v1h-4z"/><path fill-opacity="0.10" d="M45 32h4v1h-4zM51 32h2v1h-2zM67 32h2v1h-2zM75 32h2v1h-2zM81 32h2v1h-2zM101 32h2v1h-2z"/><path fill-opacity="0.04" d="M45 33h4v1h-4zM51 33h2v1h-2zM67 33h2v1h-2zM75 33h2v1h-2zM81 33h2v1h-2zM101 33h2v1h-2zM108 33h2v1h-2z"/></svg></h1>
+
+<section aria-labelledby="h-play">
+<h2 id="h-play">Station</h2>
+<form id="play" method="post" action="/radio/play">
+<div class="row">
+<input id="url" type="url" name="url" required placeholder="http://example.com/stream.mp3" aria-label="Stream URL">
+<button>Play</button>
+</div>
+</form>
+<p class="hint">MP3 streams over http:// or https:// (Icecast/Shoutcast), or an .m3u/.pls playlist. AAC isn't supported.</p>
+<form id="volume" method="post" action="/radio/volume" class="vol">
+<label for="vol">Volume</label>
+<input id="vol" type="range" name="volume" min="0" max="100" value="10">
+<output id="vol-out">10</output>
+<button class="secondary noscript-only">Set</button>
+</form>
+</section>
+
+<section aria-labelledby="h-now" aria-live="polite">
+<h2 id="h-now">Now playing</h2>
+<div class="row" style="justify-content: space-between; align-items: center">
+<span class="state" id="state">stopped</span>
+<form method="post" action="/radio/stop" id="stop"><button class="secondary">Stop</button></form>
+</div>
+<p class="title" id="title">&nbsp;</p>
+<p class="station" id="station"></p>
+<p class="fmt" id="fmt"></p>
+<div class="meter" title="Buffered audio"><div id="buffer"></div></div>
+<div class="small"><span id="buffer-text">Buffer 0%</span><span id="underruns">Dropouts: 0</span></div>
+<p class="message" id="message" hidden></p>
+</section>
+<section aria-labelledby="h-presets">
+<h2 id="h-presets">Presets</h2>
+<ol class="presets" id="preset-list"><li>Loading&hellip;</li></ol>
+<noscript><p class="hint">Editing presets needs JavaScript.</p></noscript>
+<div class="presets-foot"><button id="presets-add" type="button">Add preset</button><button class="secondary" id="presets-reset" type="button">Reset to defaults</button></div>
+</section>
+
+<section aria-labelledby="h-remote">
+<h2 id="h-remote">Remote</h2>
+<form method="post" class="remote" id="remote" aria-label="Virtual remote">
+<div class="keys">
+<button class="k-white" formaction="/remote/1" data-key="1" aria-label="1, preset 1">1</button>
+<button class="k-white" formaction="/remote/2" data-key="2" aria-label="2, preset 2">2</button>
+<button class="k-white" formaction="/remote/3" data-key="3" aria-label="3, preset 3">3</button>
+<button class="k-white" formaction="/remote/4" data-key="4" aria-label="4, preset 4">4</button>
+<button class="k-white" formaction="/remote/5" data-key="5" aria-label="5, preset 5">5</button>
+<button class="k-white" formaction="/remote/6" data-key="6" aria-label="6, preset 6">6</button>
+<button class="k-white" formaction="/remote/7" data-key="7" aria-label="7, preset 7">7</button>
+<button class="k-white" formaction="/remote/8" data-key="8" aria-label="8, preset 8">8</button>
+<button class="k-white" formaction="/remote/9" data-key="9" aria-label="9, preset 9">9</button>
+<button class="k-red" formaction="/remote/star" data-key="star" aria-label="Star, mute">*</button>
+<button class="k-white" formaction="/remote/0" data-key="0" aria-label="0, preset 10">0</button>
+<button class="k-red" formaction="/remote/hash" data-key="hash" aria-label="Hash, settings menu">#</button>
+</div>
+<div class="dpad">
+<button class="k-blue up" formaction="/remote/up" data-key="up" aria-label="Up, volume up"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1.5 9 8.5H1z" fill="currentColor"/></svg></button>
+<button class="k-blue left" formaction="/remote/left" data-key="left" aria-label="Left, previous station"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1.5 9 8.5H1z" fill="currentColor"/></svg></button>
+<button class="k-red ok" formaction="/remote/ok" data-key="ok" aria-label="OK, play or stop">OK</button>
+<button class="k-blue right" formaction="/remote/right" data-key="right" aria-label="Right, next station"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1.5 9 8.5H1z" fill="currentColor"/></svg></button>
+<button class="k-blue down" formaction="/remote/down" data-key="down" aria-label="Down, volume down"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1.5 9 8.5H1z" fill="currentColor"/></svg></button>
+</div>
+</form>
+</section>
+</main>
+<div class="foot"><button type="button" class="secondary" id="about-open">About &amp; licenses</button></div>
+<dialog id="about" aria-labelledby="h-about">
+<h2 id="h-about">About</h2>
+<p><a href="https://github.com/alexhorner/freenetradio" target="_blank" rel="noopener">https://github.com/alexhorner/freenetradio</a></p>
+<p>License: MIT</p>
+<p class="small" style="display:block">Open source libraries used:</p>
+<ul class="libs" id="libs" tabindex="0"></ul>
+<div class="presets-foot"><button type="button" id="about-close">Close</button></div>
+</dialog>
+<script>
+const $ = (id) => document.getElementById(id);
+document.querySelectorAll(".noscript-only").forEach((el) => (el.hidden = true));
+
+let lastStatus = {};
+function show(s) {
+  lastStatus = s;
+  $("state").textContent = s.state;
+  $("title").textContent = s.title || (s.state === "playing" || s.state === "buffering" ? " " : "Nothing playing");
+  $("station").textContent = s.station;
+  $("fmt").textContent = s.sample_rate
+    ? `${s.bitrate} kbps · ${(s.sample_rate / 1000).toFixed(1)} kHz · ${s.channels === 2 ? "stereo" : "mono"}`
+    : "";
+  $("buffer").style.width = s.buffer + "%";
+  $("buffer-text").textContent = `Buffer ${s.buffer}%`;
+  $("underruns").textContent = `Dropouts: ${s.underruns}`;
+  $("message").hidden = !s.message;
+  $("message").textContent = s.message;
+  if (!$("url").value && s.url) $("url").value = s.url;
+  if (document.activeElement !== $("vol")) {
+    $("vol").value = s.volume;
+    $("vol-out").textContent = s.muted ? "muted" : s.volume;
+  }
+}
+
+async function post(path, body, type) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": type, Accept: "application/json" }, body });
+  if (!res.ok) throw new Error(res.status);
+  show(await res.json());
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/radio");
+    show(await res.json());
+  } catch {
+    $("message").hidden = false;
+    $("message").textContent = "Couldn't reach the board.";
+  }
+}
+
+$("play").addEventListener("submit", (e) => {
+  e.preventDefault();
+  post("/radio/play", $("url").value.trim(), "text/plain").catch(poll);
+});
+$("stop").addEventListener("submit", (e) => {
+  e.preventDefault();
+  post("/radio/stop", "", "text/plain").catch(poll);
+});
+let volTimer;
+$("vol").addEventListener("input", () => {
+  $("vol-out").textContent = $("vol").value;
+  clearTimeout(volTimer);
+  volTimer = setTimeout(() => post("/radio/volume", $("vol").value, "text/plain").catch(poll), 80);
+});
+$("volume").addEventListener("submit", (e) => e.preventDefault());
+
+// Virtual remote: same buttons as the IR one. Holding up/down repeats after
+// 0.4 s, like a real remote's NEC repeat codes.
+function press(key, repeat) {
+  return post("/remote/" + key + (repeat ? "?repeat" : ""), "", "text/plain").catch(poll);
+}
+let holdTimer, repeatTimer, held;
+function release() {
+  clearTimeout(holdTimer);
+  clearInterval(repeatTimer);
+  if (held) held.classList.remove("pressed");
+  held = null;
+}
+for (const b of document.querySelectorAll("#remote button")) {
+  b.addEventListener("click", (e) => e.preventDefault());
+  b.addEventListener("contextmenu", (e) => e.preventDefault());
+  b.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    release();
+    held = b;
+    b.classList.add("pressed");
+    press(b.dataset.key, false);
+    if (b.dataset.key === "up" || b.dataset.key === "down") {
+      holdTimer = setTimeout(() => {
+        repeatTimer = setInterval(() => press(b.dataset.key, true), 110);
+      }, 110);
+    }
+  });
+}
+for (const ev of ["pointerup", "pointercancel", "pointerleave"]) document.addEventListener(ev, release);
+window.addEventListener("blur", release);
+
+// Presets 1..99 (type the number on the remote), saved on the board.
+// Shown: 1..10 always, higher numbers only once filled (or being added).
+const presetList = $("preset-list");
+let presets = [];
+let editing = -1;
+async function loadPresets() {
+  try {
+    presets = await (await fetch("/presets")).json();
+  } catch {
+    presets = [];
+  }
+  renderPresets();
+}
+function el(tag, props, ...kids) {
+  const e = Object.assign(document.createElement(tag), props);
+  e.append(...kids);
+  return e;
+}
+function renderPresets() {
+  presetList.replaceChildren(
+    ...presets.map((p, i) => [p, i]).filter(([p, i]) => i < 10 || p.url || i === editing).map(([p, i]) => {
+      const li = el("li", {}, el("span", { className: "num", textContent: i + 1 }));
+      if (i === editing) {
+        const name = el("input", { type: "text", value: p.name, maxLength: 32, placeholder: "Name", ariaLabel: "Preset name" });
+        const url = el("input", { type: "url", value: p.url, maxLength: 212, placeholder: "http://...", ariaLabel: "Preset URL" });
+        const save = (n, u) => {
+          const body = new URLSearchParams({ name: n, url: u });
+          fetch("/presets/" + (i + 1), { method: "POST", body })
+            .then((r) => (r.ok ? r.text() : r.text().then((t) => Promise.reject(t))))
+            .then(() => { editing = -1; loadPresets(); })
+            .catch((e) => alert("Couldn't save: " + e));
+        };
+        const current = el("button", { type: "button", className: "secondary", textContent: "Use current" });
+        current.onclick = () => {
+          url.value = lastStatus.url || "";
+          name.value = (lastStatus.station || "").split(": ")[0].slice(0, 32);
+        };
+        const clear = el("button", { type: "button", className: "secondary", textContent: "Clear" });
+        clear.onclick = () => save("", "");
+        const cancel = el("button", { type: "button", className: "secondary", textContent: "Cancel" });
+        cancel.onclick = () => { editing = -1; renderPresets(); };
+        const form = el("form", {}, name, url, el("div", { className: "row" }, el("button", { textContent: "Save" }), current, clear, cancel));
+        form.onsubmit = (e) => { e.preventDefault(); save(name.value.trim(), url.value.trim()); };
+        li.append(form);
+        setTimeout(() => name.focus());
+      } else {
+        li.append(p.url ? el("span", { className: "pname", textContent: p.name || p.url, title: p.url })
+                        : el("span", { className: "pname empty", textContent: "Empty" }));
+        const play = el("button", { type: "button", textContent: "Play", disabled: !p.url });
+        play.onclick = () => fetch("/presets/" + (i + 1) + "/play", { method: "POST" }).finally(poll);
+        const edit = el("button", { type: "button", className: "secondary", textContent: "Edit" });
+        edit.onclick = () => { editing = i; renderPresets(); };
+        li.append(play, edit);
+      }
+      return li;
+    })
+  );
+}
+$("presets-add").onclick = () => {
+  const free = presets.findIndex((p) => !p.url);
+  if (free < 0) return alert("All 99 presets are in use.");
+  editing = free;
+  renderPresets();
+};
+$("presets-reset").onclick = () => {
+  if (confirm("Replace all presets with the built-in stations? Presets 11 and up are deleted.")) {
+    fetch("/presets/reset", { method: "POST" }).then(loadPresets);
+  }
+};
+loadPresets();
+
+$("about-open").onclick = () => {
+  $("about").showModal();
+  if ($("libs").children.length) return;
+  fetch("/licenses").then((r) => r.text()).then((t) => {
+    t.trim().split("\n").forEach((line) => {
+      const [name, author, lic] = line.split("|");
+      const li = document.createElement("li");
+      for (const [cls, text] of [["name", name], ["lic", lic], ["by", "by " + author]]) {
+        const d = document.createElement("span");
+        d.className = cls;
+        d.textContent = text;
+        li.append(d);
+      }
+      $("libs").append(li);
+    });
+  });
+};
+$("about-close").onclick = () => $("about").close();
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

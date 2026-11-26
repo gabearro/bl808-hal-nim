@@ -1,0 +1,55 @@
+MP3 decoder fixtures for tests/t_mp3dec.nim
+===========================================
+
+Each <name>.mp3 is a short clip (0.4 to 2 s) and <name>.ref is what
+upstream's decoder (FreeNetRadio's vendored nanomp3-core, built with
+default-features = false, Decoder::new(), i16 output) does with it. The
+format of a reference is described at the top of tests/t_mp3dec.nim.
+
+The clips are synthetic: sweeps, tones, clicks and noise bursts made with
+ffmpeg 9.1 and encoded with LAME 4.0, Layer II with
+ffmpeg's mp2 encoder. Names give the MPEG version (m1, m2, m25), the sample
+rate, the channel mode (mono, s = stereo, js = joint stereo, ms = forced
+mid/side) and the bit rate.
+
+  m1_44k_js128_id3            ID3v2 tag in front
+  m1_44k_js128_junk           2500 bytes of junk in front, false headers in it
+  m1_44k_js128_midstart       starts inside a frame a third of the way in
+                              (bit reservoir unavailable at first)
+  m1_44k_js128_damaged        flipped bits in side info and main data, an
+                              impossible big_values, a lost header
+  m1_44k_js128_crc            CRC-protected frames
+  m1_44k_s192_truncated       ends inside a frame
+  m1_44k_free200              free-format bit rate
+  m1_44k_vbr_v3, m2_22k_vbr_v6   VBR, 8 to 320 kbit/s
+  m1_44k_mono_stereo_switch   mono, stereo, mono, stereo in one stream
+  *_intensity*                intensity stereo
+  *_mixed*                    mixed blocks
+  m1_44k_mono_modeext64       mono frames with mode-extension bits set
+  layer2_44k_192              Layer II (reported, not decoded)
+  the rest                    plain CBR at the rates the names give; all the
+                              clips have short and start/stop blocks
+
+No encoder at hand produces intensity stereo or mixed blocks, so those are
+switched on in the headers and side info of streams encoded without them
+(regen/mp3tool.py patch). What they decode to is noise, but it goes through
+the real decoding paths and upstream agrees on every sample.
+
+noref/ holds two 8 kHz MPEG-2.5 streams with mixed blocks. No encoder makes
+those either, and upstream cannot decode them: its mixed-block table for that
+rate disagrees with its long/short split and the decoder panics with an
+index out of bounds. The port stops reordering at the granule's end instead;
+the test only checks that these decode without a fault.
+
+Regenerating
+------------
+
+  sh regen/mkfix.sh <outdir>          # the clips (byte-identical with the
+                                      # tool versions above)
+  # the references: build regen/mp3ref.rs as a binary crate that depends on
+  #   nanomp3-core = { path = "<FreeNetRadio>/vendor/nanomp3-core",
+  #                    default-features = false }
+  # (cargo build --offline --release), then for every clip outside noref/
+  { echo "# window 0"; mp3ref <clip> 0; echo "# window 2000"; mp3ref <clip> 2000; } > <name>.ref
+
+`t_mp3dec trace <clip> <window>` prints the port's trace in the same format.
