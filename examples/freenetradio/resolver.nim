@@ -12,6 +12,9 @@
 import bl808/kernel/lwipcore
 import ./netio, ./netstate, ./dnsmsg, ./timebase
 
+proc os_get_random(randomBytes: ptr uint8; length: csize_t): cint {.importc, cdecl.}
+  ## The Wi-Fi stack's TRNG reader; 0 on success.
+
 const
   TryTimeoutMs = 1_500'u64
   Rounds = 2
@@ -35,7 +38,6 @@ type
     sentMs: uint64
     hurry: bool                ## the server asked just now can't help: move on
 
-var queryCount: uint32
 
 proc currentServer(r: Resolver): uint32 =
   r.servers[(r.tries - 1) mod r.serverCount]
@@ -115,13 +117,20 @@ proc start*(r: var Resolver; host: openArray[char]) =
       r.servers[r.serverCount] = server
       inc r.serverCount
 
+  # The query id and the source port are what an answer is accepted on, so
+  # both come from the TRNG. Without random numbers there is no lookup.
+  var random: array[2, uint16]
+  if os_get_random(cast[ptr uint8](addr random), sizeof(random).csize_t) != 0: return
   r.pcb = udpNew()
   if r.pcb == nil: return
+  var anyAddr = ipAddrAny()
+  if udpBind(r.pcb, addr anyAddr, 49152'u16 + (random[1] and 0x3FFF)) != 0 and
+      udpBind(r.pcb, addr anyAddr, 0) != 0:
+    udpRemove(r.pcb)
+    r.pcb = nil
+    return
   udpRecv(r.pcb, onReply, addr r)
-  # Hard to guess, and different for every lookup.
-  inc queryCount
-  let t = nowUs()
-  r.id = uint16((t xor (t shr 16)) and 0xFFFF) xor uint16((queryCount * 40503'u32) and 0xFFFF)
+  r.id = random[0]
   r.tries = 0
   r.state = rsPending
   r.sendQuery()

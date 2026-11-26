@@ -78,6 +78,17 @@ when defined(bl808WifiRealLwipDns) and not lwipDnsEnabled:
 
 when lwipDnsEnabled:
   {.compile: LwipRoot & "/src/core/dns.c".}
+when defined(bl808WifiRealLwipDns):
+  proc os_get_random(randomBytes: ptr uint8; length: csize_t): cint {.importc, cdecl.}
+
+  proc bl808_lwip_dns_txid(): uint32 {.exportc, cdecl.} =
+    ## lwIP's DNS query ids and source ports: TRNG output and nothing else.
+    ## An answer is accepted on the strength of these, so a value derived
+    ## from the clock or the MAC address will not do. lwIP has no way to
+    ## be told "no", so this waits for the TRNG (which WPA2 and TLS need
+    ## just as much).
+    while os_get_random(cast[ptr uint8](addr result), sizeof(result).csize_t) != 0:
+      discard
 {.compile: LwipRoot & "/src/core/sys.c".}
 when not defined(bl808WifiRealLwip):
   {.compile: LwipRoot & "/src/core/stats.c".}

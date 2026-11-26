@@ -18,9 +18,10 @@
 ## public-key operation of RSA signature checks up to 2048 bits, on the PKA;
 ## entropy from the TRNG. Each of these checks itself against the software
 ## implementation on first use and falls back to it for good if they differ,
-## or just for one call while its engine is in use elsewhere. In software
-## stay: GHASH (the SEC_ENG GMAC block is not validated in this HAL),
-## ChaCha20-Poly1305, X25519 and P-384, RSA keys above 2048 bits, MD5, and
+## or just for one call while its engine is in use elsewhere. AES-GCM records
+## go to the chip whole (AES in counter mode, GHASH on the GMAC block). In
+## software stay: ChaCha20-Poly1305, X25519 and P-384, multiples of the P-256
+## base point (the built-in table is faster), RSA keys above 2048 bits, MD5, and
 ## SHA-1 unless the image is built with the Wi-Fi provider
 ## (-d:bl808WifiMbedTlsSha1Hardware). TLS handshakes here do not use SHA-1.
 ##

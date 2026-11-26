@@ -88,13 +88,14 @@
 #define LWIP_DNS                       0
 #endif
 #if LWIP_DNS && !defined(DNS_RAND_TXID)
-/* Query ids and source ports come from the same TRNG-backed source as the
- * DHCP transaction id; this profile has no LWIP_RAND. */
+/* Query ids and source ports come from the TRNG only (lwipcore.nim): unlike
+ * the DHCP transaction id, they must not be guessable, so there is no
+ * time-and-address fallback. This profile has no LWIP_RAND. */
 #ifndef __ASSEMBLER__
 #include <stdint.h>
-extern uint32_t bl808_lwip_dhcp_xid_seed(void);
+extern uint32_t bl808_lwip_dns_txid(void);
 #endif
-#define DNS_RAND_TXID()                bl808_lwip_dhcp_xid_seed()
+#define DNS_RAND_TXID()                bl808_lwip_dns_txid()
 #endif
 #define LWIP_NETCONN                   0
 #define LWIP_SOCKET                    0

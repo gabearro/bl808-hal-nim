@@ -43,7 +43,8 @@ def profile_values(tmp_path: Path, *flags: str) -> dict[str, int]:
         + "#ifdef DNS_RAND_TXID\n  puts(\"DNS_RAND_TXID 1\");\n#else\n  puts(\"DNS_RAND_TXID 0\");\n#endif\n"
         "  return 0;\n}\n"
         # Only named, never called: the firmware's Wi-Fi runtime provides it.
-        "unsigned int bl808_lwip_dhcp_xid_seed(void) { return 0; }\n",
+        "unsigned int bl808_lwip_dhcp_xid_seed(void) { return 0; }\n"
+        "unsigned int bl808_lwip_dns_txid(void) { return 0; }\n",
         encoding="ascii",
     )
     binary = tmp_path / "values"
@@ -114,6 +115,9 @@ void test_lwip_assert(const char *message) { fprintf(stderr, "lwIP assert: %s\n"
 /* The firmware's TRNG-backed source; here a counter the test can predict. */
 static uint32_t seed = 0x5EED0000U;
 uint32_t bl808_lwip_dhcp_xid_seed(void) { return ++seed; }
+/* DNS query ids have their own source, which never falls back from the TRNG;
+ * the same counter here so the test can see that DNS drew from it. */
+uint32_t bl808_lwip_dns_txid(void) { return ++seed; }
 uint16_t bl808_lwip_dhcp_retry_ms(uint32_t xid, uint32_t now_ms, uint8_t tries, uint8_t state)
 {
     (void)xid; (void)now_ms; (void)tries; (void)state;
