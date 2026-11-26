@@ -89,6 +89,23 @@ plain UART flashing
   over UART0. This also avoids UART bootloader mode and is useful when the JTAG
   flash path is less reliable than UART data transfer.
 
+`--rom-flash`
+: Flashes with only the serial port and no vendor tool: prompts for UART boot
+  mode (BOOT held at power-up), loads the RAM C anchor through the boot ROM's
+  serial protocol (`tools/bl808_isp.py`), then writes, verifies and reboots
+  through the anchor as `--uart-anchor-flash` does. Short for
+  `--uart-anchor-flash --uart-anchor-rom --no-jtag --manual-boot-reset
+  --uart-anchor-reset-after-flash`. `tools/bl808_isp.py probe <port>` checks
+  that the ROM answers. This passed on the Ox64 with the `freenetradio`
+  image (flash ID `0x1860EF`, boot2, both partition tables and the firmware
+  written and verified, reboot into the image, 63 s). In UART boot mode the
+  flash regulator (`GLB_LDO18FLASH`) is off, GPIO34..39 are plain GPIOs and
+  the flash controller's pad select is 0; the C anchor sets all three before
+  it touches flash. The harness stops before erasing when the flash ID reads
+  `0x000000` or `0xFFFFFF`. Without `--manual-boot-reset` (no terminal to
+  press Enter in), put the board in UART boot mode first and pass the long
+  form of the flags.
+
 These modes are mutually exclusive where the CLI says so. In particular,
 `--uart-anchor-flash` cannot be combined with `--jtag-flash` or `--jtag-load`.
 

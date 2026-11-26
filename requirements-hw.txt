@@ -1,5 +1,6 @@
-pyserial>=3.5,<4
+# `make venv`: everything in requirements.txt, plus the vendor's flasher
+# (tools/upload.sh) and the BLE validation helpers.
+-r requirements.txt
 bflb-iot-tool>=1.9.0
 standard-telnetlib>=3.13.0; python_version >= "3.13"
 bleak>=0.22
-pytest>=8,<9

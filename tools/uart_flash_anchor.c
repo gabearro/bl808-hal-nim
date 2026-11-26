@@ -103,6 +103,7 @@
 #define CMD_ERASE           2u
 #define CMD_WRITE_VERIFY    3u
 #define CMD_REBOOT          4u
+#define CMD_PEEK            5u   /* read the 32-bit word at `address` */
 
 #define ERR_OK              0u
 #define ERR_BAD_COMMAND     1u
@@ -392,6 +393,36 @@ static int sf_wait_idle(uint32_t timeout)
     return -1;
 }
 
+/* Started from the boot ROM's serial loader (BOOT held at power-up), nothing
+ * has brought the flash chip up yet: its supply regulator is off, the six
+ * flash pads are plain GPIOs and the controller looks at another pad group.
+ * Set those as a normal boot leaves them (values read back from a running
+ * Ox64). Harmless when already done. */
+#define GLB_PARM_CFG0       (GLB_BASE + 0x510u)
+#define GLB_PARM_EMBEDDED_FLASH (1u << 9)
+#define GLB_LDO18FLASH      (GLB_BASE + 0x6CCu)
+#define LDO18FLASH_ON       0x3u            /* powered, as on a running Ox64 */
+#define FLASH_PAD_FIRST     34u
+#define FLASH_PAD_CLK_CS    0x40400256u     /* GPIO34, GPIO35 */
+#define FLASH_PAD_DATA      0x40400217u     /* GPIO36..GPIO39 */
+#define SF_CTRL_2           (SF_CTRL_BASE + 0x70u)
+#define SF_CTRL_2_PAD_MASK  0x7u
+#define SF_CTRL_2_PAD_SF2   1u              /* the pads of GPIO34..GPIO39 */
+
+static void flash_bring_up(void)
+{
+    if ((read32(GLB_LDO18FLASH) & LDO18FLASH_ON) != LDO18FLASH_ON) {
+        write32(GLB_LDO18FLASH, read32(GLB_LDO18FLASH) | LDO18FLASH_ON);
+        delay_cycles(2000000u);     /* tens of milliseconds: supply and chip start-up */
+    }
+    write32(GLB_PARM_CFG0, read32(GLB_PARM_CFG0) & ~GLB_PARM_EMBEDDED_FLASH);
+    for (uint32_t pin = FLASH_PAD_FIRST; pin < FLASH_PAD_FIRST + 6u; pin++) {
+        write32(GPIO_CFG_BASE + pin * 4u, pin < FLASH_PAD_FIRST + 2u ? FLASH_PAD_CLK_CS
+                                                                    : FLASH_PAD_DATA);
+    }
+    write32(SF_CTRL_2, (read32(SF_CTRL_2) & ~SF_CTRL_2_PAD_MASK) | SF_CTRL_2_PAD_SF2);
+}
+
 static void sf_claim_sahb(void)
 {
     uint32_t cfg1 = read32(SF_CTRL_CFG1);
@@ -607,6 +638,7 @@ void main(void)
 {
     const int watchdog_stopped = stop_inherited_watchdog();
     uart0_init(UART_ANCHOR_BAUD);
+    flash_bring_up();
     sf_claim_sahb();
     debug_clear();
     uart_send_string("\r\nBL808-UART-FLASH-ANCHOR v1\r\n");
@@ -657,6 +689,8 @@ void main(void)
                     status = (uint32_t)flash_program_verify(req.address, req.length);
                 }
             }
+        } else if (req.command == CMD_PEEK) {
+            result = read32(req.address & ~3u);
         } else if (req.command == CMD_REBOOT) {
             reboot_after_response = 1u;
         } else {

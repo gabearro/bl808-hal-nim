@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
+    from . import bl808_isp
     from .build_bl808_boot2_flash import FW_BOOTINFO_FALLBACK, read_fw_bootinfo_template
 else:
+    import bl808_isp
     from build_bl808_boot2_flash import FW_BOOTINFO_FALLBACK, read_fw_bootinfo_template
 
 
@@ -103,6 +105,7 @@ UART_FLASH_CMD_READ_ID = 1
 UART_FLASH_CMD_ERASE = 2
 UART_FLASH_CMD_WRITE_VERIFY = 3
 UART_FLASH_CMD_REBOOT = 4
+UART_FLASH_CMD_PEEK = 5
 UART_FLASH_DEBUG_BASE = 0x2204C020
 UART_FLASH_DEBUG_STATUS_BUSY = 0xFFFFFFFF
 UART_FLASH_BANNER = b"BL808-UART-FLASH-ANCHOR v1\r\n"
@@ -479,6 +482,20 @@ def parse_args() -> argparse.Namespace:
                             "and pairs with --uart-anchor-reset-after-flash when runtime "
                             "JTAG/nSRST is unavailable."
                         ))
+    parser.add_argument("--uart-anchor-rom", action="store_true",
+                        help=(
+                            "Load the RAM UART flash anchor through the BL808 boot ROM's "
+                            "serial protocol (tools/bl808_isp.py) instead of JTAG. The "
+                            "board must be in UART boot mode: BOOT held at power-up."
+                        ))
+    parser.add_argument("--rom-flash", action="store_true",
+                        help=(
+                            "Flash with nothing but the serial port: prompt for UART boot "
+                            "mode, load the flash anchor through the boot ROM, write and "
+                            "verify flash through it, and have it reboot into the new "
+                            "image. Short for --uart-anchor-flash --uart-anchor-rom "
+                            "--no-jtag --manual-boot-reset --uart-anchor-reset-after-flash."
+                        ))
     parser.add_argument("--uart-anchor-probe", action="store_true",
                         help=(
                             "Load the M0 UART flash anchor, verify ping/read-id, and exit "
@@ -625,6 +642,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.uart_anchor_flash_image_end is not None and args.uart_anchor_flash_image is None:
         parser.error("--uart-anchor-flash-image-end requires --uart-anchor-flash-image")
+    if args.rom_flash:
+        args.uart_anchor_flash = True
+        args.uart_anchor_rom = True
+        args.no_jtag = True
+        args.manual_boot_reset = True
+        args.uart_anchor_reset_after_flash = True
+    if args.uart_anchor_rom and args.uart_anchor_existing:
+        parser.error("--uart-anchor-rom loads an anchor; --uart-anchor-existing uses a running one")
     return args
 
 
@@ -3662,6 +3687,15 @@ def uart_anchor_request_reboot(
     print("UART anchor reboot requested", flush=True)
 
 
+def require_flash_present(jedec: int) -> None:
+    """Refuse to erase or write when the flash chip did not identify itself:
+    every command would go nowhere and every check would be meaningless."""
+    if jedec & 0xFFFFFF in (0x000000, 0xFFFFFF):
+        raise RuntimeError(
+            f"the flash chip did not answer (JEDEC ID 0x{jedec & 0xFFFFFF:06X}); "
+            "nothing was written")
+
+
 def flash_firmware_over_uart_anchor(
     test: dict[str, Any],
     *,
@@ -3686,6 +3720,7 @@ def flash_firmware_over_uart_anchor(
     )
     anchor_args = argparse.Namespace(**vars(args))
     anchor_args.jtag_core = "m0"
+    anchor_from_rom = bool(getattr(args, "uart_anchor_rom", False))
 
     anchor: Path | None = None
     if not args.uart_anchor_existing:
@@ -3699,6 +3734,11 @@ def flash_firmware_over_uart_anchor(
     if args.dry_run:
         if args.uart_anchor_existing:
             print(f"DRY-RUN: use existing UART flash anchor on {flash_port} at {flash_baud}")
+        elif anchor_from_rom:
+            if args.manual_boot_reset:
+                wait_for_manual_boot_reset(args, test["name"])
+            print(f"DRY-RUN: load UART flash anchor through the boot ROM on {flash_port} "
+                  f"at {flash_baud}")
         else:
             print(f"DRY-RUN: open UART flash anchor port {flash_port} at {flash_baud}")
         for segment in segments:
@@ -3718,12 +3758,12 @@ def flash_firmware_over_uart_anchor(
     ser: Any | None = None
     session: OpenOcdSession | None = None
     try:
-        if args.uart_anchor_existing:
-            anchor_log_path = work_dir / "logs" / f"{test['name']}.uart-anchor-existing.log"
-            append_log(
-                anchor_log_path,
-                "\n# use existing UART flash anchor; no JTAG load/reset performed\n",
-            )
+        if args.uart_anchor_existing or anchor_from_rom:
+            anchor_log_path = work_dir / "logs" / (
+                f"{test['name']}.uart-anchor-"
+                f"{'rom' if anchor_from_rom else 'existing'}.log")
+            if anchor_from_rom and args.manual_boot_reset:
+                wait_for_manual_boot_reset(args, test["name"])
             ser = open_serial_device(
                 serial,
                 port=flash_port,
@@ -3735,6 +3775,27 @@ def flash_firmware_over_uart_anchor(
             )
             ser.reset_input_buffer()
             ser.reset_output_buffer()
+            if anchor_from_rom:
+                assert anchor is not None
+                append_log(anchor_log_path,
+                           "\n# load UART flash anchor through the boot ROM; no JTAG\n")
+                try:
+                    info = bl808_isp.load_and_run(
+                        ser,
+                        template=find_default_boot2_image().read_bytes(),
+                        entry=UART_FLASH_ANCHOR_ENTRY,
+                        payload=anchor.read_bytes(),
+                        log=lambda line: append_log(anchor_log_path, line + "\n"),
+                    )
+                except bl808_isp.RomError as exc:
+                    raise RuntimeError(str(exc)) from exc
+                append_log(anchor_log_path, f"rom: boot info {info.hex()}\n")
+                print("UART flash anchor loaded through the boot ROM")
+            else:
+                append_log(
+                    anchor_log_path,
+                    "\n# use existing UART flash anchor; no JTAG load/reset performed\n",
+                )
             serial_drain_until_quiet(ser, quiet_s=0.15, timeout_s=1.0)
             ack_mode = select_uart_flash_anchor_ack_mode(
                 args,
@@ -3752,6 +3813,7 @@ def flash_firmware_over_uart_anchor(
                 attempts=3,
             )
             print(f"UART anchor flash JEDEC ID: 0x{jedec:06X}")
+            require_flash_present(jedec)
             for segment in segments:
                 uart_anchor_flash_program_segment(
                     ser,
@@ -3869,6 +3931,7 @@ def flash_firmware_over_uart_anchor(
             attempts=3,
         )
         print(f"UART anchor flash JEDEC ID: 0x{jedec:06X}")
+        require_flash_present(jedec)
         for segment in segments:
             uart_anchor_flash_program_segment(
                 ser,
@@ -6345,8 +6408,11 @@ def run_hardware_test(
         flash_port = args.flash_port or args.uart
         if not args.no_flash:
             if args.uart_anchor_flash:
-                if args.no_jtag and not args.uart_anchor_existing:
-                    raise RuntimeError("--uart-anchor-flash requires JTAG; remove --no-jtag")
+                if args.no_jtag and not (args.uart_anchor_existing or
+                                         getattr(args, "uart_anchor_rom", False)):
+                    raise RuntimeError(
+                        "--uart-anchor-flash needs a way to start the anchor: JTAG "
+                        "(remove --no-jtag), --uart-anchor-rom or --uart-anchor-existing")
                 if flash_port is None and not args.dry_run:
                     raise RuntimeError("--flash-port or --uart is required for UART anchor flashing")
                 flash_firmware_over_uart_anchor(

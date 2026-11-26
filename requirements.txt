@@ -1,0 +1,10 @@
+# What the hardware harness needs to build, flash (tools/hw_validate.py
+# --rom-flash, tools/bl808_isp.py) and run its host tests:
+#
+#   uv venv .venv
+#   uv pip install -r requirements.txt
+#
+# or `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
+# requirements-hw.txt adds the vendor's flasher and the BLE test helpers.
+pyserial>=3.5,<4
+pytest>=8,<9
