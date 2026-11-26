@@ -1,4 +1,6 @@
-## WPA2 passphrase derivation using the pinned Mbed TLS SHA-1 compression.
+## WPA2 passphrase derivation using the SHA-1 compression of the vendored
+## Mbed TLS 3.6.8 (vendor/mbedtls, built once per image by bl808/mbedtls/crypto;
+## the 2.x names below come from bl808/mbedtls/bl808_mbedtls_compat.h).
 
 type
   Wpa2Pmk* = array[32, uint8]

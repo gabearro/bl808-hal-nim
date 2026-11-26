@@ -9,4 +9,4 @@ BL808_MBEDTLS_OCRAM(mbedtls_md_hmac_update);
 BL808_MBEDTLS_OCRAM(mbedtls_md_hmac_finish);
 BL808_MBEDTLS_OCRAM(mbedtls_md_hmac_reset);
 
-#include "../../../build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/md.c"
+#include "../../../vendor/mbedtls/library/md.c"

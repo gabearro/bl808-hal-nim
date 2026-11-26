@@ -1,0 +1,15 @@
+Mbed TLS 3.6.8 (3.6 LTS)
+
+tag:     mbedtls-3.6.8
+release: https://github.com/Mbed-TLS/mbedtls/releases/tag/mbedtls-3.6.8
+tarball: https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.8/mbedtls-3.6.8.tar.bz2
+sha256:  bc54b818e87f49c0b3281dd85d24adaede0e63b4e822e3fbd49c005a38b9595b
+         (matches the release's published mbedtls-3.6.8-sha256sum.txt)
+
+Vendored unmodified: library/ and include/ (without their CMakeLists.txt,
+Makefile and .gitignore), LICENSE and README.md. Tests, programs, docs,
+scripts, 3rdparty, framework and the build system are left out.
+
+The BL808 configuration and hardware alternates live outside this tree in
+src/bl808/mbedtls/; nothing here is edited. To update, replace library/ and
+include/ from a newer 3.6.x release tarball and refresh this note.

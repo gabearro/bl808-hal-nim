@@ -18,10 +18,10 @@ def literal(data: bytes) -> str:
 @pytest.mark.parametrize("flags", [[], ["-d:release"], ["--passC:-fsanitize=address",
                                                           "--passL:-fsanitize=address"]])
 def test_wpa2_pmk_matches_reference(tmp_path: Path, flags: list[str]) -> None:
-    sdk = ROOT / "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls"
+    mbedtls = ROOT / "vendor/mbedtls"
     nim = shutil.which("nim")
-    if not nim or not (sdk / "library/sha1.c").is_file():
-        pytest.skip("WPA2 derivation vectors require Nim and the pinned BL808 SDK")
+    if not nim or not (mbedtls / "library/sha1.c").is_file():
+        pytest.skip("WPA2 derivation vectors require Nim and the vendored Mbed TLS")
     rng = random.Random(808)
     cases = [(b"password", b"IEEE"), (b"12345678", b""), (b"P" * 63, bytes(range(32)))]
     for length, ssid_len in [(8, 1), (9, 3), (11, 4), (12, 5), (31, 19), (48, 20), (63, 31)]:
@@ -29,8 +29,10 @@ def test_wpa2_pmk_matches_reference(tmp_path: Path, flags: list[str]) -> None:
                       rng.randbytes(ssid_len)))
     code = [
         "import bl808/wifi/wpa2_pmk",
-        f'{{.compile: "{sdk}/library/sha1.c".}}',
-        f'{{.compile: "{sdk}/library/platform_util.c".}}',
+        "import bl808/mbedtls/build  # include paths and the BL808 configuration",
+        f'{{.compile: "{mbedtls}/library/sha1.c".}}',
+        f'{{.compile: "{mbedtls}/library/platform.c".}}',
+        f'{{.compile: "{mbedtls}/library/platform_util.c".}}',
         "var pmk: Wpa2Pmk",
     ]
     for passphrase, ssid in cases:
@@ -44,7 +46,7 @@ def test_wpa2_pmk_matches_reference(tmp_path: Path, flags: list[str]) -> None:
     source.write_text("\n".join(code) + "\n")
     result = subprocess.run(
         [nim, "c", "-r", "--skipParentCfg", "--skipProjCfg", "--skipUserCfg",
-         "--assertions:on", f"--path:{ROOT / 'src'}", f"--passC:-I{sdk / 'include'}",
+         "--assertions:on", f"--path:{ROOT / 'src'}",
          f"--nimcache:{tmp_path / 'cache'}", *flags, str(source)],
         capture_output=True, text=True, timeout=60, cwd=ROOT,
     )

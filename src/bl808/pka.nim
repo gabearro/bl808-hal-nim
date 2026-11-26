@@ -194,12 +194,23 @@ proc pkaReadMtimeUs(): uint64 =
     hi2 = regRead(base + 4)
   (hi2.uint64 shl 32) or lo.uint64
 
+var pkaTimeouts: uint32
+
+proc pkaTimeoutCount*(): uint32 {.inline.} =
+  ## PKA commands since boot whose completion flag did not come within
+  ## 100 ms. The command procs return nothing (the vendor driver drops the
+  ## same timeout), so a caller running its own register program reads this
+  ## before and after: if it moved, the PKA did not finish and whatever was
+  ## read back is not a result.
+  pkaTimeouts
+
 proc pkaWaitIsr(base: uint) =
   let start = pkaReadMtimeUs()
   while pkaReadMtimeUs() - start <= 100_000'u64:
     let v = regRead(base + PkaCtrl0Offset)
     if (v and PkaCtrlIntStatus) != 0:
       return
+  inc pkaTimeouts
 
 proc pkaWaitAndClear(base: uint) =
   pkaDebugMark(base, 0x00000020'u32)
@@ -1276,6 +1287,7 @@ proc sdkP256ScalarMulLoop(dev: ptr BflbDevice, scalar: ptr uint32): cint =
   while firstNonZero < 31 and bytes[firstNonZero] == 0:
     firstNonZero.inc
 
+  let timeouts = pkaTimeouts
   var resultInf = true
   var i = 31
   while true:
@@ -1288,6 +1300,8 @@ proc sdkP256ScalarMulLoop(dev: ptr BflbDevice, scalar: ptr uint32): cint =
         else:
           sdkP256PointAdd(dev)
       sdkP256PointDouble(dev)
+      # A PKA that stopped answering would cost 100 ms per remaining command.
+      if pkaTimeouts != timeouts: return -1
     if i == firstNonZero:
       break
     i.dec
@@ -1296,6 +1310,7 @@ proc sdkP256ScalarMulLoop(dev: ptr BflbDevice, scalar: ptr uint32): cint =
 proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
                               scalar, px, py: ptr uint32,
                               outX, outY: ptr uint32): cint =
+  let timeouts = pkaTimeouts
   pkaDebugMark(dev.regBase, 0x00000200'u32)
   bflb_pka_init(dev)
   pkaDebugMark(dev.regBase, 0x00000201'u32)
@@ -1361,7 +1376,8 @@ proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
 
   bflb_pka_deinit(dev)
   pkaDebugMark(dev.regBase, 0x00000260'u32)
-  0
+  # A command that timed out leaves no product in the registers read above.
+  if pkaTimeouts != timeouts: -1 else: 0
 
 proc pkaReduceModN(dev: ptr BflbDevice, value, outValue: ptr uint32): cint =
   if dev == nil or value == nil or outValue == nil:

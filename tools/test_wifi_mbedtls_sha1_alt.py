@@ -382,18 +382,20 @@ else:
 
 
 def test_mbedtls_sha1_alt_preserves_backend_and_fallback_state(tmp_path: Path) -> None:
-    sdk = ROOT / "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls"
+    mbedtls = ROOT / "vendor/mbedtls"
     nim = shutil.which("nim")
-    if not nim or not (sdk / "library/sha1.c").is_file():
-        pytest.skip("alternate provider vectors require Nim and the pinned BL808 SDK")
+    if not nim or not (mbedtls / "library/sha1.c").is_file():
+        pytest.skip("alternate provider vectors require Nim and the vendored Mbed TLS")
     wifi = ROOT / "src/bl808/wifi"
     alt = (wifi / "mbedtls_sha1_alt.nim").read_text()
     source = tmp_path / "sha1_provider.nim"
     expected = ", ".join(f"{byte}'u8" for byte in hashlib.sha1(b"B" * 80).digest())
     source.write_text(
+        "import bl808/mbedtls/build  # include paths and the BL808 configuration\n"
         f'{{.compile: "{wifi}/mbedtls_sha1_software.c".}}\n'
-        f'{{.compile: "{sdk}/library/sha1.c".}}\n'
-        f'{{.compile: "{sdk}/library/platform_util.c".}}\n'
+        f'{{.compile: "{mbedtls}/library/sha1.c".}}\n'
+        f'{{.compile: "{mbedtls}/library/platform.c".}}\n'
+        f'{{.compile: "{mbedtls}/library/platform_util.c".}}\n'
         + r'''
 type
   Sha1State = array[5, uint32]
@@ -419,7 +421,7 @@ proc hardwareProcess(state: var Sha1State; data: ptr uint8): ShaBlockResult =
   state = context.state
   shaBlockDone
 proc sha1(data: ptr uint8; length: csize_t; digest: ptr uint8): cint
-  {.importc: "mbedtls_sha1_ret", cdecl, header: "<mbedtls/sha1.h>".}
+  {.importc: "mbedtls_sha1", cdecl, header: "<mbedtls/sha1.h>".}
 '''
         + procedure(alt, "probeShaBackend").partition("\nwhen ")[0]
         + procedure(alt, "mbedtlsSha1Process")
@@ -454,7 +456,7 @@ for (faultAt, busyFirst, busyLast, backend, hw, sw) in [
     result = subprocess.run(
         [nim, "c", "-r", "--skipParentCfg", "--skipProjCfg", "--skipUserCfg",
          "--assertions:on", "--passC:-DMBEDTLS_SHA1_PROCESS_ALT",
-         f"--passC:-I{sdk / 'include'}", f"--nimcache:{tmp_path / 'cache'}", str(source)],
+         f"--path:{ROOT / 'src'}", f"--nimcache:{tmp_path / 'cache'}", str(source)],
         capture_output=True, text=True, timeout=60, cwd=ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr

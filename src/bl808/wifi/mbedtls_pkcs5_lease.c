@@ -1,3 +1,4 @@
+#include <mbedtls/error.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
 #include <mbedtls/platform.h>

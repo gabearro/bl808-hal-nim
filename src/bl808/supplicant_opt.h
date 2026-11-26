@@ -5,6 +5,11 @@
  * b773b3f Bouffalo makefile instead builds the in-tree supplicant crypto and
  * blcrypto_suite glue, so this local header keeps that vendor source path
  * self-contained for the HAL test binary.
+ *
+ * Where the Wi-Fi build does use Mbed TLS (SHA-1, HMAC and PBKDF2 for the
+ * WPA2 key derivation, AES), it is the vendored Mbed TLS 3.6.8 in
+ * vendor/mbedtls with the configuration in src/bl808/mbedtls, not a copy
+ * from the SDK tree.
  */
 #ifndef _SUPPLICANT_OPT_H
 #define _SUPPLICANT_OPT_H

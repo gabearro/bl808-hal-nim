@@ -134,7 +134,8 @@ The standard AP image uses the software backend. Build
 for the hardware comparison. The hardware build links Mbed TLS's regular
 derivation and stream functions with a BL808 block provider, without
 precomputing the key or wrapping the derivation. It checks a non-default
-chaining state against the pinned software block function before using
+chaining state against the software block function of the vendored
+Mbed TLS 3.6.8 (`vendor/mbedtls`) before using
 hardware and requires no fallback during the timed bench command.
 
 The first channel 1 hardware comparison on 2026-11-23 passed the provider

@@ -28,7 +28,7 @@ when defined(bl808WifiRealLwip):
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto".}
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/inc".}
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/priv_inc".}
-{.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/include".}
+# Mbed TLS headers and configuration: bl808/mbedtls/build (see crypto_sources).
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/utils/include".}
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/dns_server/include".}
 {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/netutils/include".}
