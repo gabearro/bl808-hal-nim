@@ -22,9 +22,8 @@ the firmware. Keep the image and its build tree local.
 
 The [manifest entry](../tools/hardware_validation.json) supplies the Wi-Fi
 and linker defines. [freenetradio.nims](../examples/freenetradio/freenetradio.nims)
-sets the application defaults, including an eight-slot RX DMA ring and the
-split TX pools. Override the depth for a measured comparison with
-`--nim-define WifiRxRingSlots=16`.
+sets an eight-slot RX DMA ring and requires separate TX pools. The
+defaults are 16 host slots, 16 MAC DMA records, and 32 packet buffers.
 
 Set `UART_PORT` to the runtime serial device found by the
 [hardware harness](hardware_validation_harness.md). On a JTAG-equipped

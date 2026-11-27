@@ -285,6 +285,8 @@ def program(case: str, mutation: str | None = None) -> str:
             if match:
                 selected = match[1] not in known
                 if selected: known.add(match[1])
+            elif line and not line.startswith(" "):
+                selected = False
             if selected and (match or line.startswith("    ")):
                 added.append(line)
         layout += "\nconst\n" + "\n".join(added) + "\n"

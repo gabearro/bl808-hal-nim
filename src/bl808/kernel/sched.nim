@@ -116,8 +116,15 @@ when defined(radioDiag):
     atMs*, totalUs*, firstTimersUs*, readyUs*, timedUs*, lastTimersUs*: uint32
     wifiUs*, readyMaxUs*, timerMaxUs*, readyCount*: uint32
 
+  # Slow turns are recorded infrequently. Keep the trace outside cached OCRAM
+  # on Wi-Fi application builds so the TX pools can grow without taking stack.
+  when defined(bl808m0) and defined(bl808WifiApp):
+    {.pragma: schedulerTraceRam, codegenDecl: "$# $# __attribute__((section(\".wifibss.scheduler_diag\"), aligned(16)))".}
+  else:
+    {.pragma: schedulerTraceRam.}
+
   var schedulerTiming: SchedulerTiming
-  var schedulerSlowTurns*: array[32, SchedulerSlowTurn]
+  var schedulerSlowTurns* {.schedulerTraceRam.}: array[32, SchedulerSlowTurn]
   var schedulerSlowCount*: uint32
   var lastIterationEndTick: uint64
   var iterationWifiUs, iterationReadyMaxUs, iterationTimerMaxUs: uint32

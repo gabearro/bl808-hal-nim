@@ -87,9 +87,10 @@ tree local.
 
 The harness writes `kernel.elf` and `kernel.bin` under
 `build/hw-validation/bin/freenetradio/`. Keep the matching ELF for
-profiling. The [build configuration](freenetradio.nims) sets the eight-slot
-Wi-Fi RX DMA ring, separate host TX and MAC DMA pools, and a 10 KiB lwIP
-TCP receive window.
+profiling. The [build configuration](freenetradio.nims) sets an eight-slot
+Wi-Fi RX DMA ring and a 10 KiB lwIP TCP receive window. FreeNetRadio
+requires separate TX pools and defaults to 16 host slots, 16 MAC DMA
+records, and 32 packet buffers.
 
 ### Optional D0 MP3 decoder
 

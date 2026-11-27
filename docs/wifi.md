@@ -18,15 +18,20 @@ separate when tracing a delayed reply.
 [Deferred TX work](../src/bl808/wifi/fw/postponed_tx_work.nim).
 
 The native RX DMA ring defaults to 41 slots and accepts
-`WifiRxRingSlots` values from 8 through 41. FreeNetRadio chooses eight.
-Use the manifest build plus `--nim-define WifiRxRingSlots=16` to test a larger
-ring under the same workload. Track ring exhaustion, packet receipt, and
-audio underruns together.
+`WifiRxRingSlots` values from 8 through 41. FreeNetRadio defaults to eight
+to leave Wi-Fi RAM for the TX pools. When comparing ring sizes under the
+same workload, track ring exhaustion, packet receipt, and audio underruns
+together.
 [RX configuration](../src/bl808/wifi/rx_ring_config.nim) ·
 [FreeNetRadio build defaults](../examples/freenetradio/freenetradio.nims).
 
-FreeNetRadio's split TX layout defaults to four host slots, eight DMA
-records, and twelve packet buffers. These are software pool sizes.
+FreeNetRadio requires separate pools for host slots and MAC DMA records.
+The default software capacities are 16 host slots, 16 DMA records, and
+32 packet buffers. The build overrides are `WifiTxHostSlotCount`,
+`WifiTxDmaRecordCount`, and `WifiTxPacketBufferCount`.
+With both TX pools at 16, a 16-slot RX build fits the 115 KiB Wi-Fi RAM
+region with `--nim-define WifiRxRingSlots=16` and
+`--nim-define WifiTxPacketBufferCount=28`.
 
 - A host slot is a submission credit. The driver can return it when that
   frame's own DONE is observed.

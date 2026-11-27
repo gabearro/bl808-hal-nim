@@ -425,7 +425,8 @@ for i in 0 ..< WifiTxHostSlotCount:
   doAssert ipcHostTxPrimaryDone(records[i], true)
   doAssert not ipcHostTxPrimaryDone(records[i], true)
 ipcHostIrqRestore(irq)
-doAssert ipc_host_txdesc_left(env, 0, 0) == WifiTxHostSlotCount.cint
+doAssert ipc_host_txdesc_left(env, 0, 0) ==
+  min(WifiTxHostSlotCount, WifiTxDmaRecordCount - WifiTxHostSlotCount).cint
 
 for i in WifiTxHostSlotCount ..< WifiTxDmaRecordCount:
   packets[i] = ipc_host_txbuf_get(env)
@@ -447,10 +448,18 @@ listPushBack(confirmations, records[0])
 ipc_host_irq(env, 1'u32 shl IpcIrqE2aTxCfmPos)
 doAssert seen == @[cast[uint](packets[0])]
 doAssert ipc_host_txbuf_get(env) == packets[0]
-doAssert ipc_host_txdesc_get(env) == nil  # the second batch still owns all credits
 
 # A flush may retire a frame that never reached primary DONE.
-let firstUnfinished = WifiTxHostSlotCount
+when WifiTxHostSlotCount == WifiTxDmaRecordCount:
+  # The first batch returned every credit. Only the retired record can be
+  # reused, even though the other records are past their own DONE.
+  doAssert ipc_host_txdesc_get(env) == records[0]
+  ipc_host_txdesc_push(env, packets[0])
+  doAssert listPopFront(ongoing) == records[0]
+  const firstUnfinished = 0
+else:
+  doAssert ipc_host_txdesc_get(env) == nil  # the second batch owns all credits
+  const firstUnfinished = WifiTxHostSlotCount
 listPushBack(confirmations, records[firstUnfinished])
 ipc_host_irq(env, 1'u32 shl IpcIrqE2aTxCfmPos)
 doAssert seen == @[cast[uint](packets[0]), cast[uint](packets[firstUnfinished])]
@@ -595,8 +604,9 @@ def test_ipc_host_lifetime(tmp_path: Path, case: str, mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_split_tx_expanded(tmp_path: Path, mode: str) -> None:
-    run(tmp_path, "split_tx", mode, defines=("WifiTxHostSlotCount=8", "WifiTxDmaRecordCount=16"))
+@pytest.mark.parametrize("host_slots", [8, 16])
+def test_split_tx_expanded(tmp_path: Path, mode: str, host_slots: int) -> None:
+    run(tmp_path, "split_tx", mode, defines=(f"WifiTxHostSlotCount={host_slots}", "WifiTxDmaRecordCount=16"))
 
 
 @pytest.mark.parametrize("mutation", MUTANTS)
