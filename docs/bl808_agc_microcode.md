@@ -9,6 +9,8 @@ byte for byte. There are 350 program words, followed by 161 zero words and
 one final word. The listing uses hex word indices, so `S00F` starts at
 `0x24C0A000 + 4 * 0x00F = 0x24C0A03C`.
 
+Paths under `build/` identify local bench capture artifacts.
+
 [ISA encoding](#recovered-isa-encoding) ·
 [State control comparisons](#isolating-lower-state-controls) ·
 [Section walkthrough](#control-flow-by-section) ·
@@ -399,8 +401,8 @@ The historical Nim Wi-Fi scan capture reads back `001E8480`
 at `+B3BC`. The lwIP capture reads `003D0900`, twice that
 count. These are direct observations of the watchdog register.
 Both captures preserve the same four RIU entry addresses.
-[Wi-Fi scan snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178) ·
-[Wi-Fi lwIP snapshot](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L159)
+Wi-Fi scan snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178`) ·
+Wi-Fi lwIP snapshot (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L159`)
 
 BL618DG independently uses the SFAX8 and Trident
 watchdog constant. Its named `phy_init` setters
@@ -539,7 +541,7 @@ short-count variation. At 500, 1,000, and 2,000, setting bit 26
 does not add 2,048 timer counts. It is a separate state control, not
 the timer count's high bit on this board. The branch condition `02`
 advanced each state after its programmed interval. The probe restored
-the stock AGC image. The [trace](../build/hw-validation/captures/bl808_agc_timer_bit26_sweep_2026-11-21.uart.log)
+the stock AGC image. The trace (`build/hw-validation/captures/bl808_agc_timer_bit26_sweep_2026-11-21.uart.log`)
 has SHA-256 `62d2ac7322ab947da82c6545436a7123f842aef83acbf7162b147ea11031f89c`;
 [`analyze_agc_timer.py`](../tools/analyze_agc_timer.py) checks the
 counts, timing, and full sample accounting. The physical effect of bit
@@ -551,7 +553,7 @@ The raw value of bits 26:15 is 2098. Bits 25:15 alone give 50,
 the same count used before the corresponding `41000F00`
 retry action in the M1s and earlier YoC programs. Those programs
 also use `0414140F` as the restart edge from the same state.
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [YoC PHY package][agc-yoc-phy-760] ·
 [Retry loop comparison](#bit-4-in-the-acquisition-retry-loop)
 
@@ -671,8 +673,8 @@ from 100 µs onward. With 2,000 counts, it first appears near 200 µs
 and stays set thereafter. The timer-disabled controls hold the bit
 clear throughout 400 µs, and all sampled fetch addresses remain in
 the parked `S000` words. The probe restores the original 512 AGC RAM
-words and RF settings after each run. The [1,000-count trace](../build/hw-validation/captures/bl808_agc_timeout_diag_1000_2026-11-21.uart.log)
-and [2,000-count trace](../build/hw-validation/captures/bl808_agc_timeout_diag_2000_2026-11-21.uart.log)
+words and RF settings after each run. The 1,000-count trace (`build/hw-validation/captures/bl808_agc_timeout_diag_1000_2026-11-21.uart.log`)
+and 2,000-count trace (`build/hw-validation/captures/bl808_agc_timeout_diag_2000_2026-11-21.uart.log`)
 establish RIU bank `01[0]` as the observable state-timer expiry flag
 on BL808. Together with the count-only branch chain, this directly
 supports operand `02` = timer expiry; it does not map the other RIU
@@ -927,8 +929,8 @@ old source. That log cannot validate the corrected path or establish the
 board's current `HDMVERSION` value.
 [Archived PHY and clock code](../src/bl808/librf_bl808.a) ·
 [Nim port of the startup check](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2405) ·
-[Configuration field comparison](bl808_wifi_csi_research.md#qcc743-register-definitions-and-actual-driver) ·
-[Board UART log](../build/hw-validation-ssidbytes-layout-run-20260610/logs/m0_wifi_nimfw_hal_test.primary.uart.log#L83)
+[Configuration field comparison][csi-archive-qcc743-register-definitions-and-actual-driver] ·
+Board UART log (`build/hw-validation-ssidbytes-layout-run-20260610/logs/m0_wifi_nimfw_hal_test.primary.uart.log#L83`)
 
 The BL808 archive calls `crm_clk_set` at
 `phy_set_channel+0x40` before `mdm_set_channel`.
@@ -980,7 +982,7 @@ TBE byte. The numerical match supports using the
 SiFlower configuration as a reference for the
 older BL808 values. The actual BL808 clock rate
 for those fields requires independent calibration.
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) · [Vendor BLE readback](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L160) · [Vendor Wi-Fi readback](../build/hw-validation-rfphy-vendor-current-mmactive-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L175)
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] · Vendor BLE readback (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L160`) · Vendor Wi-Fi readback (`build/hw-validation-rfphy-vendor-current-mmactive-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L175`)
 
 The pinned BL808 channel routine writes
 `TXSTARTDELAY=384` in both width cases, at
@@ -1079,7 +1081,7 @@ the header reset words exactly.
 [SiFlower DC compensation fields][sfax8-riu-dc-time] ·
 [AIC DC compensation fields][aic-riu-dc-time] ·
 [QCC743 DC compensation fields][qcc-riu-dc-time] ·
-[BL808 register dump](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747)
+BL808 register dump (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747`)
 
 | Modem offset and readback | Selected named fields | Encoded intervals |
 | --- | --- | --- |
@@ -1182,7 +1184,7 @@ CRM value and its cycle count is exactly 1.5 times the vendor value.
 The current shim and timing baseline postdate these snapshots and have
 not been checked on hardware. These configured ratios do not establish
 a physical clock rate.
-[SFAX8 MAC timing fields][sfax8-mac-timing] · [Pinned MAC archive](../src/bl808/libwifi_fw.a) · [Pinned CRM archive](../src/bl808/librf_bl808.a) · [Vendor Wi-Fi snapshot](../build/hw-validation/vendor_full_rf_trace.gdb.log#L124) · [Nim Wi-Fi snapshot](../build/hw-validation/nim_full_rf_trace.gdb.log#L124)
+[SFAX8 MAC timing fields][sfax8-mac-timing] · [Pinned MAC archive](../src/bl808/libwifi_fw.a) · [Pinned CRM archive](../src/bl808/librf_bl808.a) · Vendor Wi-Fi snapshot (`build/hw-validation/vendor_full_rf_trace.gdb.log#L124`) · Nim Wi-Fi snapshot (`build/hw-validation/nim_full_rf_trace.gdb.log#L124`)
 
 | BL808 snapshot | `TIMINGS_1` | `TIMINGS_2` | Configured MAC clocks for slot setting 9 |
 | --- | --- | --- | ---: |
@@ -1282,8 +1284,8 @@ corresponding to type 3 and hold 8 in those
 snapshots. The wider mode's type-0 readback
 remains unverified on BL808.
 [BL808 Nim width settings](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2198) ·
-[BL808 vendor Wi-Fi readback](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176) ·
-[BL808 BLE readback](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747)
+BL808 vendor Wi-Fi readback (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176`) ·
+BL808 BLE readback (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747`)
 
 BL808 uses the same AGC words across these
 width settings. In BL618DG, the driver selects
@@ -1311,8 +1313,8 @@ low byte but both program the timeout to `0x1F4`
 gives the same timeout count. The headers supply
 no units for that field.
 [SFAX8 TDFOCTRL3][sfax8-tdfoctrl3] · [QCC743 TDFOCTRL3][qcc-mdm-tdfoctrl3] · [ARCS TDFOCTRL3][arcs-mdm-tdfoctrl3] ·
-[Vendor Wi-Fi snapshot](../build/hw-validation-rfphy-vendor-current-mmactive-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Vendor BLE snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L162)
+Vendor Wi-Fi snapshot (`build/hw-validation-rfphy-vendor-current-mmactive-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Vendor BLE snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L162`)
 
 The pinned BL808 `phy_init+0x300` and 20 MHz
 `mdm_set_channel+0x188` writes set bit 24 at
@@ -1508,7 +1510,7 @@ its lower control word is `0C2F`. Bit 14 is clear throughout the
 pinned image and appears in the same position in older headers,
 such as M1s `S0E2` (`30004000`). These comparisons show where the
 older images exercise combinations absent from the pinned program.
-[M1s RF archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s RF archive][csi-archive-published-rc2-register-accessors] ·
 [PineVoice PHY packages][agc-pinevoice-phy] ·
 [YoC v8.1.0 PHY package][agc-yoc-phy-810]
 
@@ -1786,7 +1788,7 @@ in the corresponding loop while changing the conditions and
 timers. The M1s and SFAX8 first loop states have the same
 header, `4819339F`.
 [BL808 transition index](#complete-transition-index) ·
-[M1s archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly) ·
+[M1s archive comparison][csi-archive-agc-state-machine-disassembly] ·
 [SFAX8 AGC program][sfax8-image]
 
 | Image | All states with bit 4 set | Selector-`41` word in the loop | First timer count |
@@ -2628,8 +2630,8 @@ SDKs all end with `C0088D03`. They contain between 96 and 124
 states. Ordinary CRC-32 over the preceding words of the pinned
 and M1s images gives `8BA7EDED` and `3BE09862`, respectively.
 [BL808 loader](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L1899) ·
-[Cold scan record](../build/hw-validation/logs/m0_wifi_nimfw_cold_scan_hal_test.primary.uart.log#L48) ·
-[Vendor archive provenance](bl808_wifi_csi_research.md#downloadable-phy-and-wi-fi-archives)
+Cold scan record (`build/hw-validation/logs/m0_wifi_nimfw_cold_scan_hal_test.primary.uart.log#L48`) ·
+[Vendor archive provenance][csi-archive-downloadable-phy-and-wi-fi-archives]
 
 #### ASCII zero checksum candidate
 
@@ -2741,7 +2743,7 @@ and 1–64 bits of advance per word, the greatest
 common divisor had degree zero after removing
 powers of `x`. This rules out a shared CRC-style
 generator over that full span in those layouts.
-[Vendor archive provenance](bl808_wifi_csi_research.md#downloadable-phy-and-wi-fi-archives) ·
+[Vendor archive provenance][csi-archive-downloadable-phy-and-wi-fi-archives] ·
 [BL618DG program arrays][agc-bl618dg-phy]
 
 #### Amlogic source revisions with unchanged trailers
@@ -3296,8 +3298,8 @@ SiFlower driver selects the CRM or modem clock
 register using a separate system signature check.
 BL808 compiled code directly selects CRM. Any
 autonomous hardware use of word `1FF` remains open.
-[BL808 HDM configuration snapshot][bl808-hdm-load-snapshot] ·
-[BL808 RIU version snapshot][bl808-riu-version-snapshot] ·
+BL808 HDM configuration snapshot (`build/hw-validation-rfphy-pure-wide-mmactive-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200`) ·
+BL808 RIU version snapshot (`build/hw-validation-rfphy-pure-wide-mmactive-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L224`) ·
 [SiFlower full-mask RF mode constants][sf19-fullmask-rfmode] ·
 [Generic load-revision field][sf19-agc-load-revision] ·
 [Generic loader mode selection][sf19-agc-mode-pick] · [Generic BIST loader][sf19-agc-bist]
@@ -3424,10 +3426,10 @@ reports a completed scan with results. The AIC
 ready-write protocol therefore cannot be assumed
 from the shared register layout. The use of
 those bits on BL808 remains unverified.
-[Vendor Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Vendor Wi-Fi scan results](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L65) ·
-[Nim Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Vendor BLE snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L183)
+Vendor Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Vendor Wi-Fi scan results (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L65`) ·
+Nim Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Vendor BLE snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L183`)
 
 The host implementations sequence clock and
 reset release differently. In the pinned BL808
@@ -3891,7 +3893,7 @@ records the same call, `riu_combpathsel_setf(1)`, at
 `phy_init+0x10C`. SFAX8, QCC743, and AIC8800 give the mask a reset
 value of 3. [SFAX8 RIU initialization][sfax8-riuin] ·
 [QCC743 mask][qcc-agc-control] · [AIC8800 mask][aic-rwnxagccomb] ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s PHY archive][csi-archive-published-rc2-register-accessors]
 
 | Recipe | Trident driver `PATHCOMB` | SFAX8, QCC743, and AIC8800 defaults |
 | --- | ---: | ---: |
@@ -3919,7 +3921,7 @@ operands and combiner. These observations separate the path flag,
 the path mask, and the operand recipe.
 [BL808 event snapshot and initializer](#entry-stubs-and-external-events) ·
 [SFAX8 defaults][riu-events] ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s PHY archive][csi-archive-published-rc2-register-accessors]
 
 Both AX3000 FMAC binaries program the receive-path
 mask from modem `+0000[11:8]`, the field named `NSS`
@@ -3975,11 +3977,11 @@ The captures establish a single active receive path
 for the Wi-Fi configurations. With one selected
 path, both candidate reductions produce the same
 result, so these snapshots cannot distinguish them.
-[BL808 RIU version snapshot][bl808-riu-version-snapshot] ·
+BL808 RIU version snapshot (`build/hw-validation-rfphy-pure-wide-mmactive-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L224`) ·
 [QCC743 RIU version][qcc-riu-version] · [RIU active-antenna fields][qcc-activeant] ·
 [HDM configuration fields][qcc-hdmconfig] ·
-[Wi-Fi scan registers](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Wi-Fi lwIP registers](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158)
+Wi-Fi scan registers (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Wi-Fi lwIP registers (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158`)
 
 The related AX3000 v3 40 MHz low-band program uses both flag
 values on RAM branches. The first branches of `S0D8` and `S0F2`
@@ -4047,8 +4049,8 @@ Both runs reach a unique true or false marker for every case;
 the longer 500-count run has at least 36 fetch samples in each
 selected marker. This establishes that the path/page bits do not
 alter these Boolean results when both receive paths, if present,
-see the same constant inputs. The [50-count trace](../build/hw-validation/captures/bl808_agc_path_page_50_2026-11-21.uart.log),
-[500-count trace](../build/hw-validation/captures/bl808_agc_path_page_500_2026-11-21.uart.log),
+see the same constant inputs. The 50-count trace (`build/hw-validation/captures/bl808_agc_path_page_50_2026-11-21.uart.log`),
+500-count trace (`build/hw-validation/captures/bl808_agc_path_page_500_2026-11-21.uart.log`),
 and [analyzer](../tools/analyze_agc_path_page.py) preserve the matrix.
 
 A separate parked-state probe tests the nonconstant timer operand
@@ -4058,8 +4060,8 @@ The enabled 1,000-count phases transfer to a marker at about
 100 µs, and the 2,000-count phases at about 200 µs. The 2,000-count
 run has one marker sample in the preceding 150–200 µs bin in one
 phase; all subsequent samples are in the marker. The
-[1,000-count trace](../build/hw-validation/captures/bl808_agc_page_timer_1000_2026-11-21.uart.log),
-[2,000-count trace](../build/hw-validation/captures/bl808_agc_page_timer_2000_2026-11-21.uart.log),
+1,000-count trace (`build/hw-validation/captures/bl808_agc_page_timer_1000_2026-11-21.uart.log`),
+2,000-count trace (`build/hw-validation/captures/bl808_agc_page_timer_2000_2026-11-21.uart.log`),
 and [analyzer](../tools/analyze_agc_page_timer.py) document this
 control. Thus `P02` remains timer expiry under both settings on
 this single-path BL808 configuration. These probes do not establish
@@ -4355,7 +4357,7 @@ action without going through the selector-`0E` state.
 Along the matched selector-`0E` path, the single outgoing
 word changes as follows.
 [SFAX8 AGC program][sfax8-image] · [SF19A28 band images][sf19-bands] ·
-[M1s archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly)
+[M1s archive comparison][csi-archive-agc-state-machine-disassembly]
 
 | Image and state | Timer count | Extension | Branch |
 | --- | ---: | --- | --- |
@@ -5134,8 +5136,8 @@ the six C2 logs instead read `6403880B` there. Other modem settings
 and test builds also vary. Scan success or failure in these runs
 cannot identify a C6 truth-table row. A new single-register event
 comparison is required for that purpose.
-[Example C6 readback](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Example C2 readback](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177)
+Example C6 readback (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Example C2 readback (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`)
 
 A separately published BL602 PHY object reconstruction supplies the
 same paired C2 recipe as those six readbacks: `agc_config` writes
@@ -5279,9 +5281,9 @@ first run and 34 in the second. The masks agree across both runs:
 The case counts plus terminal count total 5,000,000 in each run.
 [`analyze_agc_combiner.py`](../tools/analyze_agc_combiner.py) rejects
 incomplete traces, ambiguous markers, wrong controls, and disagreement
-between runs. The preserved [50-count UART trace](../build/hw-validation/captures/bl808_agc_combiner_50_2026-11-21.uart.log)
+between runs. The preserved 50-count UART trace (`build/hw-validation/captures/bl808_agc_combiner_50_2026-11-21.uart.log`)
 has SHA-256 `77af666bcac980f7306ff3293649a409478efa762b5c12fdfda25e8f0f20cf02`;
-the [500-count trace](../build/hw-validation/captures/bl808_agc_combiner_500_2026-11-21.uart.log)
+the 500-count trace (`build/hw-validation/captures/bl808_agc_combiner_500_2026-11-21.uart.log`)
 has SHA-256 `865c5743ee741b31db98c38b461ce40ca54bf05f56b43c4073ada877470c0c8d`.
 These are RAM branch combiner results with page and path bits clear;
 the [separate priority probe](#branch-slot-priority-on-bl808) tests
@@ -5356,8 +5358,8 @@ The shortest markers had 36 and 35 fetch samples in the two runs.
 
 | Run | Cases | Overlaps | Result | Preserved trace SHA-256 |
 | --- | ---: | ---: | --- | --- |
-| [Two slots](../build/hw-validation/captures/bl808_agc_priority_2slot_2026-11-21.uart.log) | 8 | 6 | Earlier slot wins; target and C0/C1 word order do not change it | `ae8bcfcb2a576f5d653091032e4bfe9cf45bfa6e550a26ef86e249b51c8b7e8a` |
-| [Seven slots](../build/hw-validation/captures/bl808_agc_priority_7slot_2026-11-21.uart.log) | 19 | 12 | Earlier slot wins at every adjacent pair | `e12eca38172512f12d90456da5bee7463612cb39d7dca5d632a4d91cc754d973` |
+| Two slots (`build/hw-validation/captures/bl808_agc_priority_2slot_2026-11-21.uart.log`) | 8 | 6 | Earlier slot wins; target and C0/C1 word order do not change it | `ae8bcfcb2a576f5d653091032e4bfe9cf45bfa6e550a26ef86e249b51c8b7e8a` |
+| Seven slots (`build/hw-validation/captures/bl808_agc_priority_7slot_2026-11-21.uart.log`) | 19 | 12 | Earlier slot wins at every adjacent pair | `e12eca38172512f12d90456da5bee7463612cb39d7dca5d632a4d91cc754d973` |
 
 [`analyze_agc_priority.py`](../tools/analyze_agc_priority.py) checks
 all cases, marker exclusivity, terminal reachability, and the
@@ -5867,11 +5869,11 @@ Wi-Fi program the matching header `2819008F` has its timer
 edge relocated to `S142`. This establishes the configured
 entry for the BLE loader. The normal Wi-Fi archive preserves
 the target field, so its runtime value still needs measurement.
-[Vendor BLE register snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220) ·
+Vendor BLE register snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220`) ·
 [BLE EVT4 word](../src/bl808/blecontroller/registers_wireless_rf.nim#L706) ·
 [BLE RAM loader](../src/bl808/blecontroller/registers_wireless_rf.nim#L2183) ·
 [BLE program data](../src/bl808/blerfdata.nim#L14) ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s PHY archive][csi-archive-published-rc2-register-accessors]
 
 #### Receive-request drops and AGC reset mode
 
@@ -5910,8 +5912,8 @@ bit 0 as 1 and 0, respectively. Their RIU event
 words differ as well, so the scan comparison
 cannot assign an observed receive outcome to
 this bit alone.
-[Vendor-PHY scan readback](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157) ·
-[Nim-PHY scan readback](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157) ·
+Vendor-PHY scan readback (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157`) ·
+Nim-PHY scan readback (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157`) ·
 [Concurrent event changes](#wi-fi-event-register-and-ram-readback)
 
 The SF16A18 HDM bank `04` exposes `mac_rxerr`,
@@ -5937,8 +5939,8 @@ an execution trace.
 Two historical Nim Wi-Fi test configurations both read back the
 same four RIU targets. Their high fields expose different event
 recipes at `+B384` and `+B38C`.
-[Wi-Fi scan snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Wi-Fi lwIP snapshot](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158)
+Wi-Fi scan snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Wi-Fi lwIP snapshot (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158`)
 
 | Register | Target | Wi-Fi scan snapshot | Wi-Fi lwIP snapshot |
 | --- | --- | --- | --- |
@@ -5951,8 +5953,8 @@ The lwIP capture's disappearance recipe is the same one read
 in the BLE test. RC2 EVT4 remains unmeasured during normal
 Wi-Fi operation. The `+B384` values show that both combiner
 settings reached hardware with the same operands and target.
-[Wi-Fi scan snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Wi-Fi lwIP snapshot](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158)
+Wi-Fi scan snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Wi-Fi lwIP snapshot (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158`)
 
 The archived scan runs give an outcome for each recipe. The
 pure-PHY run completed its scan with zero results. The
@@ -5967,11 +5969,11 @@ These runs associate the `C2` configuration with working
 reception. The concurrent changes at `+B38C`, `+B390`,
 and other addresses leave the effect of `+B384` unresolved.
 None of these captures records the actual transfers to `S005`.
-[Pure-PHY scan result](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L45) ·
-[Vendor-PHY event readback](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Vendor-PHY scan result](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L56) ·
-[OpenOCD patch and readback](../build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L137) ·
-[Patched scan result](../build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L52)
+Pure-PHY scan result (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L45`) ·
+Vendor-PHY event readback (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Vendor-PHY scan result (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L56`) ·
+OpenOCD patch and readback (`build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L137`) ·
+Patched scan result (`build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L52`)
 
 A separate Wi-Fi scan run stopped at `nimFwAgcAfterCopyProbe`.
 Its 64-word readback, `000–03F`, matches the archive exactly.
@@ -5984,8 +5986,8 @@ CPU copy window, before releasing the forced memory clock.
 That difference gives a way to recognize when an OpenOCD
 read can identify the loaded program. The logs provide
 static snapshots.
-[Wi-Fi AGC copy breakpoint and RAM readback](../build/hw-validation-rfphy-agc-gate-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L111) ·
-[Later RX DMA breakpoint](../build/hw-validation-rfphy-agc-gate-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L310) ·
+Wi-Fi AGC copy breakpoint and RAM readback (`build/hw-validation-rfphy-agc-gate-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L111`) ·
+Later RX DMA breakpoint (`build/hw-validation-rfphy-agc-gate-bp-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L310`) ·
 [Nim loader and copy window](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L1902)
 
 The pinned normal `phy_init+0x680` computes `0x800` and
@@ -6107,8 +6109,8 @@ The normal Wi-Fi scan and lwIP snapshots both show
 `GPSTATUS=0`, consistent with the final BBA setup.
 [Pinned PHY and BBA objects](../src/bl808/librf_bl808.a) ·
 [Nim PHY call order](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2430) ·
-[Wi-Fi scan snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Wi-Fi lwIP snapshot](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158)
+Wi-Fi scan snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Wi-Fi lwIP snapshot (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158`)
 
 At runtime, `bba_set_pd_state` masks interrupts
 while coordinating these two fields. Entering state 0
@@ -6218,7 +6220,7 @@ bits in those writes. The public window accessor identifies the
 separate write in BL808. The numbers below are raw field codes.
 [Public RC2 packet detector fields][bl602-agc-pkdet] ·
 [Pinned BL808 PHY](../src/bl808/librf_bl808.a) ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [YoC v8.1.0 PHY archive][agc-yoc-phy-810]
 
 | BL808 address and field | Pinned Wi-Fi and low-power writes | Vendor BLE readback |
@@ -6236,7 +6238,7 @@ the pinned BL808 Wi-Fi driver. BL618DG DWARF names the bit
 preserve bit 10. The BLE readback has bit 10 clear. Which
 detector module each bit value selects remains open.
 [BL618DG PHY archive][agc-bl618dg-phy] · [Pinned BL808 PHY archive](../src/bl808/librf_bl808.a) ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L219)
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L219`)
 
 The BLE dump reads `00000088` and `000FD2C4` at the two
 addresses. M1s and YoC DWARF both identify the fast-valid
@@ -6247,7 +6249,7 @@ mode, threshold, window, and power-validity controls. The
 mode encodings, count units, and their effects on individual
 AGC predicates remain open.
 [Public RC2 fast-valid fields][bl602-agc-fastvalid] ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L219) ·
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L219`) ·
 [YoC v8.1.0 PHY archive][agc-yoc-phy-810]
 
 #### Reference-level detector thresholds
@@ -6278,7 +6280,7 @@ predicate assignments remain unverified.
 [YoC PHY archive][agc-yoc-phy-810] · [BL616 PHY archive][agc-bl616-mainline] ·
 [BL808 normal port](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2091) ·
 [BL808 low-power port](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2972) ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220) ·
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220`) ·
 [DSSS diagnostic signal](#observable-signals-and-the-bl808-diagnostic-route)
 
 BL618DG DWARF independently names the three thresholds and
@@ -6311,7 +6313,7 @@ all four addresses. That readback gives a BL808 comparison point
 for these offsets. The adaptive field layout is established for
 BL618DG, and its applicability to BL808 Wi-Fi remains open.
 [BL618DG PHY archive][agc-bl618dg-phy] ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L224)
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L224`)
 
 The public BL602 header and BL616CL and BL618DG DWARF name
 `ADCPOWINSEL`. Their compiled getters or setters agree on bits 1:0
@@ -6339,7 +6341,7 @@ unverified. The Nim port applies the masked selector write in both
 normal and low-power initialization.
 [Normal PHY initialization](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim) ·
 [Low-power Nim initialization](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim) ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220)
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L220`)
 
 ### Named saturation and power controls
 
@@ -6351,7 +6353,7 @@ adjustments.
 [SFAX8 detector registers][sfax8-detector-regs] ·
 [QCC743 detector registers][qcc-detector-regs] ·
 [AIC8800 detector registers][aic-detector-regs] ·
-[M1s RIU accessor comparison](bl808_wifi_csi_research.md#eswin-and-aic-embedded-sdks)
+[M1s RIU accessor comparison][csi-archive-eswin-and-aic-embedded-sdks]
 
 | Modem offset | Named fields | Programmed values |
 | --- | --- | --- |
@@ -6393,7 +6395,7 @@ reads `003E0504` at that address, with the same two minimum codes.
 The saturation-specific minimum provides a direct control to test
 against the diagnostic signal `RFGainCp2Min4Sat`.
 [BL618DG PHY archive][agc-bl618dg-phy] ·
-[BL808 BLE capture](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L221) ·
+BL808 BLE capture (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L221`) ·
 [SiFlower RIU diagnostics][ax3000-riu-diag]
 
 The BL618DG v2.3.17 and current channel setters
@@ -6494,7 +6496,7 @@ The preceding `0x21` setup for the third decision changes
 from `21000101` in M1s, SFAX8, and SF19A28 to `21000303`
 in the pinned BL808 image. Only bits 1 and 9 change in that
 setup word. The output encoding survives both changes.
-[M1s AGC archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly) ·
+[M1s AGC archive comparison][csi-archive-agc-state-machine-disassembly] ·
 [SFAX8 AGC program][sfax8-image] · [SF19A28 band images][sf19-bands]
 
 AX3000 preserves the two first-decision result sets while using
@@ -6530,7 +6532,7 @@ their destination indexes. All seven edges select matching
 `29` words. The only change in `21` is `21000101 → 21000303`,
 which sets payload bits 1 and 9. These bits can vary while
 preserving the entire encoded decision and its result words.
-[M1s AGC archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly) ·
+[M1s AGC archive comparison][csi-archive-agc-state-machine-disassembly] ·
 [Pinned BL808 PHY archive](../src/bl808/librf_bl808.a)
 
 The BL618DG programs use the same `21` payload in both bands
@@ -7335,7 +7337,7 @@ revisions examined use the same 121-state program
 and the same bound.
 [Earlier BL616 archive][agc-bl616-early] · [Official BL616 v2.3.5 archive][agc-bl616-official-first] ·
 [Official BL616 archive][agc-bl616-mainline] ·
-[Ai-M6X archive provenance](bl808_wifi_csi_research.md#downloadable-phy-and-wi-fi-archives)
+[Ai-M6X archive provenance][csi-archive-downloadable-phy-and-wi-fi-archives]
 
 | Driver | End-pointer setup | Copy loop | Last copied word | Last active program word |
 | --- | --- | --- | ---: | ---: |
@@ -7619,7 +7621,7 @@ and shows that the fixed LNA index is carried by
 `10000231` on either route. It leaves separate
 hardware effects for `5B` and `60` possible.
 [Named saturation events](#what-named-event-recipes-establish) ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [Earlier BL616 PHY archive][agc-bl616-early] ·
 [Mainline BL616 PHY archive][agc-bl616-mainline] ·
 [BL616CL PHY archive][agc-arduino-phy]
@@ -7855,7 +7857,7 @@ assignment for the upper byte.
 [Earlier BL616 PHY archive][agc-bl616-early] ·
 [Mainline BL616 PHY archive][agc-bl616-mainline] ·
 [ADC comparator fields][qcc-adc-comparator] ·
-[Published RC2 accessors](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[Published RC2 accessors][csi-archive-published-rc2-register-accessors]
 
 | Setting | Earlier BL616 | Mainline BL616 |
 | --- | --- | --- |
@@ -7887,7 +7889,7 @@ and jump to the same count-8 record with
 `20000CEF`. BL808 uses the clear bit on its
 corresponding `S085` path, where the following
 count-8 state carries no extension.
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [Earlier YoC archives][agc-yoc-phy-760]
 
 The middle byte also varies by itself between
@@ -7965,7 +7967,7 @@ middle bytes in other states. The hardware meaning of
 the three byte ranges remains unresolved.
 [AX3000 images][ax3000-images] ·
 [BL618DG band images][agc-bl618dg-phy] ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [Earlier YoC PHY package][agc-yoc-phy-760]
 
 AIC CSI RX, D80, and D80X2 retain the count-1500
@@ -8863,8 +8865,8 @@ moves from −100 to −105 only on the in-band
 path would support the assignment. Use the
 calibrated ADC power in dBm for the ADC comparison.
 The published ADC result at `+B208` is in dBV.
-[Vendor Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Nim Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
+Vendor Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Nim Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
 [ECR6600F low-byte comparison](#addressed-records-in-the-patched-ecr6600f-program) ·
 [Power readouts](#readouts-for-gain-power-and-cca)
 
@@ -9178,7 +9180,7 @@ the standard entries. Whether the cleared gain-enable
 bit gates `P31` or a later gain update requires a
 trace that exercises that branch.
 [QCC743 AGC control register][qcc-agc-control] · [Pinned PHY archive](../src/bl808/librf_bl808.a) ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [YoC PHY archive][agc-yoc-phy-810] · [BL616CL PHY package][agc-arduino-phy] ·
 [BL618DG PHY archive][agc-bl618dg-phy]
 
@@ -9188,8 +9190,8 @@ values of this hardware enable. The scan build reads
 `00000001`. The words differ only in `HTSTFGAINEN`
 and both select receive path 0. These are static
 register observations in separate builds.
-[Wi-Fi scan registers](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177) ·
-[Wi-Fi lwIP registers](../build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158)
+Wi-Fi scan registers (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L177`) ·
+Wi-Fi lwIP registers (`build/hw-validation-purerf-lwip-smoke-roc-edge-compare/logs/m0_wifi_lwip_smoke.m0.openocd.log#L158`)
 
 The SiFlower diagnostic maps expose an OFDM HT-STF
 signal in both RIU bank `05` and HDM bank `00`.
@@ -9212,7 +9214,7 @@ the same pair and payload at `S106`. This constrains
 where the operand is tested, while `P0D` could account
 for any live DSSS transitions on the shared edge.
 [SF16A18 full-mask image][sf16-full-agc] · [DSSS event evidence](#high-payload-byte-on-dsss-associated-paths) ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s PHY archive][csi-archive-published-rc2-register-accessors]
 
 ##### P20 after gain-related setup
 
@@ -9622,7 +9624,7 @@ records. BL618DG 5 GHz retains the bit-16 setting
 with the same first two records. It sets header bit
 14 in the next three states while retaining their
 actions and branch conditions.
-[Pinned BL808 PHY archive](../src/bl808/librf_bl808.a) · [M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[Pinned BL808 PHY archive](../src/bl808/librf_bl808.a) · [M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [BL618DG band programs][agc-bl618dg-phy]
 
 The archive cohort contains the same three `3E`
@@ -9701,7 +9703,7 @@ YoC uses 54, while both use 45 in the low byte of selector `14`.
 The comparison supports an LNA-related interpretation for the profile
 and limits the formula to an observed fit in the pinned image.
 The physical destinations, units, and latch timing remain unverified.
-[BL808 gain registers and programmed table](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[BL808 gain registers and programmed table][csi-archive-published-rc2-register-accessors] ·
 [PineVoice PHY packages][agc-pinevoice-phy] ·
 [YoC v8.1.0 PHY package][agc-yoc-phy-810]
 
@@ -9714,7 +9716,7 @@ contains `10000821` and `0C004203` in adjacent states `S012`
 and `S015`. Its common entry at `S00F` branches directly to
 `S015`, so the presence of the first word does not establish a
 runtime LNA change on that entry path.
-[M1s archive and LNA register offsets](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s archive and LNA register offsets][csi-archive-published-rc2-register-accessors]
 
 #### RF hardware codes for the startup gain index
 
@@ -9727,7 +9729,7 @@ Decoding the table gives `(LNA, mixer) = (index, 1)`
 for indices 0–7. Index 8 gives `(7, 3)`. Thus index 8
 is a valid table entry even though the physical LNA
 field can hold only codes 0–7.
-[M1s RF lookup fields][m1s-rf-gain-table] · [Board lookup-table readback](../build/hw-validation-rxflow-vendor-scanend-phy-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L188)
+[M1s RF lookup fields][m1s-rf-gain-table] · Board lookup-table readback (`build/hw-validation-rxflow-vendor-scanend-phy-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L188`)
 
 The RF hardware gain readback at `0x2000104C` exposes
 the same stage codes. `GC_LNA_HW` occupies bits 2:0,
@@ -9743,9 +9745,9 @@ matches index 8, and the `(RBB1, RBB2)` pair `(2, 3)`
 matches RBB index 9 in the same capture's table at
 `0x20001104..0x20001114`.
 [M1s RF gain readback fields][m1s-rf-gain-readback] · [M1s RBB table fields][m1s-rbb-gain-table] ·
-[First Wi-Fi snapshot](../build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L139) ·
-[Second Wi-Fi snapshot](../build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L246) ·
-[Vendor gain and table snapshot](../build/hw-validation-rxflow-vendor-scanend-phy-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L181)
+First Wi-Fi snapshot (`build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L139`) ·
+Second Wi-Fi snapshot (`build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L246`) ·
+Vendor gain and table snapshot (`build/hw-validation-rxflow-vendor-scanend-phy-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L181`)
 
 The M1s BL808 `cli.o:cmd_rxgain_register` confirms the
 software control path. Its inlined `rf_rx_gain_ctrl_hw_getf`
@@ -9785,7 +9787,7 @@ names and absolute register addresses.
 [Archived BL808 `bba.c.o`](../src/bl808/librf_bl808.a) ·
 [QCC743 RIU control fields][qcc-agc-control] ·
 [BL616CL PHY driver package][agc-arduino-phy] ·
-[Published RC2 gain field](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[Published RC2 gain field][csi-archive-published-rc2-register-accessors]
 
 | BL808 host argument | `DSSSONLY` | `OFDMONLY` | Host LNA maximum index | `S00F` target for matching `P26,P27` | Extension at target |
 | ---: | ---: | ---: | ---: | --- | --- |
@@ -10042,7 +10044,7 @@ numbers also occur in the M1s and PineVoice setup extension
 [QCC743 receive gain reference][qcc-rx-agc-gainref] ·
 [SFAX8 receive gain reference][sfax8-rx-agc-gainref] ·
 [BL808 BLE initializer](../src/bl808/blecontroller/registers_wireless_rf.nim#L696) ·
-[BL808 board register dump](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L759)
+BL808 board register dump (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L759`)
 
 The SFAX8 factory driver provides a comparison with
 different values. `phy_hw_init` loads `g_agc_ram_bin`,
@@ -10076,7 +10078,7 @@ RC2 fields.
 [SFAX8 gain configuration][sfax8-phy-gain-tables] ·
 [Catena RF map][sfax8-catena-rf-map] ·
 [Catena RF defaults][sfax8-catena-rf-defaults] ·
-[BL808 RC2 definitions](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[BL808 RC2 definitions][csi-archive-published-rc2-register-accessors]
 
 | SFAX8 band | RF pointer address | RF table address range | RF table entries 30, 31, and 63 |
 | --- | --- | --- | --- |
@@ -10128,7 +10130,7 @@ SFAX8 `0C000A21`. Treating its two bytes as a complete
 max/min pair would give 10 and 33. Some states may use
 part of the low byte as control bits. The comparison leaves
 the exact low-byte layout and the destinations open.
-[M1s named RC2 fields and PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s named RC2 fields and PHY archive][csi-archive-published-rc2-register-accessors] ·
 [SFAX8 gain range][sfax8-riu-gainrange] · [SFAX8 AGC program][sfax8-image]
 
 ##### Selector 0C payload bit 6 across AX3000 revisions
@@ -10161,7 +10163,7 @@ keeps the count-1 header and `0020001B` branch of
 around the state boundary with the same preceding
 `S015:10000821` action and host gain limits. The effect
 of the bit remains unmeasured.
-[M1s VGA minimum index](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s VGA minimum index][csi-archive-published-rc2-register-accessors] ·
 [Seven-bit RC gain minimum][qcc-rx-agc-gainref] ·
 [BL808 startup listing](#complete-annotated-listing) ·
 [Gain readouts](#readouts-for-gain-power-and-cca)
@@ -10183,7 +10185,7 @@ same masked stores inline. The named register also has
 an ordinary receive maximum at bits 14:8, which these
 stores preserve. Archived BL808 Wi-Fi register dumps
 show both maxima at `42` in `42004200`.
-[BL618DG PHY archive][agc-bl618dg-phy] · [BL618DG v2.3.17 PHY archive][agc-bl618dg-first-phy] · [RIU gain range][sfax8-riu-gainrange] · [BL808 hardware readback](../build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157)
+[BL618DG PHY archive][agc-bl618dg-phy] · [BL618DG v2.3.17 PHY archive][agc-bl618dg-first-phy] · [RIU gain range][sfax8-riu-gainrange] · BL808 hardware readback (`build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L157`)
 
 | BL618DG gain profile | Host `RFGAINMAX4DETDB` code | Current channel routine | `0C` extension |
 | --- | --- | --- | --- |
@@ -10216,7 +10218,7 @@ and RC2 maximum one at a time. Observe the
 RF gain together. Changing a limit may move the
 applied gain as well as change a comparison threshold.
 A branch change alone would not distinguish these effects.
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [BL618DG RC2 gain controls](#named-saturation-and-power-controls) ·
 [RC gain limit in AIC DFS](#detection-input-controlled-by-aic-dfs-mode) ·
 [Gain readouts](#readouts-for-gain-power-and-cca)
@@ -10314,7 +10316,7 @@ M1s preserves both types of incoming path to its
 `10000231` state, with the same `P39`, `P37`,
 and `C2(05,06,37)` decisions upstream.
 [BL808 transition index](#complete-transition-index) ·
-[M1s AGC archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly)
+[M1s AGC archive comparison][csi-archive-agc-state-machine-disassembly]
 
 PineVoice, YoC v8.1.0, and the BL616CL program also
 supply `10000231` on the path from event stub `S002`.
@@ -10488,7 +10490,7 @@ in an exclusive bin decoder. Neither trace has been
 run on BL618DG. The archived BL808 BLE readback has
 zero at all four threshold addresses. Whether the
 same circuitry is wired on BL808 remains unresolved.
-[BL618DG 2.4 GHz program][agc-bl618dg-phy] · [Archived BL808 BLE readback](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L223)
+[BL618DG 2.4 GHz program][agc-bl618dg-phy] · Archived BL808 BLE readback (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L223`)
 
 ##### What selects the short gain ladder
 
@@ -10611,7 +10613,7 @@ bandwidth detector. The AGC sequencer's timer timebase
 remains open.
 [RivieraWaves bandwidth detector, Figure 8 and description][rw-bandwidth-patent] ·
 [SFAX8 register definition][sfax8-rxtdctrl1] · [SF19A28 register definition][sf19-rxtdctrl1] ·
-[Archived BL808 snapshot](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L719)
+Archived BL808 snapshot (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L719`)
 
 The AX3000 v3 kernel module ties these filenames to
 the reported channel width. DWARF names the second
@@ -10675,7 +10677,7 @@ The archived BL808 vendor PHY snapshot matches all
 nine reset words.
 [QCC743 RIU definitions][qcc-riu-aci-margins] · [SFAX8 RIU definitions][sfax8-riu-aci-margins] ·
 [AIC8800 RIU definitions][aic-riu-aci-margins] ·
-[BL808 vendor PHY snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L181)
+BL808 vendor PHY snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L181`)
 
 | Table | BL808 addresses for words 0, 1, 2 | Reset words |
 | --- | --- | --- |
@@ -10695,7 +10697,7 @@ two adjacent margin tables and leave AGC RAM untouched.
 The SFAX8 driver attributes the zero-margin setting to
 HT-SIG decoding latency at 20 MHz. The Trident driver
 also clears the table at 20 MHz and restores it at 40 MHz.
-[Pinned BL808 PHY archive](../src/bl808/librf_bl808.a) · [M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[Pinned BL808 PHY archive](../src/bl808/librf_bl808.a) · [M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [BL618DG PHY archive][agc-bl618dg-phy] · [SFAX8 channel setup][sfax8-phy-width-timing] · [Trident channel setup][tuya-trident-width]
 
 The archived vendor Wi-Fi scan repeatedly reads all
@@ -10712,12 +10714,12 @@ by itself remains unmeasured. The Nim channel
 setter's `macActiveB340`,
 `macActiveB344`, and `channelProfile348` fields occupy
 these three `ACI20MARG` addresses.
-[Vendor Wi-Fi readback](../build/hw-validation-vendorrf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200) ·
-[Earlier Nim Wi-Fi readback](../build/hw-validation-purerf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200) ·
-[Later Nim Wi-Fi readback](../build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L159) ·
-[Earlier Nim scan result](../build/hw-validation-purerf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L283) ·
-[Archived register patch](../build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L137) ·
-[Patched scan result](../build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L52) ·
+Vendor Wi-Fi readback (`build/hw-validation-vendorrf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200`) ·
+Earlier Nim Wi-Fi readback (`build/hw-validation-purerf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200`) ·
+Later Nim Wi-Fi readback (`build/hw-validation-purerf-modem-latch-patch-run/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L159`) ·
+Earlier Nim scan result (`build/hw-validation-purerf-mmactive-wide-compare/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L283`) ·
+Archived register patch (`build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L137`) ·
+Patched scan result (`build/hw-validation-purerf-premmactive-modem-mutation/logs/m0_wifi_nimfw_scan_hal_test.primary.uart.log#L52`) ·
 [Nim channel stores](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2202)
 
 #### ESWIN channel width and header bit 8
@@ -10785,7 +10787,7 @@ again saw that address. Clearing EVT2 at `0x24C0B388` gave a
 zero readback and kept all 5,000 sampled fetches per phase at
 the intended branch word in three diagnostic sweeps. The probe
 restored EVT2 and the complete stock AGC image afterward.
-[Unmasked control](../build/hw-validation/captures/bl808_agc_extension29_evt2_on_bank3_2026-11-21.uart.log) ·
+Unmasked control (`build/hw-validation/captures/bl808_agc_extension29_evt2_on_bank3_2026-11-21.uart.log`) ·
 [Event-isolated analyzer](../tools/analyze_agc_extension29.py)
 
 With EVT2 cleared, RIU bank `03` remained exactly `0x3F40`
@@ -10796,9 +10798,9 @@ across all payloads. Bank `05` changed only in its encoded
 AGC RAM address: `0x0090` for the branch at word `1` in
 the no-extension controls, and `0x0110` for the branch at
 word `2` in extension states. The
-[bank-2](../build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank2_2026-11-21.uart.log),
-[bank-3](../build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank3_2026-11-21.uart.log),
-and [bank-5](../build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank5_2026-11-21.uart.log)
+bank-2 (`build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank2_2026-11-21.uart.log`),
+bank-3 (`build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank3_2026-11-21.uart.log`),
+and bank-5 (`build/hw-validation/captures/bl808_agc_extension29_evt2_off_bank5_2026-11-21.uart.log`)
 traces preserve every payload and control. This constrains
 selector `29`: it does not directly change these sampled idle
 outputs in isolation. Its payload may act on another internal
@@ -10841,7 +10843,7 @@ copy sequence had produced no measurable change. This confirms the low
 nine-bit target field for word `052` and the need to use the copy path for
 controlled program experiments. Later [combiner](#all-eight-ram-combiner-truth-tables-in-one-capture)
 and [priority](#branch-slot-priority-on-bl808) probes resolve the RAM
-Boolean tables and stored branch order. The [UART evidence](../build/hw-validation/captures/bl808_agc_diag_patch_2026-11-21.uart.log)
+Boolean tables and stored branch order. The UART evidence (`build/hw-validation/captures/bl808_agc_diag_patch_2026-11-21.uart.log`)
 is preserved under `build/hw-validation/captures`.
 
 The candidate analyzer block at `0x24E00000` returned `DEADDEAD` on this
@@ -10980,10 +10982,10 @@ checks the case accounting and controls.
 
 | Page bit 9 | Path bit 13 | Immediate true codes, excluding `01` | Timer-only code | Trace |
 | ---: | ---: | --- | --- | --- |
-| 0 | 0 | `03 08 0F 10 21 2A 2C 2E 37 38 39 3A` | `02` | [UART](../build/hw-validation/captures/bl808_agc_predicate_page0_idle_2026-11-21.uart.log) |
-| 1 | 0 | Same | `02` | [UART](../build/hw-validation/captures/bl808_agc_predicate_page1_idle_2026-11-21.uart.log) |
-| 0 | 1 | Same | `02` | [UART](../build/hw-validation/captures/bl808_agc_predicate_page0_path1_idle_2026-11-21.uart.log) |
-| 1 | 1 | Same | `02` | [UART](../build/hw-validation/captures/bl808_agc_predicate_page1_path1_idle_2026-11-21.uart.log) |
+| 0 | 0 | `03 08 0F 10 21 2A 2C 2E 37 38 39 3A` | `02` | UART (`build/hw-validation/captures/bl808_agc_predicate_page0_idle_2026-11-21.uart.log`) |
+| 1 | 0 | Same | `02` | UART (`build/hw-validation/captures/bl808_agc_predicate_page1_idle_2026-11-21.uart.log`) |
+| 0 | 1 | Same | `02` | UART (`build/hw-validation/captures/bl808_agc_predicate_page0_path1_idle_2026-11-21.uart.log`) |
+| 1 | 1 | Same | `02` | UART (`build/hw-validation/captures/bl808_agc_predicate_page1_path1_idle_2026-11-21.uart.log`) |
 
 `00` always took the expiry fallback; `01` reached the true
 marker immediately. `02` reached the true marker at 99–101 µs,
@@ -11007,7 +11009,7 @@ threshold or signal change is needed to assign each physical
 input; idle coincidence alone is insufficient.
 
 Forcing the RF FSM into RX in a fifth
-[sweep](../build/hw-validation/captures/bl808_agc_predicate_page0_force_rx_2026-11-21.uart.log)
+sweep (`build/hw-validation/captures/bl808_agc_predicate_page0_force_rx_2026-11-21.uart.log`)
 left the same 64 outcomes and parked bank-1 value `0002`.
 No known RF signal was present, so this only shows that the force
 setting alone did not change these predicates. A separate
@@ -11018,7 +11020,7 @@ varied the low byte of `0x24C0C85C`, named
 remained immediately true, RIU bank `01[1]` remained high,
 and bank-3 gain stayed `3F40`; `P00`/`P01` controls and a
 repeated `04` control behaved as expected. The
-[UART trace](../build/hw-validation/captures/bl808_agc_predicate03_gain_limits_2026-11-21.uart.log)
+UART trace (`build/hw-validation/captures/bl808_agc_predicate03_gain_limits_2026-11-21.uart.log`)
 and [analyzer](../tools/analyze_agc_predicate03_gain.py)
 therefore supplies no differential proof that `P03` is the
 named `RFGainCp2Min4Sat` signal. The comparator may depend on
@@ -11031,7 +11033,7 @@ The same isolated test used `TargetPredicate=4` and
 all read back exactly. `P04` remained false until the timer fallback,
 candidate bank-`01[2]` stayed low, and bank-3 gain stayed `3F40`.
 The `P00` and `P01` controls and repeated default case also passed.
-The [P04 UART trace](../build/hw-validation/captures/bl808_agc_predicate04_gain_limits_2026-11-21.uart.log)
+The P04 UART trace (`build/hw-validation/captures/bl808_agc_predicate04_gain_limits_2026-11-21.uart.log`)
 and [shared analyzer](../tools/analyze_agc_predicate03_gain.py)
 therefore supply no differential evidence for or against the
 `P04 = RFGainCp2Max` proposal in this parked idle state. The RF gain
@@ -11057,11 +11059,11 @@ is still possible. The pinned `P1A` tests at `S07B` and `S08C`
 also set header bits 3 and 10. Varying the power-stability lane
 independently while holding the header fixed is needed for a firm
 physical assignment.
-[Controls `0008`](../build/hw-validation/captures/bl808_agc_predicate_control0008_2026-11-21.uart.log) ·
-[`0400`](../build/hw-validation/captures/bl808_agc_predicate_control0400_2026-11-21.uart.log) ·
-[`0408`](../build/hw-validation/captures/bl808_agc_predicate_control0408_2026-11-21.uart.log) ·
+Controls `0008` (`build/hw-validation/captures/bl808_agc_predicate_control0008_2026-11-21.uart.log`) ·
+`0400` (`build/hw-validation/captures/bl808_agc_predicate_control0400_2026-11-21.uart.log`) ·
+`0408` (`build/hw-validation/captures/bl808_agc_predicate_control0408_2026-11-21.uart.log`) ·
 [predicate analyzer](../tools/analyze_agc_predicate_sweep.py) ·
-[factorial bank-1 trace](../build/hw-validation/captures/bl808_agc_bit10_factorial_2026-11-21.uart.log)
+factorial bank-1 trace (`build/hw-validation/captures/bl808_agc_bit10_factorial_2026-11-21.uart.log`)
 
 M1s `cli.o` gives a BL808-specific route to the diagnostic ports.
 `cmd_diag_cfg` packs four user-supplied PHY selector bytes into
@@ -11076,7 +11078,7 @@ The four reads are consecutive `lw` instructions at
 Treat them as sequential samples until a hardware latch or
 hardware-timed capture is established. The SiFlower bank numbers
 have yet to be verified on this mux.
-[M1s RF archive and register comparison](bl808_wifi_csi_research.md#published-rc2-register-accessors)
+[M1s RF archive and register comparison][csi-archive-published-rc2-register-accessors]
 
 #### Separating BL808 header bits 0 and 2 in a trace
 
@@ -11104,8 +11106,8 @@ parked state. It ran once with a 2,000-count timer enabled and
 once with the timer disabled. In all 128 phase/bin groups, RIU
 bank `02[14]` was high exactly when header bit 2 was set:
 both the OR and AND of every sampled diagnostic word agreed.
-The [enabled-timer trace](../build/hw-validation/captures/bl808_agc_state_diag_2000_2026-11-21.uart.log),
-[disabled-timer trace](../build/hw-validation/captures/bl808_agc_state_diag_timer_off_2026-11-21.uart.log),
+The enabled-timer trace (`build/hw-validation/captures/bl808_agc_state_diag_2000_2026-11-21.uart.log`),
+disabled-timer trace (`build/hw-validation/captures/bl808_agc_state_diag_timer_off_2026-11-21.uart.log`),
 and [analyzer](../tools/analyze_agc_state_diag.py) preserve the result.
 
 Both published RIU bank-`02` dictionaries name bit 14
@@ -11147,11 +11149,11 @@ power bits varied during some phases, so this experiment does not
 assign those changes to a state bit. The direct measurements support
 the output relationships above; the signal names are taken from
 related-chip dictionaries, not from a BL808 register specification.
-[Bank 2, base `0000`](../build/hw-validation/captures/bl808_agc_lower_bit_bank2_2026-11-21.uart.log) ·
-[bank 2, base `000F`](../build/hw-validation/captures/bl808_agc_lower_bit_bank2_base000f_2026-11-21.uart.log) ·
-[bank 3](../build/hw-validation/captures/bl808_agc_lower_bit_bank3_base000f_2026-11-21.uart.log) ·
-[bank 5, base `0000`](../build/hw-validation/captures/bl808_agc_lower_bit_bank5_base0000_2026-11-21.uart.log) ·
-[bank 5, base `000F`](../build/hw-validation/captures/bl808_agc_lower_bit_bank5_base000f_2026-11-21.uart.log) ·
+Bank 2, base `0000` (`build/hw-validation/captures/bl808_agc_lower_bit_bank2_2026-11-21.uart.log`) ·
+bank 2, base `000F` (`build/hw-validation/captures/bl808_agc_lower_bit_bank2_base000f_2026-11-21.uart.log`) ·
+bank 3 (`build/hw-validation/captures/bl808_agc_lower_bit_bank3_base000f_2026-11-21.uart.log`) ·
+bank 5, base `0000` (`build/hw-validation/captures/bl808_agc_lower_bit_bank5_base0000_2026-11-21.uart.log`) ·
+bank 5, base `000F` (`build/hw-validation/captures/bl808_agc_lower_bit_bank5_base000f_2026-11-21.uart.log`) ·
 [SF16A18 map][sf16-riu-diag] · [AX3000 map][ax3000-riu-diag]
 
 Bank `01` gave one repeatable interaction. A `000F` base with
@@ -11166,10 +11168,10 @@ the end of the 500 µs window. The other 24 cases never showed it.
 The related diagnostic maps name bank-`01[9]` `PowerStable`.
 This establishes a BL808 control interaction and a candidate
 power-stability output, while the internal logic and polarity
-remain unproved. [Factorial UART trace](../build/hw-validation/captures/bl808_agc_bit10_factorial_2026-11-21.uart.log) ·
+remain unproved. Factorial UART trace (`build/hw-validation/captures/bl808_agc_bit10_factorial_2026-11-21.uart.log`) ·
 [factorial analyzer](../tools/analyze_agc_bit10_factorial.py) ·
-[bank-1 `000F` repeat](../build/hw-validation/captures/bl808_agc_lower_bit_bank1_base000f_repeat_2026-11-21.uart.log) ·
-[bank-1 `0000`](../build/hw-validation/captures/bl808_agc_lower_bit_bank1_base0000_2026-11-21.uart.log)
+bank-1 `000F` repeat (`build/hw-validation/captures/bl808_agc_lower_bit_bank1_base000f_repeat_2026-11-21.uart.log`) ·
+bank-1 `0000` (`build/hw-validation/captures/bl808_agc_lower_bit_bank1_base0000_2026-11-21.uart.log`)
 
 #### Readouts for gain, power, and CCA
 
@@ -11189,8 +11191,8 @@ branch trace. The scan samples give no transition timing
 or numeric AGC operand assignment.
 [M1s RF packet detector status][m1s-rf-pkdet-status] ·
 [M1s RF packet detector count][m1s-rf-pkdet-count] ·
-[Wi-Fi scan first RF readback](../build/hw-validation-vendorrf-mmactive-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L153) ·
-[Wi-Fi scan later RF readback](../build/hw-validation-vendorrf-mmactive-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L242) ·
+Wi-Fi scan first RF readback (`build/hw-validation-vendorrf-mmactive-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L153`) ·
+Wi-Fi scan later RF readback (`build/hw-validation-vendorrf-mmactive-compare/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L242`) ·
 [RC2 detector settings](#packet-detection-configuration-and-readback)
 
 The QCC743 and SFAX8 headers agree on four read-only
@@ -11241,7 +11243,7 @@ diagnostic outputs. It supplies a register readback
 without a validated signal assignment, active AGC
 state, or time reference.
 [BL602 RC2 gain-status accessors][bl602-rc2-gain-status] ·
-[BL808 vendor BLE snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L227)
+BL808 vendor BLE snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L227`)
 
 | Modem offset | Path-0 status field |
 | --- | --- |
@@ -11262,9 +11264,9 @@ readback `0x2000104C = 11800010`. The software
 gain word `00826237` gives LNA code 7 and mixer
 code 3. The hardware gain source select at
 `0x2000102C[1]` is set.
-[Vendor RF readback and tables](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L131) ·
-[Vendor RC2 gain table](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L207) ·
-[Vendor RC2 status](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L227) ·
+Vendor RF readback and tables (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L131`) ·
+Vendor RC2 gain table (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L207`) ·
+Vendor RC2 status (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L227`) ·
 [RF gain source and field layout](#rf-hardware-codes-for-the-startup-gain-index)
 
 Under the same masks, the RBB index 6 would select
@@ -11278,7 +11280,7 @@ between the RC2 index and the RF setting unresolved in
 this mode. Gain-action traces need both readouts and
 an identifiable AGC state or RF programming boundary.
 [M1s RBB table fields][m1s-rbb-gain-table] ·
-[Vendor snapshot commands](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L128) ·
+Vendor snapshot commands (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L128`) ·
 [Diagnostic capture workflow](#correlating-a-diagnostic-capture-with-the-disassembly)
 
 For `0E` and `0F`, the paired BL808 branches
@@ -11335,8 +11337,8 @@ the same offsets as the SFAX8 and QCC743 headers.
 [BL616 SDK archive history][agc-bl616-sdk-history] ·
 [BL616CL SDK archive history][agc-bl616cl-sdk-history] ·
 [BL618DG SDK archive history][agc-bl618dg-sdk-history] ·
-[BL808 Wi-Fi scan dump](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178) ·
-[BL808 vendor BLE dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L184)
+BL808 Wi-Fi scan dump (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178`) ·
+BL808 vendor BLE dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L184`)
 
 Among the 12 contiguous four-bit slices of the lower
 15 header bits, `[14:11]` is the only one that stays
@@ -11558,7 +11560,7 @@ initializer also explicitly writes that value.
 [SFAX8 saturation and disappearance fields][sfax8-riu-cca-events] ·
 [QCC743 saturation and disappearance fields][qcc-riu-cca-events] ·
 [AIC saturation and disappearance fields][aic-riu-cca-events] ·
-[BL808 Wi-Fi readback](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178) ·
+BL808 Wi-Fi readback (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L178`) ·
 [BL808 BLE initialization](../src/bl808/blecontroller/registers_wireless_rf.nim#L674)
 
 Two public Trident drivers provide a separate
@@ -11610,7 +11612,7 @@ The individual controls within its low 16 bits remain unverified.
 [BL616 PHY archive][agc-bl616-mainline] · [BL616CL PHY archive][agc-bl616cl-phy] · [BL618DG PHY archive][agc-bl618dg-phy] ·
 [Normal Nim initialization](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2044) ·
 [Low-power Nim initialization](../src/bl808/wifi/fw/global_state/rf_bl808_core.nim#L2990) ·
-[Vendor BLE register dump](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L222)
+Vendor BLE register dump (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L222`)
 
 BL618DG DWARF names bit 31 of this register separately
 as `CFG_BAND_5G`. The normal channel driver invokes
@@ -12144,8 +12146,8 @@ The current BL808 image, M1s, PineVoice, and two distinct YoC images
 all use the same three predicate recipes below. In each image
 these are the only branch occurrences of the relevant six selectors.
 The branches move to different word addresses with their states.
-[BL808-family archive comparison](bl808_wifi_csi_research.md#agc-state-machine-disassembly) ·
-[YoC component archives](bl808_wifi_csi_research.md#yoc-dependency-and-release-history)
+[BL808-family archive comparison][csi-archive-agc-state-machine-disassembly] ·
+[YoC component archives][csi-archive-yoc-dependency-and-release-history]
 
 | Selector pair | Recipe in all five images | What control flow can identify |
 | --- | --- | --- |
@@ -12176,7 +12178,7 @@ correspond to the named DWARF setters. In each RAM image,
 directly to `S108`, which issues `32000000`, then
 `32000100`, then the count-1500 wait with `4100000F`.
 [YoC v7.6.0 PHY package][agc-yoc-phy-760] ·
-[YoC package history](bl808_wifi_csi_research.md#yoc-dependency-and-release-history)
+[YoC package history][csi-archive-yoc-dependency-and-release-history]
 
 YoC v7.7.0 and v8.1.0 insert a detector check on that path.
 The two selector-`29` routes at `S0CD` and `S0D3` enter
@@ -12194,7 +12196,7 @@ The revised RAM program tests `P3F` independently of those
 vetoes. This supports a DSSS-related signal for `P3F`. Its
 source and timing within the detector remain open.
 [YoC PHY archive][agc-yoc-phy-810] ·
-[YoC package history](bl808_wifi_csi_research.md#yoc-dependency-and-release-history) ·
+[YoC package history][csi-archive-yoc-dependency-and-release-history] ·
 [BL808 external event setup](#entry-stubs-and-external-events) ·
 [DSSS-associated path](#the-dsss-associated-path-in-the-related-image)
 
@@ -12475,7 +12477,7 @@ initializer paths on 16 register patterns each verified
 the masked writes. The archived BLE snapshot gives a
 third crossing setting alongside the same saturation
 codes as M1s. The snapshot covers BLE configuration.
-[Pinned BL808 PHY](../src/bl808/librf_bl808.a) · [M1s PHY archive][m1s-agc-phy-rf] · [YoC PHY archive][agc-yoc-phy-810] · [BL808 BLE register snapshot](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747)
+[Pinned BL808 PHY](../src/bl808/librf_bl808.a) · [M1s PHY archive][m1s-agc-phy-rf] · [YoC PHY archive][agc-yoc-phy-810] · BL808 BLE register snapshot (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747`)
 
 | Configuration | Saturation delay, high, low, threshold | Crossing codes down/up |
 | --- | --- | --- |
@@ -12848,7 +12850,7 @@ destination changes across builds.
 [September monitor array][bl60x-monitor-agc-array] ·
 [August BL602 SDK archive][agc-bl602-2022-08] ·
 [October BL602 SDK archive][agc-bl602-2022-10] ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) ·
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] ·
 [YoC v8.1.0 PHY archive][agc-yoc-phy-810]
 
 | Image | Source | Edge on `P29` | Edge on expiry |
@@ -13049,8 +13051,8 @@ The headers give no time conversion for either
 index.
 [SFAX8 detector fields][sfax8-detector-regs] ·
 [QCC743 detector fields][qcc-detector-regs] ·
-[BL808 vendor Wi-Fi readback](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176) ·
-[BL808 vendor BLE readback](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L182)
+BL808 vendor Wi-Fi readback (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176`) ·
+BL808 vendor BLE readback (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L182`)
 
 Use the plateau fields as candidate independent
 controls when comparing the split `P0B/P0C` exits.
@@ -13107,9 +13109,9 @@ not specify its units or a connection to either
 predicate.
 [QCC743 DC compensation register][qcc-riu-dc-time] ·
 [SFAX8 DC compensation register][sfax8-riu-dc-time] ·
-[Vendor Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176) ·
-[Nim Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176) ·
-[BLE snapshot](../build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747)
+Vendor Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176`) ·
+Nim Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L176`) ·
+BLE snapshot (`build/hw-validation-no-conn-rf-retune-central/logs/m0_ble_nim_controller_pure_central_hal_test.m0.openocd.clean.log#L747`)
 
 #### In-band power gap controls for the P10 test
 
@@ -13125,7 +13127,7 @@ same at `phy_init+0x5F0`, `phy_init+0x522`, and
 setter by name and give its argument as 24 (`18` hex).
 [QCC743 in-band comparator fields][qcc-inbd-comparator] · [SFAX8 in-band comparator fields][sfax8-inbd-gap] ·
 [Pinned BL808 archive](../src/bl808/librf_bl808.a) · [QCC743 PHY archives][qcc-phy-archives] ·
-[M1s PHY archive](bl808_wifi_csi_research.md#published-rc2-register-accessors) · [YoC PHY archive][agc-yoc-phy-810]
+[M1s PHY archive][csi-archive-published-rc2-register-accessors] · [YoC PHY archive][agc-yoc-phy-810]
 
 The archived vendor and Nim BL808 Wi-Fi scans both
 read `1828A3B0` at that address. All 36 saved Wi-Fi
@@ -13140,9 +13142,9 @@ also have an isolated positive `P10` branch at word
 `057` (`40000059`), with a separate fallback to
 `S00F`. The hardware source of `P10` remains
 unverified.
-[Vendor Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L179) ·
-[Nim Wi-Fi snapshot](../build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L179) ·
-[Vendor BLE snapshot](../build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L185) ·
+Vendor Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-vendor-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L179`) ·
+Nim Wi-Fi snapshot (`build/hw-validation-rfphy-rxstate-pure-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L179`) ·
+Vendor BLE snapshot (`build/hw-validation/logs/prebuilt_vendor_bl606p_phy_snapshot.m0.openocd.log#L185`) ·
 [SiFlower `IdPow` lane][sf16-riu-diag] · [QCC743 PHY archives][qcc-phy-archives]
 
 The lower and upper threshold bytes in the saved Wi-Fi
@@ -13333,7 +13335,7 @@ the raw header, extension, and encoding of each individual word.
 ## Complete annotated listing
 
 Regenerate the listing with `python3 tools/disasm_agc.py --annotate agcmem.bin`.
-The [research handoff](bl808_wifi_csi_research.md#agc-state-machine-disassembly)
+The [research handoff][csi-archive-agc-state-machine-disassembly]
 shows how to extract the section from the archive.
 Extension descriptions give the [program roles](#extension-selector-inventory)
 and the available payload interpretations. The physical outputs of many
@@ -13766,8 +13768,6 @@ the physical checks described above.
 [sf19-agc-mode-pick]: https://github.com/Siflower/sf_wifi/blob/da991fafab179a2ed495c2925a0bf219ef38e22e/sf_smac/src/bb_src/umac/siwifi_platform.c#L295-L312
 [sf19-fullmask-rfmode]: https://github.com/Siflower/sf_wifi/blob/da991fafab179a2ed495c2925a0bf219ef38e22e/sf_smac/src/bb_src/umac/hal_desc.h#L148-L157
 [sf19-agc-load-revision]: https://github.com/Siflower/sf_wifi/blob/da991fafab179a2ed495c2925a0bf219ef38e22e/sf_smac/src/bb_src/umac/hal_desc.h#L197-L202
-[bl808-hdm-load-snapshot]: ../build/hw-validation-rfphy-pure-wide-mmactive-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L200
-[bl808-riu-version-snapshot]: ../build/hw-validation-rfphy-pure-wide-mmactive-c1/logs/m0_wifi_nimfw_scan_hal_test.m0.openocd.log#L224
 [qcc-riu-version]: https://github.com/amitv87/QCCSDK-QCC74x/blob/82c5538ac3b1408d102c331f6d67e142f8e12549/drivers/soc/qcc743/phyrf/reg/wlan11/reg_riu.h#L33-L84
 [qcc-mdm-rxmode-dsss]: https://github.com/amitv87/QCCSDK-QCC74x/blob/82c5538ac3b1408d102c331f6d67e142f8e12549/drivers/soc/qcc743/phyrf/reg/wlan11/reg_mdm_cfg.h#L7644-L7762
 [qcc-riu-psselect]: https://github.com/amitv87/QCCSDK-QCC74x/blob/82c5538ac3b1408d102c331f6d67e142f8e12549/drivers/soc/qcc743/phyrf/reg/wlan11/reg_riu.h#L1101-L1175
@@ -14085,3 +14085,10 @@ the physical checks described above.
 [beken-bk7238-0e-second]: https://github.com/bekencorp/bk_freertos_sdk/blob/e2dfa46b93b7d91502c2b278a4b83ecba1f6bda6/beken378/driver/phy/phy_trident.c#L1552-L1560
 [beken-bk7238-large-event]: https://github.com/bekencorp/bk_freertos_sdk/blob/e2dfa46b93b7d91502c2b278a4b83ecba1f6bda6/beken378/driver/phy/phy_trident.c#L3102-L3109
 [beken-bk7238-trailer]: https://github.com/bekencorp/bk_freertos_sdk/blob/e2dfa46b93b7d91502c2b278a4b83ecba1f6bda6/beken378/driver/phy/phy_trident.c#L1619-L1625
+
+[csi-archive-agc-state-machine-disassembly]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#agc-state-machine-disassembly
+[csi-archive-downloadable-phy-and-wi-fi-archives]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#downloadable-phy-and-wi-fi-archives
+[csi-archive-eswin-and-aic-embedded-sdks]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#eswin-and-aic-embedded-sdks
+[csi-archive-published-rc2-register-accessors]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#published-rc2-register-accessors
+[csi-archive-qcc743-register-definitions-and-actual-driver]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#qcc743-register-definitions-and-actual-driver
+[csi-archive-yoc-dependency-and-release-history]: https://github.com/gabearro/bl808-hal-nim/blob/eb932dddbb56ac5131b3d398e5463f18008fc639/docs/bl808_wifi_csi_research.md#yoc-dependency-and-release-history
