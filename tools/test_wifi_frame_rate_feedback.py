@@ -121,6 +121,7 @@ const
   ackFirst = 0x80800000'u32
   ackFourth = 0x80800300'u32
   ackFifth = 0x80800400'u32
+  ackSixth = 0x80800500'u32
   exhausted = 0x80010700'u32
 
 let d = cast[ptr IpcHostTxWrapperView](cast[uint](addr ipcSharedEnv[0]) + 6932).txDesc.addr
@@ -168,7 +169,7 @@ proc duplicateRates(status: uint32; rotation = 0'u8) =
   stats[0].retrySlots[(rotation + 1) and 3].rateIdx = 0
 
 for rotation in 0'u8 .. 3:
-  for status in [ackFirst, ackFifth, exhausted]:
+  for status in [ackFirst, ackFifth, ackSixth, exhausted]:
     duplicateRates(status, rotation)
     txlTagRateFeedback(d, addr d.rateTemplate)
     # Rebuilding the retry chain does not change the physical slots already queued.
@@ -177,11 +178,22 @@ for rotation in 0'u8 .. 3:
     let feedback = txlCaptureRateFeedback(d)
     doAssert txRateSampleTag[0] == 0
     txlApplyRateFeedback(feedback, addr owner, node)
-    doAssert stats[0].entries[1].attempts == (if status == ackFirst: 1'u16 else: 4'u16)
-    doAssert stats[0].entries[1].successes == (status == ackFirst).uint16
-    doAssert stats[0].entries[0].attempts == (if status == exhausted: 4'u16
-      elif status == ackFifth: 1'u16 else: 0'u16)
-    doAssert stats[0].entries[0].successes == (status == ackFifth).uint16
+    doAssert stats[0].entries[1].attempts == (if status == ackFirst: 1'u16 else: 5'u16)
+    doAssert stats[0].entries[1].successes == (status in [ackFirst, ackFifth]).uint16
+    doAssert stats[0].entries[0].attempts == (if status == exhausted: 3'u16
+      elif status == ackSixth: 1'u16 else: 0'u16)
+    doAssert stats[0].entries[0].successes == (status == ackSixth).uint16
+
+# The fifth ACK still belongs to the primary rate. The sixth is the first
+# possible fallback ACK under the normal eight-attempt BL808 policy.
+for attempts in 1'u32 .. 8:
+  resetFrame(0x80800000'u32 or ((attempts - 1) shl 8))
+  txlTagRateFeedback(d, addr d.rateTemplate)
+  txlApplyRateFeedback(txlCaptureRateFeedback(d), addr owner, node)
+  doAssert stats[0].entries[2] == RateEntry(rateConfig: 0x1207,
+    attempts: min(attempts, 5).uint16, successes: (attempts <= 5).uint16)
+  doAssert stats[0].entries[0] == RateEntry(rateConfig: 0x0400,
+    attempts: (attempts - min(attempts, 5)).uint16, successes: (attempts > 5).uint16)
 
 # Pending/foreign policies have no authoritative slot identity. The duplicate
 # encoding is ambiguous, even if the current retry chain happens to select it.
@@ -223,7 +235,7 @@ for i in 0 .. 2: doAssert stats[0].entries[i].attempts == 0
 
 # A pure sort can move a unique sample without invalidating the generation.
 # Its submitted word remains authoritative even after a policy overwrite.
-resetFrame(ackFifth)
+resetFrame(ackSixth)
 txlTagRateFeedback(d, addr d.rateTemplate)
 let captured = txlCaptureRateFeedback(d)
 var uniqueTp = [0'u32, 5, 1, 10, 0, 0, 0, 0, 0, 0]
@@ -231,10 +243,10 @@ rc_sort_samples_tp(addr stats[0], addr uniqueTp)
 doAssert rcRateSampleEpoch[0] == 0
 d.rateTemplate.rateWord = 0x8000040A'u32
 txlApplyRateFeedback(captured, addr owner, node)
-doAssert stats[0].entries[1].attempts == 4 and stats[0].entries[1].successes == 0
+doAssert stats[0].entries[1].attempts == 5 and stats[0].entries[1].successes == 0
 doAssert stats[0].entries[0].attempts == 1 and stats[0].entries[0].successes == 1
 doAssert stats[0].entries[2].attempts == 0 and stats[0].entries[3].attempts == 0
-resetFrame(ackFifth, first = 0x1007'u32)
+resetFrame(ackSixth, first = 0x1007'u32)
 txlTagRateFeedback(d, addr d.rateTemplate)
 txlApplyRateFeedback(txlCaptureRateFeedback(d), addr owner, node)
 doAssert stats[0].entries[0].attempts == 1 and stats[0].entries[0].successes == 1
@@ -258,9 +270,9 @@ for submittedTrial in [false, true]:
     txlTagRateFeedback(d, addr d.rateTemplate)
   txlApplyRateFeedback(txlCaptureRateFeedback(d), addr owner, node)
   doAssert stats[0].updateStage == (if submittedTrial: 3'u8 else: 2'u8)
-  doAssert stats[0].entries[2].attempts == 4
-  doAssert stats[0].entries[0].attempts == (if submittedTrial: 0'u16 else: 4'u16)
-  doAssert stats[0].entries[1].attempts == (if submittedTrial: 4'u16 else: 0'u16)
+  doAssert stats[0].entries[2].attempts == 5
+  doAssert stats[0].entries[0].attempts == (if submittedTrial: 0'u16 else: 3'u16)
+  doAssert stats[0].entries[1].attempts == (if submittedTrial: 3'u16 else: 0'u16)
   for i in 0 .. 2: doAssert stats[0].entries[i].successes == 0
 
 # Two in-flight frames can sample the same trial before either completes.
@@ -282,7 +294,7 @@ for change in ["none", "serial", "invalidated", "epoch", "pending policy", "poli
   txlApplyRateFeedback(txlCaptureRateFeedback(d), addr owner, node)
   doAssert stats[0].updateStage == 3
   doAssert rcArmedRateTrial(0, addr stats[0]).tag == 0
-  doAssert stats[0].entries[2].attempts == 4 and stats[0].entries[0].attempts == 4
+  doAssert stats[0].entries[2].attempts == 5 and stats[0].entries[0].attempts == 3
 
   case change
   of "serial":
@@ -299,15 +311,15 @@ for change in ["none", "serial", "invalidated", "epoch", "pending policy", "poli
   txlApplyRateFeedback(txlCaptureRateFeedback(late), addr owner, lateNode)
   doAssert stats[0].totalAttempts == 2
   doAssert stats[0].updateStage == (if change == "serial": 2'u8 else: 3'u8)
-  doAssert stats[0].entries[2].attempts == (if change == "epoch": 4'u16 else: 8'u16)
-  doAssert stats[0].entries[0].attempts == (if change == "none": 8'u16 else: 4'u16),
+  doAssert stats[0].entries[2].attempts == (if change == "epoch": 5'u16 else: 10'u16)
+  doAssert stats[0].entries[0].attempts == (if change == "none": 6'u16 else: 3'u16),
     "incorrect credit for the second trial completion: " & change
   doAssert stats[0].entries[1].attempts == 0
   for entry in stats[0].entries: doAssert entry.successes == 0
   doAssert stats[1] == otherStation
 
 for rotation in [0'u8, 1]:
-  for status in [ackFirst, ackFourth, ackFifth]:
+  for status in [ackFirst, ackFourth, ackFifth, ackSixth]:
     for kind in 0 .. 5:
       resetFrame(status)
       # Logical slot one is the trial. Rotation can move it to slot zero.
@@ -332,7 +344,7 @@ for rotation in [0'u8, 1]:
       if kind == 4: owner.confirmations.first = nil
       if kind == 5: rcInvalidateTrialTag(0)
       txlApplyRateFeedback(feedback, addr owner, node)
-      let reached = rotation == 1 or status == ackFifth
+      let reached = rotation == 1 or status == ackSixth
       doAssert stats[0].updateStage == (if kind == 0 and reached: 3'u8 else: 2'u8)
       doAssert stats[0].totalAttempts == uint16(kind != 4)
       if reached and kind == 1:
@@ -377,10 +389,10 @@ for attempts in 1'u32 .. 8:
   let feedback = txlCaptureRateFeedback(d)
   doAssert feedback.attempts.uint32 == attempts and feedback.failed
   txlApplyRateFeedback(feedback, addr owner, node)
-  doAssert stats[0].entries[2].attempts.uint32 == min(attempts, 4'u32)
-  doAssert stats[0].entries[0].attempts.uint32 == attempts - min(attempts, 4'u32)
+  doAssert stats[0].entries[2].attempts.uint32 == min(attempts, 5'u32)
+  doAssert stats[0].entries[0].attempts.uint32 == attempts - min(attempts, 5'u32)
   doAssert stats[0].entries[0].successes == 0 and stats[0].entries[2].successes == 0
-  doAssert stats[0].updateStage == (if attempts > 4: 3'u8 else: 2'u8)
+  doAssert stats[0].updateStage == (if attempts > 5: 3'u8 else: 2'u8)
 
 # Software/unfinished, ambiguous completion, lifetime, RTS and unsupported
 # retry budgets never update the sample table or consume a trial.
@@ -391,15 +403,20 @@ for status in [0x00000000'u32, 0x40000000'u32, 0xC0080000'u32, 0x80020000'u32,
   let before = stats[0]
   txlApplyRateFeedback(txlCaptureRateFeedback(d), addr owner, node)
   doAssert stats[0] == before
-for kind in 0 .. 4:
-  resetFrame(ackFifth)
+for kind in 0 .. 6:
+  resetFrame(ackSixth)
   case kind
   of 0: d.aggDescPtr.ackPolicyControl = 0
   of 1: d.aggDescPtr.chainedThd = nil
   of 2: d.rateTemplate.policyWord = 0xFFFF0304'u32
   of 3: d.aggDescPtr.head = nil
-  else: d.rateTemplate.retryRateControl0 = 0
+  of 4: d.rateTemplate.retryRateControl0 = 0
+  of 5: d.rateTemplate.rateWord = 0xA0001207'u32
+  else: d.rateTemplate.retryRateControl0 = 0xC0000400'u32
   doAssert txlCaptureRateFeedback(d).attempts == 0
+resetFrame(ackFifth)
+d.rateTemplate.retryRateControl0 = 0
+doAssert txlCaptureRateFeedback(d).attempts == 5
 var internal: HostTxDescView
 doAssert txlCaptureRateFeedback(addr internal).attempts == 0
 
@@ -421,7 +438,7 @@ for caseIndex in 0 .. 3:
 
 # Exercise the deployed event branch, including the IRQ boundary. The
 # submitted words and slot identities must survive a reentrant policy update.
-resetFrame(ackFifth)
+resetFrame(ackSixth)
 txlTagRateFeedback(d, addr d.rateTemplate)
 confirmList = CoList(first: node, last: node)
 txCtrl.packetCounter = 1
@@ -435,7 +452,7 @@ onRestore = proc() =
 txl_cfm_evt(0)
 doAssert interrupts and done == 1 and noticed == 1
 doAssert txActiveFlush == nil and confirmList.first == nil
-doAssert stats[0].entries[2].attempts == 4 and stats[0].entries[2].successes == 0
+doAssert stats[0].entries[2].attempts == 5 and stats[0].entries[2].successes == 0
 doAssert stats[0].entries[0].attempts == 1 and stats[0].entries[0].successes == 1
 doAssert stats[0].entries[3].attempts == 0
 """

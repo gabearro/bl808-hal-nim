@@ -1,0 +1,5 @@
+package ox64:diagnostics;
+
+world error-context-test {
+  export pass: func(context: error-context) -> error-context;
+}

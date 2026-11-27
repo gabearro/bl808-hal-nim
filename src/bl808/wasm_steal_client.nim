@@ -37,7 +37,8 @@ when defined(wasmStealHostTest):
   var
     wasmStealRpc*: WasmStealRpc
     wasmStealPrepareHook*: proc(job: WasmStealJob,
-      admission: FullWasmAdmission): WasmSchedulerResult
+      admission: FullWasmAdmission, memoryFactory: FullMemoryFactory,
+      memoryFactoryContext: pointer): WasmSchedulerResult
 elif defined(bl808m0):
   import ./wasm_steal_server
   import ./kernel/runtime
@@ -65,6 +66,11 @@ type
     wscReady
     wscFailed
     wscFinishRetry
+    wscHandoffChecked
+    wscHandoffRetry
+
+  WasmStealClaim* = object
+    ownerEpoch*, jobId*, token*: uint32
 
   WasmStealClient* = object
     state*: WasmStealClientState
@@ -86,6 +92,9 @@ type
     claimAfterHello: bool
     hostBindings: seq[FullWasmHostBinding]
     resourceMask: uint16
+    when defined(wasmChunkedMemory):
+      memoryFactory: FullMemoryFactory
+      memoryFactoryContext: pointer
     claimToken: uint32
     pendingOp: WasmStealOp
     pendingFuture: CpsVoidFuture
@@ -102,6 +111,12 @@ type
     responseLen: int
     requestBuf: array[WasmStealRequestBytes, byte]
     responseBuf: array[WasmStealResponseBytes, byte]
+    when defined(wasmManagedMigration):
+      handoffClaim: WasmStealClaim
+      handoffJob*: WasmStealJob
+      handoffStatus*: WasmStealStatus
+      handoffTaskId: uint32
+      handoffSourceCore: uint32
 
 proc initWasmStealClient*(client: var WasmStealClient,
                           bootId: uint32, maxMemoryPages: uint32,
@@ -109,8 +124,10 @@ proc initWasmStealClient*(client: var WasmStealClient,
                           timeoutMs = 5000'u64,
                           hostBindings: seq[FullWasmHostBinding] = @[],
                           resourceMask = 0'u16,
-                          hostCore = wasmCoreD0): bool =
-  if client.state in {wscPending, wscReady, wscFinishRetry} or
+                          hostCore = wasmCoreD0,
+                          memoryFactory: FullMemoryFactory = nil,
+                          memoryFactoryContext: pointer = nil): bool =
+  if client.state in {wscPending, wscReady, wscFinishRetry, wscHandoffChecked, wscHandoffRetry} or
       (client.pendingFuture != nil and not client.pendingFuture.finished):
     return false
   var caps = wasmRuntimeCapabilities()
@@ -121,8 +138,10 @@ proc initWasmStealClient*(client: var WasmStealClient,
     return false
   let bit = wasmStealCoreBit(caps.core)
   if bit == 0 or not wasmStealResourcesAllowed(bit, resourceMask): return false
+  if memoryFactory == nil and (memoryFactoryContext != nil or
+      (resourceMask and WasmStealPagedBacking) != 0): return false
   when not defined(wasmChunkedMemory):
-    if (resourceMask and WasmStealPagedBacking) != 0: return false
+    if memoryFactory != nil: return false
   when defined(bl808WasmRtPolicy):
     # This binding API has no measured host-call bound for deadline slots.
     if hostBindings.len != 0: return false
@@ -143,7 +162,15 @@ proc initWasmStealClient*(client: var WasmStealClient,
   client = WasmStealClient(state: wscIdle, bootId: bootId, coreBit: bit,
     capabilities: caps, maxMemoryPages: maxMemoryPages,
     timeoutMs: timeoutMs, hostBindings: hostBindings, resourceMask: resourceMask)
+  when defined(wasmChunkedMemory):
+    client.memoryFactory = memoryFactory
+    client.memoryFactoryContext = memoryFactoryContext
   true
+
+when defined(wasmManagedMigration) and defined(wasmChunkedMemory):
+  proc registeredWasmStealMemory*(client: var WasmStealClient):
+      tuple[factory: FullMemoryFactory, context: pointer] {.inline.} =
+    (client.memoryFactory, client.memoryFactoryContext)
 
 when defined(wasmSoftStealing):
   proc enableWasmSoftStealing*(client: var WasmStealClient, limits: WasmClockLimits): bool =
@@ -323,7 +350,92 @@ proc beginWasmStealCancel*(client: var WasmStealClient,
   ## Cancel before start. Read and acknowledge the canceled outcome as usual.
   client.beginOutcomeRequest(wsoCancel, jobId, expectedOwnerEpoch)
 
-proc decodeName(job: WasmStealJob): string =
+when defined(wasmManagedMigration):
+  proc currentWasmStealClaim*(client: WasmStealClient): WasmStealClaim =
+    if client.state == wscReady:
+      WasmStealClaim(ownerEpoch: client.ownerEpoch, jobId: client.jobId,
+        token: client.claimToken)
+    else:
+      WasmStealClaim()
+
+  proc sendHandoffRequest(client: var WasmStealClient, req: WasmStealRequest): bool =
+    if req.encodeWasmStealRequest(client.requestBuf) != WasmStealRequestBytes: return false
+    client.pendingOp = req.op
+    client.state = wscPending
+    client.exchange(client.requestBuf)
+
+  proc retryWasmStealHandoff*(client: var WasmStealClient): bool =
+    if client.state != wscHandoffRetry: return false
+    client.state = wscPending
+    if client.exchange(client.requestBuf): return true
+    client.state = wscHandoffRetry
+    false
+
+  proc beginWasmStealCheckHandoff*(client: var WasmStealClient,
+                                   claim: WasmStealClaim, sourceCoreBit: uint32,
+                                   probeOnly = false): bool =
+    if client.state notin {wscIdle, wscNoJob} or client.peerSession == 0 or
+        claim.ownerEpoch != client.ownerEpoch or claim.jobId == 0 or claim.token == 0:
+      return false
+    var req = client.makeRequest(if probeOnly: wsoProbeHandoff else: wsoCheckHandoff)
+    req.jobId = claim.jobId
+    req.claimToken = claim.token
+    req.hostInterfaceMask = 0
+    req.handoffCoreBit = sourceCoreBit
+    client.handoffStatus = wssStale
+    client.handoffJob = WasmStealJob()
+    client.handoffClaim = claim
+    client.handoffSourceCore = sourceCoreBit
+    if client.sendHandoffRequest(req): return true
+    client.fail()
+    false
+
+  proc cancelWasmStealCheckHandoff*(client: var WasmStealClient): bool =
+    ## Call before the snapshot sender retires its task.
+    if client.state != wscHandoffChecked: return false
+    client.handoffJob = WasmStealJob()
+    client.handoffClaim = WasmStealClaim()
+    client.state = wscIdle
+    true
+
+  proc beginWasmStealAuthorizeHandoff*(client: var WasmStealClient,
+                                       targetCoreBit, checkedSession: uint32): bool =
+    ## Keep the source frozen until the broker confirms the handoff. Only
+    ## an explicit refusal with the live source token permits resumption.
+    if client.state != wscReady or client.taskId == 0 or checkedSession == 0 or
+        targetCoreBit == client.coreBit or targetCoreBit notin
+          [WasmStealM0, WasmStealD0, WasmStealLP]:
+      return false
+    let task = getWasmTask(client.taskId)
+    if task.state != wasmTaskMigrating: return false
+    var req = client.makeRequest(wsoAuthorizeHandoff)
+    req.jobId = client.jobId
+    req.handoffCoreBit = targetCoreBit
+    req.handoffSession = checkedSession
+    req.handoffFuelUsed = task.fuelUsed
+    client.handoffStatus = wssStale
+    if not client.sendHandoffRequest(req): client.state = wscHandoffRetry
+    true
+
+  proc beginWasmStealAcceptHandoff*(client: var WasmStealClient,
+                                     preparedTaskId: uint32): bool =
+    ## The receiver must first validate and restore the declared job, then
+    ## observe the source commit. Only a broker grant may activate the task.
+    if client.state != wscHandoffChecked or preparedTaskId == 0: return false
+    let task = getWasmTask(preparedTaskId)
+    if task.state != wasmTaskMigrating or task.slot < 0 or
+        task.slot.uint32 != client.handoffJob.slot or
+        task.fuelLimit != client.handoffJob.maxFuel: return false
+    var req = client.makeRequest(wsoAcceptHandoff)
+    req.jobId = client.handoffClaim.jobId
+    req.claimToken = client.handoffClaim.token
+    req.hostInterfaceMask = 0
+    req.handoffCoreBit = client.handoffSourceCore
+    client.handoffTaskId = preparedTaskId
+    if not client.sendHandoffRequest(req): client.state = wscHandoffRetry
+    true
+
+proc wasmStealExportName*(job: WasmStealJob): string =
   var n = 0
   while n < WasmStealNameBytes and job.exportName[n] != '\0': inc n
   if n == 0 or n == WasmStealNameBytes: return ""
@@ -364,12 +476,10 @@ when defined(wasmSoftStealing):
 proc prepare(client: var WasmStealClient, job: WasmStealJob,
              memoryFactory: FullMemoryFactory,
              memoryFactoryContext: pointer): StealPreparation =
-  let name = job.decodeName()
+  let name = job.wasmStealExportName()
   if name.len == 0 or job.argCount > WasmStealMaxArgs or
       not job.compatibleWasmStealJob(client.makeRequest(wsoClaim)):
     return stpRetry
-  if (job.requiredResources and WasmStealPagedBacking) != 0 and memoryFactory == nil:
-    return stpDependencyUnavailable
   when defined(wasmSoftStealing):
     client.softDeadline = 0
     var spec: WasmRtSpec
@@ -377,10 +487,11 @@ proc prepare(client: var WasmStealClient, job: WasmStealJob,
       return stpRetry
   var started: WasmSchedulerResult
   let admission = FullWasmAdmission(enforceMemoryQuota: true,
+    requireMemoryFactory: client.coreBit in [WasmStealM0, WasmStealLP],
     allowedHostInterfaces: job.requiredHostInterfaces, hostBindings: client.hostBindings)
   when defined(wasmStealHostTest):
     if wasmStealPrepareHook == nil: return stpRetry
-    started = wasmStealPrepareHook(job, admission)
+    started = wasmStealPrepareHook(job, admission, memoryFactory, memoryFactoryContext)
   else:
     if job.argCount == 0:
       started = startFullWasmTaskI32(job.slot, name, [],
@@ -424,17 +535,24 @@ proc pollWasmSteal*(client: var WasmStealClient,
     if client.pendingFuture == nil or not client.pendingFuture.finished: return client.state
     if client.pendingFuture.getError() != nil:
       if client.pendingOp == wsoFinish: client.finishRetry()
+      elif client.pendingOp in {wsoAuthorizeHandoff, wsoAcceptHandoff}:
+        client.pendingFuture = nil
+        client.state = wscHandoffRetry
       else: client.fail()
       return client.state
   var reply: WasmStealResponse
   if client.responseLen != WasmStealResponseBytes or
       not client.responseBuf.decodeWasmStealResponse(reply):
     if client.pendingOp == wsoFinish: client.finishRetry()
+    elif client.pendingOp in {wsoAuthorizeHandoff, wsoAcceptHandoff}:
+      client.pendingFuture = nil
+      client.state = wscHandoffRetry
     else: client.fail()
     return client.state
   let op = client.pendingOp
   client.pendingFuture = nil
-  if (op notin {wsoOffer, wsoReadOutcome, wsoAckOutcome, wsoCancel} and
+  if (op notin {wsoOffer, wsoReadOutcome, wsoAckOutcome, wsoCancel,
+                wsoProbeHandoff, wsoCheckHandoff, wsoAuthorizeHandoff, wsoAcceptHandoff} and
        reply.status in {wssStale, wssInvalid}) or
       (op != wsoHello and
        (reply.ownerEpoch != client.ownerEpoch or
@@ -487,6 +605,50 @@ proc pollWasmSteal*(client: var WasmStealClient,
       client.outcomeStatus = reply.status
       client.outcome = reply.outcome
       client.state = wscIdle
+  of wsoProbeHandoff, wsoCheckHandoff, wsoAuthorizeHandoff, wsoAcceptHandoff:
+    when defined(wasmManagedMigration):
+      client.handoffStatus = reply.status
+      case op
+      of wsoProbeHandoff, wsoCheckHandoff:
+        if reply.status == wssOk and reply.job.jobId == client.handoffClaim.jobId and
+            reply.claimToken == client.handoffClaim.token:
+          client.handoffJob = reply.job
+          client.state = wscHandoffChecked
+        else:
+          client.state = wscIdle
+      of wsoAuthorizeHandoff:
+        if reply.job.jobId != client.jobId or reply.claimToken != client.claimToken:
+          client.fail()
+        elif reply.status == wssBusy:
+          client.state = wscReady
+        elif reply.status == wssOk and retireWasmTaskMigration(client.taskId) == wasmMigrationOk:
+          client.taskId = 0
+          client.jobId = 0
+          client.claimToken = 0
+          client.state = wscIdle
+        else:
+          client.fail()
+      of wsoAcceptHandoff:
+        if reply.status == wssBusy:
+          client.state = wscHandoffChecked
+        elif reply.status == wssOk and reply.job.jobId == client.handoffClaim.jobId and
+            reply.claimToken != 0 and reply.claimToken != client.handoffClaim.token:
+          client.taskId = client.handoffTaskId
+          client.jobId = reply.job.jobId
+          client.claimToken = reply.claimToken
+          client.handoffTaskId = 0
+          if activateWasmTaskMigration(client.taskId,
+              brokerOwnerCore = client.capabilities.core.ord.uint8) == wasmMigrationOk:
+            client.state = wscReady
+          else:
+            discard discardPreparedWasmTaskMigration(client.taskId)
+            client.rejectedAfterStart = true
+            discard client.sendFinish(WasmStealOutcome(kind: wokTaskLost))
+        else:
+          client.state = wscHandoffChecked
+      else: discard
+    else:
+      client.fail()
   of wsoClaim:
     if reply.status == wssEmpty:
       client.state = wscNoJob
@@ -495,7 +657,13 @@ proc pollWasmSteal*(client: var WasmStealClient,
       client.fail()
     else:
       client.claimToken = reply.claimToken
-      let prepared = client.prepare(reply.job, memoryFactory, memoryFactoryContext)
+      let prepared = when defined(wasmChunkedMemory):
+        if client.memoryFactory != nil:
+          client.prepare(reply.job, client.memoryFactory, client.memoryFactoryContext)
+        else:
+          client.prepare(reply.job, memoryFactory, memoryFactoryContext)
+      else:
+        client.prepare(reply.job, memoryFactory, memoryFactoryContext)
       case prepared
       of stpReady:
         if not client.send(wsoStart): client.fail()

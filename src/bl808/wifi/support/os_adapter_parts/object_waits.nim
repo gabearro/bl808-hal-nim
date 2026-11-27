@@ -9,6 +9,9 @@ proc osWaitState(ticks: uint32): OsWaitState =
     forever: ticks == BlOsWaitingForever)
 
 proc osWaitAgain(state: var OsWaitState): bool =
+  when defined(radioDiag):
+    if wifiSchedulerWorkHook != nil:
+      inc wifiCpsNestedWaitPolls
   if not state.forever and state.remainingUs == 0:
     return false
   let saved = osEnterCritical()

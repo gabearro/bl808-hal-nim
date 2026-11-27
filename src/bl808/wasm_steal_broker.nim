@@ -13,7 +13,7 @@ when defined(wasmSoftStealing):
 const
   WasmStealWireTag* = 0x5753'u16
   WasmStealWireMagic* = 0x5357'u16
-  WasmStealWireVersion* = when defined(wasmSoftStealing): 6'u8 else: 5'u8
+  WasmStealWireVersion* = when defined(wasmSoftStealing): 10'u8 else: 9'u8
   WasmStealRequestBytes* = 40
   WasmStealResponseBytes* = when defined(wasmSoftStealing): 160 else: 104
   WasmStealMaxJobs* {.intdefine.} = 8
@@ -26,8 +26,11 @@ const
   WasmStealDirectPsram* = 1'u16 shl 0
   WasmStealPagedBacking* = 1'u16 shl 1
   WasmStealDirectSd* = 1'u16 shl 2
+  WasmStealApplicationResources* = 0xFF00'u16
+    ## Firmware images agree on the meaning of bits 8–15. Workers advertise
+    ## them only for initialized dependencies available on that worker.
   WasmStealResourceMask* = WasmStealDirectPsram or WasmStealPagedBacking or
-    WasmStealDirectSd
+    WasmStealDirectSd or WasmStealApplicationResources
 
 when defined(wasmSoftStealing):
   type WasmStealSoftSpec* = object
@@ -47,6 +50,10 @@ type
     wsoReadOutcome = 8
     wsoAckOutcome = 9
     wsoCancel = 10
+    wsoCheckHandoff = 11
+    wsoAuthorizeHandoff = 12
+    wsoAcceptHandoff = 13
+    wsoProbeHandoff = 14
 
   WasmStealStatus* = enum
     wssOk = 0
@@ -62,6 +69,7 @@ type
     wstClaimed
     wstStarted
     wstComplete
+    wstHandoff
 
   WasmStealOutcomeKind* = enum
     wokNone
@@ -105,6 +113,9 @@ type
     claimToken*: uint32
     jobId*: uint32
     outcome*: WasmStealOutcome
+    handoffCoreBit*: uint32
+    handoffSession*: uint32
+    handoffFuelUsed*: uint32
     backendMask*: uint32
     hostInterfaceMask*: uint32
     maxMemoryPages*: uint32
@@ -136,10 +147,16 @@ type
     dependencyDeclines*: uint32
     acknowledgedOutcomes*: uint32
     abandonedOffers*: uint32
+    handoffsAuthorized*: uint32
+    handoffsAccepted*: uint32
     when defined(wasmSoftStealing):
       expiredSoftJobs*: uint32
 
   WasmStealClock* = proc(): uint64 {.nimcall.}
+
+  WasmStealHandoff = object
+    sourceCoreBit, sourceSession, sourceToken: uint32
+    targetCoreBit, targetSession, fuelUsed: uint32
 
   WasmStealEntry = object
     state: WasmStealState
@@ -152,6 +169,8 @@ type
     claimToken: uint32
     leaseUntil: uint64
     declinedCoreMask: uint32
+    handoff: WasmStealHandoff
+    migratedFuelUsed: uint32
 
   WasmStealPeer = object
     bootId: uint32
@@ -231,6 +250,25 @@ proc encodeWasmStealRequest*(req: WasmStealRequest,
     if req.jobId == 0 or req.claimToken != 0: return 0
     outBuf.put32(24, req.jobId)
     return WasmStealRequestBytes
+  if req.op == wsoAuthorizeHandoff:
+    if req.jobId == 0 or req.claimToken == 0 or req.handoffSession == 0 or
+        not validCoreBit(req.handoffCoreBit): return 0
+    outBuf.put32(24, req.jobId)
+    outBuf.put32(28, req.handoffCoreBit)
+    outBuf.put32(32, req.handoffSession)
+    outBuf.put32(36, req.handoffFuelUsed)
+    return WasmStealRequestBytes
+  if req.op in {wsoProbeHandoff, wsoCheckHandoff, wsoAcceptHandoff}:
+    # Currently only import-free core guests can cross a suspension point.
+    if req.jobId == 0 or req.claimToken == 0 or req.hostInterfaceMask != 0 or
+        not validCoreBit(req.handoffCoreBit): return 0
+    outBuf.put32(24, req.jobId)
+    outBuf.put32(28, req.backendMask)
+    outBuf.put32(32, req.maxMemoryPages)
+    outBuf[36] = req.fullInterpreter.byte
+    outBuf[37] = req.handoffCoreBit.byte
+    outBuf.put16(38, req.resourceMask)
+    return WasmStealRequestBytes
   outBuf.put32(24, req.backendMask)
   outBuf.put32(28, req.hostInterfaceMask)
   outBuf.put32(32, req.maxMemoryPages)
@@ -245,7 +283,7 @@ proc decodeWasmStealRequest*(buf: openArray[byte],
   if buf.len != WasmStealRequestBytes or
       buf.get16(0) != WasmStealWireMagic or
       buf[2] != WasmStealWireVersion or
-      buf[3] < wsoHello.ord.byte or buf[3] > wsoCancel.ord.byte or
+      buf[3] < wsoHello.ord.byte or buf[3] > wsoProbeHandoff.ord.byte or
       buf[3] == wsoOffer.ord.byte:
     return false
   req = WasmStealRequest(op: WasmStealOp(buf[3]), ownerEpoch: buf.get32(4),
@@ -263,6 +301,24 @@ proc decodeWasmStealRequest*(buf: openArray[byte],
     req.jobId = buf.get32(24)
     return req.jobId != 0 and req.claimToken == 0 and buf.get32(28) == 0 and
       buf.get32(32) == 0 and buf.get32(36) == 0
+  if req.op == wsoAuthorizeHandoff:
+    req.jobId = buf.get32(24)
+    req.handoffCoreBit = buf.get32(28)
+    req.handoffSession = buf.get32(32)
+    req.handoffFuelUsed = buf.get32(36)
+    return req.jobId != 0 and req.claimToken != 0 and req.handoffSession != 0 and
+      validCoreBit(req.handoffCoreBit)
+  if req.op in {wsoProbeHandoff, wsoCheckHandoff, wsoAcceptHandoff}:
+    if buf[36] > 1 or not validCoreBit(buf[37].uint32) or
+        (buf.get16(38) and not WasmStealResourceMask) != 0:
+      return false
+    req.jobId = buf.get32(24)
+    req.backendMask = buf.get32(28)
+    req.maxMemoryPages = buf.get32(32)
+    req.resourceMask = buf.get16(38)
+    req.fullInterpreter = buf[36] == 1
+    req.handoffCoreBit = buf[37].uint32
+    return req.jobId != 0 and req.claimToken != 0
   if buf[36] > 1 or (buf.get16(38) and not WasmStealResourceMask) != 0:
     return false
   when defined(wasmSoftStealing):
@@ -405,7 +461,7 @@ proc wasmStealCoreBit*(core: WasmRuntimeCore): uint32 =
   else: 0
 
 proc wasmStealResourcesAllowed*(coreBit: uint32, mask: uint16): bool =
-  (mask and not WasmStealResourceMask) == 0 and
+  validCoreBit(coreBit) and (mask and not WasmStealResourceMask) == 0 and
     ((mask and WasmStealDirectPsram) == 0 or coreBit != WasmStealLP) and
     ((mask and WasmStealDirectSd) == 0 or coreBit == WasmStealM0)
 
@@ -563,7 +619,9 @@ proc processFinish(broker: var WasmStealBroker, peer: int, req: WasmStealRequest
         entry.claimToken != req.claimToken or entry.claimantCoreBit != req.peerCoreBit or
         entry.claimantSession != req.peerSession:
       continue
-    if outcome.fuelUsed > entry.job.maxFuel:
+    if outcome.fuelUsed > entry.job.maxFuel or
+        (outcome.kind in {wokReturned, wokTrapped, wokKilled} and
+         outcome.fuelUsed < entry.migratedFuelUsed):
       reply.status = wssInvalid
       return
     worker.lastFinishToken = req.claimToken
@@ -574,6 +632,91 @@ proc processFinish(broker: var WasmStealBroker, peer: int, req: WasmStealRequest
     reply.claimToken = req.claimToken
     inc broker.telemetry.completed
     return
+  reply.status = wssStale
+  inc broker.telemetry.staleRequests
+
+proc transferable(job: WasmStealJob): bool =
+  if job.requiredHostInterfaces != 0: return false
+  when defined(wasmSoftStealing):
+    if job.soft.deadlineTick != 0: return false
+  true
+
+proc processHandoff(broker: var WasmStealBroker, req: WasmStealRequest,
+                   reply: var WasmStealResponse) =
+  reply.job.jobId = req.jobId
+  if req.jobId == 0 or req.claimToken == 0:
+    reply.status = wssInvalid
+    return
+  for entry in broker.entries.mitems:
+    if entry.state notin {wstStarted, wstHandoff} or entry.job.jobId != req.jobId:
+      continue
+    if not entry.job.transferable():
+      reply.status = wssInvalid
+      return
+    let handoff = entry.handoff
+    case req.op
+    of wsoProbeHandoff, wsoCheckHandoff:
+      if entry.state != wstStarted or entry.claimToken != req.claimToken or
+          entry.claimantCoreBit == req.peerCoreBit or entry.claimantCoreBit != req.handoffCoreBit or
+          broker.peers[entry.claimantCoreBit.coreIndex()].session != entry.claimantSession:
+        break
+      if not entry.job.compatibleWasmStealJob(req):
+        reply.status = wssInvalid
+        return
+      if req.op == wsoCheckHandoff:
+        entry.handoff = WasmStealHandoff(sourceCoreBit: entry.claimantCoreBit,
+          sourceSession: entry.claimantSession, sourceToken: entry.claimToken,
+          targetCoreBit: req.peerCoreBit, targetSession: req.peerSession)
+      reply.job = entry.job
+      reply.claimToken = req.claimToken
+      return
+    of wsoAuthorizeHandoff:
+      let matchesPrepared = handoff.sourceToken == req.claimToken and
+        handoff.sourceCoreBit == req.peerCoreBit and
+        handoff.sourceSession == req.peerSession and handoff.targetCoreBit == req.handoffCoreBit and
+        handoff.targetSession == req.handoffSession and handoff.targetSession != 0
+      if not matchesPrepared: break
+      if entry.state == wstStarted and entry.claimToken == req.claimToken and
+          entry.claimantCoreBit == req.peerCoreBit and entry.claimantSession == req.peerSession:
+        if broker.peers[handoff.targetCoreBit.coreIndex()].session != handoff.targetSession:
+          # The obsolete session cannot receive a later retry of this handoff.
+          reply.status = wssBusy
+          reply.claimToken = req.claimToken
+          return
+        if req.handoffFuelUsed < entry.migratedFuelUsed or
+            req.handoffFuelUsed >= entry.job.maxFuel:
+          reply.status = wssInvalid
+          return
+        entry.handoff.fuelUsed = req.handoffFuelUsed
+        entry.state = wstHandoff
+        inc broker.telemetry.handoffsAuthorized
+      elif handoff.fuelUsed != req.handoffFuelUsed:
+        break
+      reply.claimToken = req.claimToken
+      return
+    of wsoAcceptHandoff:
+      if handoff.sourceToken != req.claimToken or handoff.targetCoreBit != req.peerCoreBit or
+          handoff.targetSession != req.peerSession or handoff.sourceCoreBit != req.handoffCoreBit:
+        break
+      if not entry.job.compatibleWasmStealJob(req):
+        reply.status = wssInvalid
+        return
+      if entry.state == wstHandoff:
+        entry.claimantCoreBit = req.peerCoreBit
+        entry.claimantSession = req.peerSession
+        entry.claimToken = broker.nextToken.nextNonzero()
+        entry.migratedFuelUsed = handoff.fuelUsed
+        entry.state = wstStarted
+        inc broker.telemetry.handoffsAccepted
+      elif entry.claimantCoreBit != req.peerCoreBit or
+          entry.claimantSession != req.peerSession or entry.claimToken == req.claimToken:
+        reply.status = wssBusy
+        return
+      reply.job = entry.job
+      reply.claimToken = entry.claimToken
+      return
+    else:
+      break
   reply.status = wssStale
   inc broker.telemetry.staleRequests
 
@@ -592,13 +735,17 @@ proc processWasmSteal*(broker: var WasmStealBroker,
       for entry in broker.entries.mitems:
         entry.declinedCoreMask = entry.declinedCoreMask and not req.peerCoreBit
         if entry.job.sourceCoreBit == req.peerCoreBit and entry.sourceSession != 0:
-          if entry.state == wstStarted:
+          if entry.state in {wstStarted, wstHandoff}:
             # Keep the worker's claim until it finishes or is confirmed stopped.
             entry.sourceSession = 0
           else:
             entry = WasmStealEntry()
           inc broker.telemetry.abandonedOffers
-          continue
+        if entry.state == wstHandoff and entry.handoff.targetCoreBit == req.peerCoreBit:
+          # Authorization is irrevocable. The exact boot that staged the
+          # snapshot disappeared before it could take ownership.
+          entry.storeOutcome(WasmStealOutcome(kind: wokWorkerStopped,
+            workerCoreBit: req.peerCoreBit))
         if entry.state == wstClaimed and
             entry.claimantCoreBit == req.peerCoreBit:
           entry.requeueClaim()
@@ -680,6 +827,8 @@ proc processWasmSteal*(broker: var WasmStealBroker,
     broker.processOutcomeRequest(peer, req, result)
   of wsoFinish:
     broker.processFinish(peer, req, result)
+  of wsoProbeHandoff, wsoCheckHandoff, wsoAuthorizeHandoff, wsoAcceptHandoff:
+    broker.processHandoff(req, result)
   of wsoStart, wsoRelease, wsoDecline:
     for entry in broker.entries.mitems:
       if entry.claimToken != 0 and entry.claimToken == req.claimToken and
@@ -753,9 +902,11 @@ proc retireStoppedWasmStealJob*(broker: var WasmStealBroker,
   ## job without replaying it and report the failure to a live submitter.
   if not peerConfirmedStopped or jobId == 0: return false
   for entry in broker.entries.mitems:
-    if entry.state == wstStarted and entry.job.jobId == jobId:
+    if entry.state in {wstStarted, wstHandoff} and entry.job.jobId == jobId:
+      let worker = if entry.state == wstHandoff: entry.handoff.targetCoreBit
+                   else: entry.claimantCoreBit
       entry.storeOutcome(WasmStealOutcome(kind: wokWorkerStopped,
-        workerCoreBit: entry.claimantCoreBit))
+        workerCoreBit: worker))
       inc broker.telemetry.operatorRetirements
       return true
   false

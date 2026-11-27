@@ -24,6 +24,7 @@ type
 
   FullWasmAdmission* = object
     enforceMemoryQuota*: bool
+    requireMemoryFactory*: bool
     allowedHostInterfaces*: uint32
     hostBindings*: seq[FullWasmHostBinding]
 
@@ -93,17 +94,12 @@ proc openLoaded(handle: var FullWasmProgramHandle,
           memory.limits.hasMax = true
           memory.limits.max = maxMemoryPages
     let imports = if restoreSnapshot: @[] else: module.resolveFullHostImports(admission)
-    when defined(bl808m0) or defined(bl808lp):
-      # One flat WASM page is 64 KiB; neither core has that much free local
-      # writable RAM. A bounded chunk factory is mandatory for any memory.
-      when defined(wasmChunkedMemory):
-        if module.memories.len > 0 and memoryFactory == nil:
-          program.unload()
-          return wasmManagerInstantiateFailed
-      else:
-        if module.memories.len > 0:
-          program.unload()
-          return wasmManagerInstantiateFailed
+    # M0 and LP cannot fit a flat 64 KiB Wasm page in local writable RAM.
+    const nativeNeedsFactory = defined(bl808m0) or defined(bl808lp)
+    if (nativeNeedsFactory or admission.requireMemoryFactory) and
+        module.memories.len > 0 and memoryFactory == nil:
+      program.unload()
+      return wasmManagerDependencyUnavailable
     when not defined(wasmChunkedMemory):
       if memoryFactory != nil:
         program.unload()

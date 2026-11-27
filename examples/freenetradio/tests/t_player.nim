@@ -81,11 +81,16 @@ proc dacActualRate(rate: uint32): uint32 {.nimcall.} = rate + 1   # tells it apa
 
 # ---- Fake decoder ----------------------------------------------------------------
 
+var pendingDecode: bool
+
 proc fakeDecode(ctx: pointer; mp3: openArray[byte]; pcm: var openArray[int16];
                 info: var FrameInfo): tuple[consumed: int, status: DecodeStatus] {.nimcall.} =
   doAssert ctx == addr decodeCalls
   doAssert mp3.len >= MinDecodeInput and mp3.len <= Window
   doAssert pcm.len == MaxSamplesPerFrame
+  if pendingDecode:
+    pendingDecode = false
+    return (0, dsPending)
   inc decodeCalls
   advanceUs(decodeCostUs)
   info = FrameInfo()
@@ -157,6 +162,7 @@ proc setup() =
   for i in 0 ..< RingLen: dac.cpu[i] = 0x2222
   dac.mem = dac.cpu
   decodeCalls = 0
+  pendingDecode = false
   spectrumN = 0
   decodeCostUs = 3000
   initPlayer(pl, cast[ptr UncheckedArray[int16]](addr dac.cpu[0]),
@@ -177,6 +183,7 @@ proc tick(): StepResult =
   of srIdle: advanceUs(20_000)
   of srWait: advanceUs(10_000)
   of srYield: advanceUs(200)
+  of srDecodePending: doAssert false
 
 proc startPlaying(kind = kStereo44; amp = 64) =
   ## Fill the pipe, hold for the prebuffer time, and step until playing.
@@ -297,6 +304,7 @@ block: # decodeLoopFillsTheRingOneFramePerStep
     of srYield: inc yields
     of srWait: inc waits
     of srIdle: doAssert false
+    of srDecodePending: doAssert false
   doAssert pl.playing and st.underruns == 0 and st.phase == phPlaying
   # One pass = one prologue (the last pass may still be decoding).
   doAssert stats.audioLoops - loops in [waits.uint32, waits.uint32 + 1]
@@ -636,6 +644,26 @@ block: # stopWithoutANewGenerationStillFades
   for _ in 0 ..< 10: doAssert tick() == srIdle        # and only once
   doAssert pl.windowLen == w                          # the window is kept (same generation)
   doAssert dac.played[^1] == [0'i16, 0'i16]
+
+block: # a decode request preserves input and a station change retires it
+  setup()
+  startPlaying()
+  keepFed()
+  pendingDecode = true
+  let decoded = decodeCalls
+  let errors = stats.decodeErrors
+  doAssert pl.step() == srDecodePending
+  doAssert decodeCalls == decoded and stats.decodeErrors == errors
+  let submitted = pl.windowLen
+  doAssert submitted >= MinDecodeInput
+  doAssert pl.step() == srYield and decodeCalls == decoded + 1
+  doAssert pl.windowLen == Window - FrameBytes
+
+  pendingDecode = true
+  doAssert pl.step() == srDecodePending
+  beginGeneration()
+  doAssert pl.step() == srIdle
+  doAssert pl.windowLen == 0 and decodeCalls == decoded + 1
 
 block: # diagnostics
   setup()

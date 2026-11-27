@@ -4,6 +4,8 @@ proc txl_transmit_trigger*() {.importc, cdecl.}
 proc txl_frame_evt*() {.importc, cdecl.}
 proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.importc, cdecl.}
 proc wifi_nimfw_service_tx*(count: uint32) {.importc, cdecl.}
+proc wifi_nimfw_next_timer_delay_us*(): int32 {.importc, cdecl.}
+proc wifi_pm_wake_pending*(): bool {.importc, cdecl.}
 proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
                                                ssidLen: uint32)
   {.importc, cdecl.}

@@ -16,7 +16,11 @@ proc wifi_mgmr_api_fw_powersaving*(mode: cint): cint {.exportc, cdecl.} =
   mgmrPmModes[mgmrPmWriteIndex] = mode
   mgmrPmWriteIndex = (mgmrPmWriteIndex + 1) mod MgmrPmQueueCapacity
   inc mgmrPmCount
+  vendorNotifyWork()
   0
+
+proc mgmrPmPending(): bool =
+  wifiStarted and mgmrPmCount != 0
 
 proc mgmrPmProcessOne(): bool =
   if not wifiStarted:

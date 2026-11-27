@@ -28,9 +28,11 @@ from typing import Any
 
 if __package__:
     from . import bl808_isp
+    from . import bl808_pc_profile
     from .build_bl808_boot2_flash import FW_BOOTINFO_FALLBACK, read_fw_bootinfo_template
 else:
     import bl808_isp
+    import bl808_pc_profile
     from build_bl808_boot2_flash import FW_BOOTINFO_FALLBACK, read_fw_bootinfo_template
 
 
@@ -251,6 +253,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jtag-read", type=parse_jtag_read, action="append", default=[],
                         metavar="ADDRESS[:COUNT]",
                         help="Read 1–512 32-bit words through JTAG without flashing or resetting the target. May be repeated.")
+    parser.add_argument("--jtag-live-profile", type=int, metavar="SECONDS",
+                        help="Sample live M0 branch PCs through JTAG without halting the core.")
+    parser.add_argument("--d0-live-profile", type=int, metavar="SECONDS",
+                        help="Sample live D0 retired PCs through the M0 UART observer.")
+    parser.add_argument("--jtag-profile-rate", "--profile-rate", type=int, default=30, metavar="HZ",
+                        help="Requested live PC sample rate (default 30).")
+    parser.add_argument("--jtag-profile-elf", "--profile-elf", type=Path, metavar="ELF",
+                        help="Matching ELF to symbolize live PC samples.")
+    parser.add_argument("--profile-hpm", action="store_true",
+                        help="Include D0 hardware counters when the D0 firmware provides them.")
     parser.add_argument("--lp-dtmcs-probe", action="store_true",
                         help=(
                             "Switch to the LP JTAG mux, then run a tap-only OpenOCD "
@@ -650,6 +662,26 @@ def parse_args() -> argparse.Namespace:
         args.uart_anchor_reset_after_flash = True
     if args.uart_anchor_rom and args.uart_anchor_existing:
         parser.error("--uart-anchor-rom loads an anchor; --uart-anchor-existing uses a running one")
+    if args.profile_hpm and args.d0_live_profile is None:
+        parser.error("--profile-hpm requires --d0-live-profile")
+    if args.jtag_live_profile is not None or args.d0_live_profile is not None:
+        jtag = args.jtag_live_profile is not None
+        seconds = args.jtag_live_profile if jtag else args.d0_live_profile
+        other_action = (
+            args.list or args.test or args.preflight or args.build_only or
+            args.jtag_read or args.jtag_load or args.jtag_flash or
+            args.attach_openocd or args.probe_uart_boot or args.lp_dtmcs_probe or
+            args.uart_anchor_build_only or args.uart_anchor_probe or
+            args.uart_anchor_reboot or args.uart_anchor_flash or
+            args.uart_anchor_flash_image is not None
+        )
+        if jtag and (other_action or args.d0_live_profile is not None or
+                     args.no_jtag or args.jtag_core != "m0"):
+            parser.error("--jtag-live-profile is a standalone M0 JTAG action")
+        if not jtag and (other_action or not args.uart):
+            parser.error("--d0-live-profile is a standalone action and requires --uart")
+        if not 1 <= seconds <= 600 or not 1 <= args.jtag_profile_rate <= 200:
+            parser.error("live profile requires 1–600 seconds and a rate of 1–200 Hz")
     return args
 
 
@@ -5707,9 +5739,10 @@ def make_openocd_session(
     test_name: str,
     core: str,
     log_suffix: str,
+    target_override: Path | None = None,
 ) -> OpenOcdSession:
     interface = jtag_interface_for_core(args, defaults, core)
-    target = jtag_target_for_core(args, defaults, core)
+    target = target_override or jtag_target_for_core(args, defaults, core)
     openocd = jtag_openocd_for_core(args, core)
     env = sudo_env(args)
     if core == "lp":
@@ -7054,6 +7087,125 @@ def macos_ftdi_visible(vid_text: str, pid_text: str) -> tuple[bool, str]:
     return False, f"{vid_text}:{pid_text} not visible in IOUSB"
 
 
+def load_profile_symbols(elf: Path | None) -> list[tuple[int, int, str]]:
+    if elf is None:
+        return []
+    nm = find_tool(None, "riscv64-unknown-elf-nm", "riscv32-unknown-elf-nm")
+    return bl808_pc_profile.load_symbols(nm, elf)
+
+
+def save_live_profile(report: Path, args: argparse.Namespace, symbols: list,
+                      *, elapsed: float, samples: list, metadata: dict,
+                      eligible: list | None = None) -> int:
+    if eligible is None:
+        eligible = samples
+    hotspots = bl808_pc_profile.hotspot_counts(eligible, symbols)
+    ensure_parent(report)
+    report.write_text(json.dumps({
+        **metadata,
+        "elapsed_seconds": elapsed,
+        "requested_rate_hz": args.jtag_profile_rate,
+        "elf": str(args.jtag_profile_elf.resolve()) if args.jtag_profile_elf else None,
+        "hotspots": hotspots,
+        "samples": samples,
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"{len(samples)} PC samples ({len(samples) / elapsed:.1f}/s)")
+    if len(eligible) != len(samples):
+        print(f"{len(eligible)} running, nonzero PC samples used for hotspots")
+    if args.jtag_profile_elf is not None:
+        matched = sum(row["samples"] for row in hotspots if row["symbol"])
+        print(f"{matched}/{len(eligible)} samples matched ELF symbols")
+    print("  Count   Share  Location")
+    for row in hotspots[:20]:
+        print(f"  {row['samples']:5d}  {row['sample_percent']:5.1f}%  {row['site']}")
+    print(f"Saved {report}")
+    if not eligible:
+        print("FAIL capture contained no usable PCs", flush=True)
+        return 1
+    return 0
+
+
+def run_jtag_live_profile(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    symbols = load_profile_symbols(args.jtag_profile_elf)
+    target = REPO_ROOT / "tools" / "m0_live_profile.cfg"
+    if args.dry_run:
+        print(f"DRY-RUN: {target.name}, live branch PC samples for "
+              f"{args.jtag_live_profile}s at up to {args.jtag_profile_rate} Hz")
+        return 0
+
+    configure_sudo_askpass(args, args.work_dir)
+    session = make_openocd_session(args=args, defaults=manifest.get("defaults", {}),
+        work_dir=args.work_dir, test_name="jtag-live-profile", core="m0",
+        log_suffix="m0", target_override=target)
+    try:
+        # TAP-only setup verifies the ID and DMI itself. OpenOCD's automatic
+        # scan can misread the ID on the first scan with some FTDI adapters.
+        # Adapter recovery only. The normal attach helper halts the hart.
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                if attempt:
+                    reset_ftdi_adapter(args, session.log_path, reason="retry live profile attach")
+                session.start()
+                bl808_pc_profile.scan_value(session.command("m0_profile_init"),
+                                            "BL808_PROFILE_READY")
+                break
+            except (OSError, RuntimeError) as exc:
+                append_log(session.log_path, f"\n# Live profile attach failed: {exc}\n")
+                if attempt + 1 == attempts:
+                    raise RuntimeError(f"{exc} (see {session.log_path})") from exc
+                session.stop_process()
+
+        print(f"Sampling live M0 branch PCs for {args.jtag_live_profile}s", flush=True)
+        elapsed, samples = bl808_pc_profile.collect_samples(
+            session.command, seconds=args.jtag_live_profile, rate=args.jtag_profile_rate)
+    finally:
+        session.close()
+
+    return save_live_profile(args.work_dir / "logs" / "jtag-live-profile.json",
+        args, symbols, elapsed=elapsed, samples=samples,
+        metadata={"core": "m0", "method": "e907-latest-branch-destination", "transport": "jtag"})
+
+
+def run_d0_live_profile(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    seconds, rate = args.d0_live_profile, args.jtag_profile_rate
+    baud = int(args.uart_baud or manifest.get("defaults", {}).get("uart_baud", 230_400))
+    symbols = load_profile_symbols(args.jtag_profile_elf)
+    if args.dry_run:
+        detail = "including hardware counters" if args.profile_hpm else "PC samples only"
+        print(f"DRY-RUN: D0 retire monitor on {args.uart} at {baud} baud, "
+              f"{seconds}s at {rate} Hz ({detail})")
+        return 0
+
+    log = args.work_dir / "logs" / "d0-live-profile.uart.log"
+    try:
+        capture = SerialCapture(args.uart, baud, "D0 profile observer", log,
+            dtr=modem_control_state(args.serial_dtr), rts=modem_control_state(args.serial_rts))
+        try:
+            print(f"Sampling live D0 retired PCs for {seconds}s", flush=True)
+            command = "D0PROFILEHPM" if args.profile_hpm else "D0PROFILE"
+            capture.write_text(f"{command} {seconds} {rate}\n")
+            elapsed, samples, unstable, counters = bl808_pc_profile.read_d0_capture(
+                bl808_pc_profile.d0_uart_lines(capture.read_available, seconds=seconds),
+                seconds=seconds, rate=rate, with_hpm=args.profile_hpm)
+        finally:
+            capture.close()
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"{exc} (see {log})") from exc
+
+    eligible = [sample for sample in samples if not sample["halted"] and int(sample["pc"], 16)]
+    metadata = {"core": "d0", "method": "c906-retired-pc", "transport": "m0-uart",
+                "unstable_samples": unstable, "hotspot_samples": len(eligible)}
+    if counters is not None:
+        metadata["hardware_counters"] = counters
+        print("D0 hardware counters")
+        for name, count in counters.items():
+            print(f"  {name:34s} {count:15,d}")
+    return save_live_profile(args.work_dir / "logs" / "d0-live-profile.json",
+        args, symbols, elapsed=elapsed, samples=samples, eligible=eligible,
+        metadata=metadata)
+
+
 def run_jtag_read(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
     if args.no_jtag:
         print("FAIL --jtag-read requires JTAG", flush=True)
@@ -7298,6 +7450,9 @@ def hardware_lock_required(args: argparse.Namespace) -> bool:
 
 
 def main_locked(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    if args.d0_live_profile is not None:
+        return run_d0_live_profile(args, manifest)
+
     if args.manual_target_reset:
         args.no_jtag_reset = True
 
@@ -7320,6 +7475,9 @@ def main_locked(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
 
     if args.preflight:
         return run_preflight(args, manifest)
+
+    if args.jtag_live_profile is not None:
+        return run_jtag_live_profile(args, manifest)
 
     if args.jtag_read:
         return run_jtag_read(args, manifest)

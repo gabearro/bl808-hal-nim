@@ -328,10 +328,8 @@ func imageByte(f: FontId; i: int): uint8 {.inline.} =
   of font6x13Bold: Font6x13BoldImage[i]
   of font10x20: Font10x20Image[i]
 
-func glyphRow*(f: FontId; c: char; row: int): uint16 =
-  ## Row `row` of the glyph for `c`: bit 15 is the leftmost pixel.
+func unpackGlyphRow(f: FontId; index, row: int): uint16 =
   let w = f.charWidth
-  let index = if c.ord in FirstChar .. LastChar: c.ord - FirstChar else: Replacement
   let x0 = (index mod GlyphsPerRow) * w
   let rowBytes = GlyphsPerRow * w div 8
   let base = ((index div GlyphsPerRow) * f.charHeight + row) * rowBytes
@@ -339,3 +337,39 @@ func glyphRow*(f: FontId; c: char; row: int): uint16 =
     let x = x0 + k
     if ((f.imageByte(base + (x shr 3)) shr (7 - (x and 7))) and 1) != 0:
       result = result or (0x8000'u16 shr k)
+
+const GlyphCount = LastChar - FirstChar + 1
+
+func fontOffset(font: FontId): int =
+  for f in FontId:
+    if f == font: break
+    result += GlyphCount * f.charHeight
+
+const FontOffsets = [font5x7.fontOffset, font6x10.fontOffset,
+                     font6x13Bold.fontOffset, font10x20.fontOffset]
+const RowCount = font10x20.fontOffset + GlyphCount * font10x20.charHeight
+
+func buildGlyphRows(): array[RowCount, uint16] =
+  var i = 0
+  for f in FontId:
+    for index in 0 ..< GlyphCount:
+      for row in 0 ..< f.charHeight:
+        result[i] = f.unpackGlyphRow(index, row)
+        inc i
+
+const GlyphRows = buildGlyphRows()
+
+func glyphOffset(f: FontId; c: char): int {.inline.} =
+  let index = if c.ord in FirstChar .. LastChar: c.ord - FirstChar else: Replacement
+  FontOffsets[f.ord] + index * f.charHeight
+
+template glyphRows*(f: FontId; c: char): untyped =
+  ## A glyph's rows in flash, with the leftmost pixel in bit 15.
+  block:
+    let font = f
+    let first = glyphOffset(font, c)
+    GlyphRows.toOpenArray(first, first + font.charHeight - 1)
+
+func glyphRow*(f: FontId; c: char; row: int): uint16 =
+  ## Row `row` of the glyph for `c`: bit 15 is the leftmost pixel.
+  GlyphRows[f.glyphOffset(c) + row]

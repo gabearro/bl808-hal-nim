@@ -1,5 +1,5 @@
 import std/os
-import bl808/[wasm_migration_client, wasm_migration_wire,
+import bl808/[wasm_full_manager, wasm_migration_client, wasm_migration_wire,
   wasm_scheduler, wasm_store]
 import cps/runtime
 
@@ -182,7 +182,8 @@ var
   dropCommitReplies = 0
   rejectPrepare = false
 
-proc prepare(migration: WasmTaskMigration): WasmSchedulerResult {.nimcall.} =
+proc prepare(migration: WasmTaskMigration, _: uint32, _: FullMemoryFactory,
+             _: pointer, _: bool): WasmSchedulerResult {.nimcall.} =
   if rejectPrepare:
     return WasmSchedulerResult(status: wasmSchedInitFailed)
   when defined(wasmExtendedMigrationTest):

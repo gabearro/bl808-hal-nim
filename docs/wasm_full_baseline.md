@@ -86,6 +86,207 @@ This does not establish that the Ox64 can boot the XIP image or run it
 concurrently with M0/LP XIP. It must be exercised through a scoped harness
 test after the shared bench is free.
 
+### Typed function-reference instructions
+
+```sh
+python3 tools/run_wasm_full_baseline.py --function-references --d0-xip
+```
+
+The opt-in `-d:wasmFunctionReferences` profile adds `call_ref`,
+`return_call_ref`, `ref.as_non_null`, concrete nullable locals, and nullable
+and non-nullable function reference parameters and results to the shared
+interpreter. The validator preserves those types through calls, indexed
+blocks, branches, and returns. It treats `nofunc` as the null-only subtype.
+Recursive function groups can refer to their own members and link across
+modules by structural identity. Declared subtypes check parameter
+contravariance and result covariance. Tables support nullable and
+non-nullable function references. An explicit table initializer is evaluated
+once before active element segments are applied. It can name a function or
+read an immutable imported global. Globals also support typed function
+references. Read-only global imports allow a subtype, and mutable global
+imports require the same type. Inline typed block and select immediates remain open.
+[Core WebAssembly instruction validation](https://webassembly.github.io/spec/core/valid/instructions.html)
+[Core WebAssembly recursive types](https://webassembly.github.io/spec/core/valid/types.html#recursive-types)
+[Core WebAssembly table binary format](https://webassembly.github.io/spec/core/binary/modules.html#table-section)
+[Core WebAssembly global type matching](https://webassembly.github.io/spec/core/valid/matching.html#global-types)
+
+The gate checks the WAST corpus with `wasm-tools` and runs valid, trapping,
+invalid, malformed, and incompatible-link inputs on the host. The host
+rejects forged, null, and wrong-type arguments to a non-nullable function
+reference parameter. It freezes a tail-replaced guest frame and restores it
+against the original entry export. Buffered and streamed captures reject
+invalid table and global references. The receiver revalidates them before
+restoring them. A smaller module from the same corpus exercises explicit
+table initialization, typed parameters, results, and locals, `call_ref`,
+and 1,024 recursive `return_call_ref` steps across execution slices through
+the full manager on RV32, RV64, and RV32E QEMU. Native builds include the
+same probe. The D0 DRAM build is available alongside the optional XIP build.
+
+| Core | Native `.data` | Native `.bss` | QEMU heap peak | QEMU stack used |
+| --- | ---: | ---: | ---: | ---: |
+| M0 RV32 | 196 B | 2,340 B | 15,168 B | 4,160 B |
+| D0 RV64, DRAM | 392 B | 4,600 B | 52,768 B | 7,184 B |
+| LP RV32E | 196 B | 2,212 B | 9,680 B | 3,952 B |
+
+The LP probe keeps the 16 KiB writable layout and 4 KiB stack reservation.
+The combined host corpus exceeded the LP probe's heap during decode, so
+the LP-sized module carries the typed local and call cases and the host
+executes the separate null-trap module and the invalid binary cases.
+
+The native probe writes `0x57465200` on success to the baseline status
+address for its core, with capabilities at offset 4 and peak heap bytes
+at offset 8. The status and actual flash execution require an Ox64 run.
+
+### Shared core function types, tables, and globals
+
+```sh
+python3 tools/run_wasm_full_baseline.py --shared-core-types --function-references --d0-xip
+```
+
+`-d:wasmSharedCoreTypes` adds shared core function types, shared
+`func`/`nofunc` references, shared function reference tables, and shared
+scalar and function-reference globals to the opt-in typed interpreter. It uses the
+shared-everything threads draft at revision `de560922268ca89fd3303776c5c1b8f123da2aec`.
+Sharedness participates in recursive type equality, subtyping, store
+imports, and embedding arguments. Shared bodies require shared reference
+locals and shared targets for direct and reference calls. The validator
+requires shared tables and reference globals to use shared reference types.
+Shared functions can access shared tables, global cells, and element
+segments. Table and global imports preserve store identity and must agree
+on sharedness.
+[Pinned shared-everything threads draft](https://github.com/WebAssembly/shared-everything-threads/blob/de560922268ca89fd3303776c5c1b8f123da2aec/proposals/shared-everything-threads/Overview.md#shared-annotations)
+
+The host gate runs the shared function, table, and global corpora against
+`wasm-tools` and the interpreter. It also checks the draft's isolation
+rules and a passive segment with its sharedness bit. The native and QEMU
+probes run shared locals, reference calls, sliced tail recursion, table
+initialization and updates, and shared global reads and writes. A separate
+small guest runs an i64 atomic add with one instruction per execution
+slice on all three CPU profiles. The native probe reports
+`0x57534300` through the baseline status address. M0, D0 DRAM, D0 XIP,
+and LP builds link. Physical execution remains pending.
+
+| Profile | Native `.data` | Native `.bss` | QEMU heap peak | QEMU stack used |
+| --- | ---: | ---: | ---: | ---: |
+| M0 RV32 | 196 B | 2,340 B | 15,248 B | 4,160 B |
+| D0 RV64, DRAM | 392 B | 4,600 B | 53,000 B | 7,024 B |
+| LP RV32E | 196 B | 2,212 B | 9,760 B | 3,960 B |
+
+The LP probe retains the 16 KiB writable layout and 4 KiB stack reservation.
+The QEMU stack high-water leaves 136 bytes in that reservation.
+
+The interpreter executes shared functions, tables, and globals in one store.
+The opt-in profile supports integer global atomic get, set, add, subtract,
+and, or, xor, exchange, and compare-exchange. Each operation runs within
+one dispatch in the store's serialized executor. The JIT compilers leave
+these instructions to the interpreter.
+
+The host corpus checks i32 wraparound, i64 operations, success and failure
+of compare-exchange, and rejection of invalid types, immutable writes,
+and inaccessible globals. The pinned encoding uses `0x11` for
+acquire-release read-modify-write. `wasm-tools 1.263.0` reads a single ordering
+nibble for these operations, so the gate checks sequentially consistent
+read-modify-write with the tool and generates the draft-format
+acquire-release guest separately.
+[Pinned atomic binary encoding](https://github.com/WebAssembly/shared-everything-threads/blob/de560922268ca89fd3303776c5c1b8f123da2aec/proposals/shared-everything-threads/Overview.md#memory-orderings)
+[wasmparser 1.263.0 atomic reader](https://github.com/bytecodealliance/wasm-tools/blob/v1.263.0/crates/wasmparser/src/binary_reader.rs)
+
+Portable snapshots reject shared tables, globals, memories, and segments
+until there is a transferable backing. Shared v128 global instructions
+require SIMD support. Cross-core storage and ordering, GC-reference
+atomics, and preemptive execution remain open. The
+pinned draft describes thread-local globals and leaves their binary
+encoding unspecified.
+[Pinned draft binary format and thread-local globals](https://github.com/WebAssembly/shared-everything-threads/blob/de560922268ca89fd3303776c5c1b8f123da2aec/proposals/shared-everything-threads/Overview.md#thread-local-storage-tls)
+
+### Shared linear memory and data segments
+
+The same `--shared-core-types` command builds the shared-memory probe.
+The validator requires an explicit maximum for shared memory and checks
+both memory indices of `memory.copy`. A shared function can use shared
+memory and shared data segments. The pinned draft encodes data segment
+sharedness in bit 3 of the mode field. The test runner applies that bit
+to toolchain-generated active and passive data segments.
+[Threads memory type and encoding](https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md#shared-linear-memory)
+[Pinned shared data encoding](https://github.com/WebAssembly/shared-everything-threads/blob/de560922268ca89fd3303776c5c1b8f123da2aec/proposals/shared-everything-threads/Overview.md#types-1)
+
+Core modules within one store can import the same shared memory. The
+import checks sharedness and the memory's current size, including growth
+by the provider. A raw host memory value cannot represent this shared
+identity in the current embedding API. The host and native probe use the
+CRC-checked image loader and existing chunked memory backend with two
+512-byte resident chunks. They cover growth, a store across a 64 KiB
+guest page boundary, overlapping copy, fill, and active and passive data
+initialization. The native status code is `0x57534D00`.
+
+| Shared-memory profile | Native `.data` | Native `.bss` | QEMU heap peak | QEMU stack used |
+| --- | ---: | ---: | ---: | ---: |
+| M0 RV32 | 196 B | 2,340 B | 11,696 B | 4,240 B |
+| D0 RV64, DRAM | 392 B | 4,600 B | 47,136 B | 7,136 B |
+| LP RV32E | 196 B | 2,212 B | 6,216 B | 4,008 B |
+
+The LP probe uses the 16 KiB writable layout and leaves 88 bytes in its
+4,096-byte stack reservation at the observed QEMU high-water mark. The
+fixture uses resident SRAM chunks on each CPU profile.
+Physical cross-core access, backing I/O, and memory ordering require
+their own verification.
+
+The shared interpreter implements sequentially consistent loads, stores,
+and read-modify-write operations for full-width and subword accesses,
+along with `atomic.fence`. It validates natural alignment, enforces bounds
+and effective address alignment at runtime, and zero-extends subword
+results. These instructions run in the
+serialized store executor for both shared and ordinary memory. With
+multi-memory enabled, each instruction uses its specified memory index.
+The JIT leaves these operations to the interpreter. Ordering across
+physical cores remains open.
+[WebAssembly threads atomic memory accesses](https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md#atomic-memory-accesses)
+
+The same gate checks the atomic corpus with `wasm-tools` and the host VM.
+The one-frame host case forces an eviction at the write and a page-in at
+the read of separate read-modify-write operations. It injects a failed
+backing read, then verifies exact restored values and fuel accounting.
+The native probe uses two resident chunks on opposite sides of a 64 KiB
+guest page boundary. Every naturally aligned access fits one chunk.
+
+### Cooperative atomic wait and notify
+
+`python3 tools/run_wasm_full_baseline.py --atomic-wait --d0-xip` checks
+`memory.atomic.wait32`, `memory.atomic.wait64` and `memory.atomic.notify`
+with `wasm-tools` and the opt-in interpreter. A value mismatch returns 1,
+a timeout returns 2, and a notification returns 0 to an enrolled waiter.
+The serialized store keeps a FIFO keyed by memory identity and byte
+offset. A notification can wake either wait width at that address. A cold
+chunk is read before enrollment, so a notification counts only actual
+waiters. The interpreter charges a parked wait once. By default a store
+admits four parked waits on LP and 16 on larger profiles.
+[WebAssembly wait and notify semantics](https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md#wait-and-notify-operators)
+[WebAssembly wait queue ordering](https://webassembly.github.io/threads/core/exec/relaxed.html)
+
+An actual wait parks a sliced guest arena. The BL808 tickless driver
+supplies the store clock and rearms on a finite timeout. An embedding
+with its own executor uses `setWasmAtomicClock` or
+`setComponentAtomicClock` for finite waits. The host test runs the
+kernel's timed-hook adapter with a controlled clock and verifies that a
+5,000 ns wait wakes after five ticks at 1 MHz. Hard slots reject these
+instructions. Parked waits stay with the owning store and cannot be
+captured for migration. `supportsAtomicWait` reports compiled support,
+also recorded in bit 7 of the smoke capability word. Timer delivery on
+the board and memory shared by different physical cores require separate
+validation.
+
+The native probe passes when one arena parks in `wait64` and a second
+arena wakes it. It loads both exports through the CRC-checked full VM
+image path and uses a 512-byte chunked backend. LP's atomic-wait probe
+reserves 4,608 stack bytes within its 16 KiB writable layout. Its native
+status code is `0x57415700`.
+
+| Atomic-wait profile | Native `.data` | Native `.bss` | QEMU heap peak | QEMU stack used |
+| --- | ---: | ---: | ---: | ---: |
+| M0 RV32 | 224 B | 2,340 B | 11,136 B | 4,272 B |
+| D0 RV64, DRAM | 448 B | 4,600 B | 46,232 B | 7,248 B |
+| LP RV32E | 224 B | 2,212 B | 5,544 B | 4,104 B |
+
 The opt-in `-d:wasmChunkedMemory` runtime path accepts a per-memory factory
 for 4 KiB resident chunks while preserving WebAssembly's 64 KiB guest pages.
 `src/cps/wasm/linear_memory.nim` bounds guest offsets, enforces page and

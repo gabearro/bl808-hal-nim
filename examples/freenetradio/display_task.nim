@@ -101,7 +101,7 @@ proc flushBegin(s: var Screen) =
   s.flushStartMs = nowMs()
   s.oled.flushStart(s.fb.buf)
 
-proc flushPending(s: Screen): bool =
+proc flushPending(s: var Screen): bool =
   not s.oled.flushDone() and elapsedMs(s.flushStartMs, nowMs()) < FlushTimeoutMs
 
 proc flushEnd(s: var Screen) =

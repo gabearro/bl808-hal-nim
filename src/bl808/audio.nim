@@ -30,6 +30,9 @@ const
 # AUDAC (Audio DAC) register offsets — base 0x20055000
 # =============================================================================
 const
+  AudioRxFifoCtrl*  = AudioBase + 0x80'u  # Audio codec RX FIFO control
+  AudioRxFifoSts*   = AudioBase + 0x84'u  # Audio codec RX FIFO status
+  AudioRxFifoData*  = AudioBase + 0x88'u  # Audio codec RX FIFO read data
   AudacCtrl0*       = AudacBase + 0x00'u  # DAC enable, ITF enable, clk gate, PWM mode
   AudacStatus*      = AudacBase + 0x04'u  # Busy, mute done, interrupts
   AudacS0*          = AudacBase + 0x08'u  # Volume, ramp rate, ZCD, mute

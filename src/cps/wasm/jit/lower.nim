@@ -396,6 +396,12 @@ proc lowerInstr(ctx: var LowerCtx, instr: Instr) =
     let localIdx = ctx.numOrigLocals + globalIdx
     let val = ctx.pop()
     ctx.emitLocalSetValue(localIdx, val)
+  of opGlobalAtomicGet .. opGlobalAtomicCmpXchg:
+    raise newException(ValueError, "global atomics require interpreter execution")
+  of opMemoryAtomic, opAtomicFence, opMemoryAtomicNotify, opMemoryAtomicWait32, opMemoryAtomicWait64:
+    raise newException(ValueError, "linear-memory atomics require interpreter execution")
+  of opCallRef, opReturnCallRef, opRefAsNonNull:
+    raise newException(ValueError, "typed function references require interpreter execution")
 
   # --- Parametric ---
   of opDrop:

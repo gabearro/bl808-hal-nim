@@ -17,6 +17,9 @@ when defined(bl808WasmFullScheduler):
   when defined(wasmChunkedMemory):
     import cps/wasm/linear_memory
 
+const FullSchedulerAtomicWait* = defined(bl808WasmFullScheduler) and
+  defined(wasmSharedCoreTypes) and defined(wasmAtomicWait)
+
 const
   WasmSchedulerMaxTasks* {.intdefine.} = 8
   WasmSchedulerDefaultFuel* {.intdefine.} = 64'u32
@@ -63,6 +66,7 @@ type
     wasmTaskBlockedEnclave
     wasmTaskBlockedMemory
     wasmTaskMigrating
+    wasmTaskBlockedAtomic
 
   WasmTaskMigrationStatus* = enum
     wasmMigrationOk
@@ -187,6 +191,26 @@ var
   tasks: array[WasmSchedulerMaxTasks, WasmSchedulerTask]
   nextTaskId = 1'u32
   schedulerDebugHook: proc(stage: uint32) {.nimcall.}
+
+when FullSchedulerAtomicWait:
+  type WasmSchedulerAtomicTicks* = proc(ns: uint64): uint64 {.nimcall.}
+  var schedulerAtomicClock: WasmAtomicClock
+  when defined(bl808WasmRtPolicy):
+    var schedulerAtomicTicks: WasmSchedulerAtomicTicks
+
+  proc setWasmSchedulerAtomicClock*(clock: WasmAtomicClock,
+      durationToTicks: WasmSchedulerAtomicTicks = nil) =
+    ## Configure once at boot with the timed scheduler's clock domain.
+    schedulerAtomicClock = clock
+    when defined(bl808WasmRtPolicy):
+      schedulerAtomicTicks = durationToTicks
+
+proc schedulerTaskRunnable(task: var WasmSchedulerTask): bool =
+  if not task.used: return false
+  when FullSchedulerAtomicWait:
+    if task.state == wasmTaskBlockedAtomic:
+      return task.fullHandle.vm[].executionRunnable(task.fullContinuation)
+  task.state in {wasmTaskReady, wasmTaskYielded}
 
 when defined(bl808WasmRtPolicy):
   var
@@ -516,13 +540,16 @@ when defined(bl808WasmFullScheduler):
     if migration.staged.hasPortableStaging(): migration.staged
     else: portableInputView(migration.bytes)
 
-  proc freezeWasmTaskMigration(index: int): WasmTaskMigrationStatus =
+  proc freezeWasmTaskMigration(index: int, brokerManaged = false): WasmTaskMigrationStatus =
     if index < 0: return wasmMigrationNoTask
     let task = addr tasks[index]
     if not task[].full or task[].state != wasmTaskYielded or
         task[].migrationRole != wmrNone:
       return wasmMigrationBadState
-    if task[].portableMigrationDisabled or task[].slot < 0 or task[].fullHandle.vm == nil or
+    if (if brokerManaged:
+          not task[].portableMigrationDisabled or not task[].retainTrappedTask
+        else: task[].portableMigrationDisabled) or
+        task[].slot < 0 or task[].fullHandle.vm == nil or
         task[].fullContinuation.instructions != task[].fuelUsed.uint64:
       return wasmMigrationUnsupported
     when defined(bl808WasmRtPolicy):
@@ -534,9 +561,10 @@ when defined(bl808WasmFullScheduler):
     wasmMigrationOk
 
   proc captureTaskMigration(id: uint32, maxBytes: int, staging: WasmPortableStaging,
-                             allowAsync: static bool): WasmTaskMigration =
+                             allowAsync: static bool,
+                             brokerManaged = false): WasmTaskMigration =
     let index = findTaskIndex(id)
-    result.status = freezeWasmTaskMigration(index)
+    result.status = freezeWasmTaskMigration(index, brokerManaged)
     if result.status != wasmMigrationOk: return
     let task = addr tasks[index]
     defer:
@@ -577,10 +605,16 @@ when defined(bl808WasmFullScheduler):
     ## Freeze the source before initiating any asynchronous snapshot reads.
     captureTaskMigration(id, maxBytes, staging, true)
 
+  proc beginBrokerWasmTaskMigrationCapture*(id: uint32,
+      maxBytes: int, staging: WasmPortableStaging): WasmTaskMigration =
+    ## The broker client owns the suspended task until retirement.
+    captureTaskMigration(id, maxBytes, staging, true, brokerManaged = true)
+
   when defined(wasmStreamMigration):
-    proc beginWasmTaskMigrationStream*(id: uint32, maxBytes: int): WasmTaskMigration =
+    proc beginWasmTaskMigrationStream*(id: uint32, maxBytes: int,
+                                      brokerManaged = false): WasmTaskMigration =
       let index = findTaskIndex(id)
-      result.status = freezeWasmTaskMigration(index)
+      result.status = freezeWasmTaskMigration(index, brokerManaged)
       if result.status != wasmMigrationOk: return
       let task = addr tasks[index]
       new(task[].migrationStream)
@@ -752,7 +786,8 @@ when defined(bl808WasmFullScheduler):
 
   proc prepareFullWasmMigrationSlot*(migration: sink WasmTaskMigration,
       maxMemoryPages = 0'u32, memoryFactory: FullMemoryFactory = nil,
-      memoryFactoryContext: pointer = nil, allowPagedRestore = false): WasmSchedulerResult =
+      memoryFactoryContext: pointer = nil, allowPagedRestore = false,
+      enforceMemoryQuota = false): WasmSchedulerResult =
     ## Open the receiver's local CRC-checked slot and verify its module
     ## digest before creating a dormant task. It cannot run until activated.
     ## Keep a borrowed staging region immutable until prepare finishes or is canceled.
@@ -764,7 +799,8 @@ when defined(bl808WasmFullScheduler):
         slot: slotLabel)
     var handle: FullWasmProgramHandle
     let openErr = handle.openFullWasmProgramSlot(migration.slot, maxMemoryPages,
-      memoryFactory, memoryFactoryContext, restoreSnapshot = true)
+      memoryFactory, memoryFactoryContext, restoreSnapshot = true,
+      admission = FullWasmAdmission(enforceMemoryQuota: enforceMemoryQuota))
     if openErr != wasmManagerOk:
       return WasmSchedulerResult(status: wasmSchedOpenFailed,
         managerError: openErr, slot: slotLabel)
@@ -773,7 +809,8 @@ when defined(bl808WasmFullScheduler):
   proc prepareFullWasmMigrationImage*(base: ptr UncheckedArray[byte],
       len: uint32, migration: sink WasmTaskMigration,
       maxMemoryPages = 0'u32, memoryFactory: FullMemoryFactory = nil,
-      memoryFactoryContext: pointer = nil, allowPagedRestore = false): WasmSchedulerResult =
+      memoryFactoryContext: pointer = nil, allowPagedRestore = false,
+      enforceMemoryQuota = false): WasmSchedulerResult =
     ## Staged-image form for host tests and approved image delivery. The
     ## same staging lifetime applies to a pending prepare.
     if migration.slot > high(int32).uint32:
@@ -784,7 +821,8 @@ when defined(bl808WasmFullScheduler):
         slot: slotLabel)
     var handle: FullWasmProgramHandle
     let openErr = handle.openFullWasmProgramImage(base, len, maxMemoryPages,
-      memoryFactory, memoryFactoryContext, restoreSnapshot = true)
+      memoryFactory, memoryFactoryContext, restoreSnapshot = true,
+      admission = FullWasmAdmission(enforceMemoryQuota: enforceMemoryQuota))
     if openErr != wasmManagerOk:
       return WasmSchedulerResult(status: wasmSchedOpenFailed,
         managerError: openErr, slot: slotLabel)
@@ -815,7 +853,20 @@ when defined(bl808WasmFullScheduler):
         result = snapshot(task[], wasmSchedBackingFailed)
         clearSlotTeardown(index)
 
-  proc activateWasmTaskMigration*(id: uint32): WasmTaskMigrationStatus =
+  proc preparedWasmMigrationEntryMatches*(id: uint32, exportName: string): bool =
+    let index = findTaskIndex(id)
+    if index < 0: return false
+    let task = addr tasks[index]
+    if not task[].full or task[].state != wasmTaskMigrating or
+        task[].migrationRole != wmrDestination or task[].fullHandle.vm == nil:
+      return false
+    try:
+      task[].fullHandle.fullExportFuncAddr(exportName) == task[].fullFuncAddr
+    except CatchableError:
+      false
+
+  proc activateWasmTaskMigration*(id: uint32,
+                                  brokerOwnerCore = 0'u8): WasmTaskMigrationStatus =
     ## Call only after the source has irreversibly retired ownership.
     let index = findTaskIndex(id)
     if index < 0: return wasmMigrationNoTask
@@ -824,6 +875,10 @@ when defined(bl808WasmFullScheduler):
       return wasmMigrationBadState
     when defined(wasmChunkedMemory):
       if tasks[index].migrationRestore != nil: return wasmMigrationBadState
+    if brokerOwnerCore != 0:
+      tasks[index].portableMigrationDisabled = true
+      tasks[index].retainTrappedTask = true
+      tasks[index].ownerCore = brokerOwnerCore
     tasks[index].migrationRole = wmrNone
     tasks[index].state = wasmTaskYielded
     notifyWasmRtScheduleChanged()
@@ -859,6 +914,9 @@ when defined(bl808WasmFullScheduler):
     var values: seq[WasmValue]
     var trapped = false
     try:
+      when FullSchedulerAtomicWait:
+        if tasks[index].fullContinuation.status != wesAtomicBlocked:
+          tasks[index].fullHandle.vm[].setWasmAtomicClock(schedulerAtomicClock)
       values = tasks[index].fullHandle.vm[].executeSlice(
         tasks[index].fullFuncAddr, tasks[index].fullArgs,
         tasks[index].fullContinuation, slice,
@@ -897,6 +955,10 @@ when defined(bl808WasmFullScheduler):
     of wesMemoryBlocked:
       tasks[index].state = wasmTaskBlockedMemory
       inc tasks[index].yields
+      tasks[index].stalledSlices = 0
+    of wesAtomicBlocked:
+      tasks[index].state = wasmTaskBlockedAtomic
+      if consumed != 0: inc tasks[index].yields
       tasks[index].stalledSlices = 0
     else:
       tasks[index].state = wasmTaskTrapped
@@ -946,6 +1008,9 @@ proc resumeWasmTaskImpl(id, fuel: uint32, deadlineClock: WasmSchedulerClock,
       wasmTaskBlockedTimer, wasmTaskBlockedEnclave, wasmTaskBlockedMemory,
       wasmTaskMigrating}:
     return snapshot(tasks[index], wasmSchedBadState)
+  when FullSchedulerAtomicWait:
+    if tasks[index].state == wasmTaskBlockedAtomic and not tasks[index].schedulerTaskRunnable():
+      return snapshot(tasks[index], wasmSchedBadState)
   when defined(bl808WasmFullScheduler):
     if tasks[index].full:
       return resumeFullWasmTask(index, fuel, deadlineClock, deadlineTick)
@@ -1003,7 +1068,7 @@ proc runWasmScheduler*(fuelPerTask = WasmSchedulerDefaultFuel,
     for i in 0 ..< tasks.len:
       if count >= maxResumes:
         break
-      if tasks[i].used and tasks[i].state in {wasmTaskReady, wasmTaskYielded}:
+      if tasks[i].schedulerTaskRunnable():
         when defined(bl808WasmRtPolicy):
           if rtConfigured and rtPolicy.hasWasmRtJob(tasks[i].id): continue
         discard resumeWasmTask(tasks[i].id, fuelPerTask)
@@ -1188,7 +1253,8 @@ when defined(bl808WasmRtPolicy):
           for instruction in function.code[].code:
             if instruction.op in {opMemoryGrow, opMemoryInit, opDataDrop,
                 opMemoryCopy, opMemoryFill, opTableInit, opElemDrop,
-                opTableCopy, opTableGrow, opTableFill}:
+                opTableCopy, opTableGrow, opTableFill, opMemoryAtomicWait32,
+                opMemoryAtomicWait64, opMemoryAtomicNotify}:
               return wrUnsafeHardSlot
         for memory in vm[].store.mems:
           when defined(wasmChunkedMemory):
@@ -1206,8 +1272,8 @@ when defined(bl808WasmRtPolicy):
     rtPolicy.wasmRtTelemetry()
 
   proc collectRtRunnable(outIds: var array[WasmSchedulerMaxTasks, uint32]): int =
-    for task in tasks:
-      if task.used and task.state in {wasmTaskReady, wasmTaskYielded}:
+    for task in tasks.mitems:
+      if task.schedulerTaskRunnable():
         outIds[result] = task.id
         inc result
 
@@ -1222,10 +1288,20 @@ when defined(bl808WasmRtPolicy):
     if not rtConfigured: return 0
     var runnable: array[WasmSchedulerMaxTasks, uint32]
     let count = collectRtRunnable(runnable)
-    if count == 0: rtPolicy.nextWasmRtWakeTick([], now, fallbackMaxSliceTicks)
-    else:
-      rtPolicy.nextWasmRtWakeTick(runnable.toOpenArray(0, count - 1),
+    result = if count == 0: rtPolicy.nextWasmRtWakeTick([], now, fallbackMaxSliceTicks)
+      else: rtPolicy.nextWasmRtWakeTick(runnable.toOpenArray(0, count - 1),
         now, fallbackMaxSliceTicks)
+    when FullSchedulerAtomicWait:
+      if schedulerAtomicTicks == nil: return
+      for task in tasks.mitems:
+        if not task.used or task.state != wasmTaskBlockedAtomic: continue
+        let remaining = task.fullHandle.vm[].executionAtomicRemainingNs(task.fullContinuation)
+        if remaining == uint64.high: continue
+        if remaining == 0 and count > 0 and task.id in runnable.toOpenArray(0, count - 1):
+          continue
+        let delay = max(1'u64, schedulerAtomicTicks(remaining))
+        let wake = now + min(delay, uint64.high - now)
+        if result == 0 or wake < result: result = wake
 
   proc runWasmSchedulerRt*(clock: proc(): uint64 {.nimcall.},
                            fallbackMaxSliceTicks: uint64,
@@ -1259,7 +1335,8 @@ when defined(bl808WasmRtPolicy):
       let isHard = rtPolicy.wasmRtClass(id) == wrHard
       if action == wrStopJob or (isHard and taskResult.state in {
           wasmTaskBlockedHttp, wasmTaskBlockedSd, wasmTaskBlockedIpc,
-          wasmTaskBlockedTimer, wasmTaskBlockedEnclave, wasmTaskBlockedMemory}):
+          wasmTaskBlockedTimer, wasmTaskBlockedEnclave, wasmTaskBlockedMemory,
+          wasmTaskBlockedAtomic}):
         discard stopWasmTask(id, wasmSchedQuotaExceeded)
       elif taskResult.state in {wasmTaskExited, wasmTaskTrapped, wasmTaskKilled}:
         rtPolicy.removeWasmRtJob(id)

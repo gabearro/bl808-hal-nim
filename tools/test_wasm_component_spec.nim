@@ -13,7 +13,7 @@ proc concatCaseIndex(exportName, label: string): uint32 =
   doAssert index >= 0
   index.uint32
 
-proc toComponent(node: JsonNode, exportName = ""): ComponentValue =
+proc toComponent(node: JsonNode, exportName = "", tupleDepth = 0): ComponentValue =
   case node["type"].getStr()
   of "bool": componentValue(cpBool, node["value"].getBool().uint64)
   of "u8": componentValue(cpU8, parseBiggestUInt(node["value"].getStr()))
@@ -37,9 +37,15 @@ proc toComponent(node: JsonNode, exportName = ""): ComponentValue =
     componentValue(cpChar, scalars[0].uint64)
   of "list":
     let items = node["value"]
-    # The pinned cases use the specialized numeric ABI only for u32 lists.
+    if exportName == "map-str-map" and tupleDepth == 2:
+      var bytes: seq[byte]
+      for item in items:
+        doAssert item["type"].getStr() == "u8"
+        bytes.add(parseBiggestUInt(item["value"].getStr()).byte)
+      return componentBytes(bytes)
     if (items.len > 0 and items[0]["type"].getStr() == "u32") or
-        exportName in ["concat-u32s", "scores", "f"]:
+        exportName in ["concat-u32s", "scores", "f"] or
+        (exportName == "map-str-list" and tupleDepth == 1):
       var words: seq[uint32]
       for item in items:
         doAssert item["type"].getStr() == "u32"
@@ -47,13 +53,20 @@ proc toComponent(node: JsonNode, exportName = ""): ComponentValue =
       return componentU32List(words)
     var values: seq[ComponentValue]
     for item in items:
-      values.add(toComponent(item, exportName))
+      values.add(toComponent(item, exportName, tupleDepth))
     componentList(values)
   of "tuple":
     var fields: seq[ComponentValue]
     for item in node["value"]:
-      fields.add(toComponent(item, exportName))
+      fields.add(toComponent(item, exportName, tupleDepth + 1))
     componentTuple(fields)
+  of "map":
+    var entries: seq[ComponentValue]
+    for entry in node["value"]:
+      doAssert entry.len == 2
+      entries.add(componentTuple([
+        toComponent(entry[0], exportName), toComponent(entry[1], exportName)]))
+    componentMap(entries)
   of "record":
     var fields: seq[ComponentValue]
     for item in node["value"]:
@@ -81,9 +94,13 @@ proc toComponent(node: JsonNode, exportName = ""): ComponentValue =
     doAssert index >= 0
     componentEnum(index.uint32)
   of "flags":
+    let labels = if exportName == "junk-to-f9":
+      @["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9"]
+    else:
+      @["a", "b", "c"]
     var bits = 0'u32
     for item in node["value"]:
-      let index = ["a", "b", "c"].find(item.getStr())
+      let index = labels.find(item.getStr())
       doAssert index >= 0
       bits = bits or (1'u32 shl index)
     componentFlags(bits)
@@ -93,9 +110,26 @@ proc toComponent(node: JsonNode, exportName = ""): ComponentValue =
 proc loadComponent(filename: string): ComponentPlan =
   decodeComponent(cast[seq[byte]](readFile(filename)))
 
+proc invokeForSpec(instance: ComponentInstance, name: string,
+    args: openArray[ComponentValue]): seq[ComponentValue] =
+  when defined(wasmComponentAsyncCallbacks):
+    if instance.hasCallbackExport(name):
+      let call = instance.beginCallback(name, args)
+      for _ in 0 ..< 1024:
+        let state = call.pollCallback()
+        if call.callbackResultReady(): return call.takeCallbackResult()
+        if state == ccsUnresolved: break
+      raise newException(ValueError, "WAST async result did not resolve")
+  instance.invoke(name, args)
+
 proc matches(actual, expected: ComponentValue): bool =
-  actual.kind == expected.kind and actual.bits == expected.bits and
-    actual.text == expected.text
+  if actual.kind != expected.kind or actual.bits != expected.bits or
+      actual.text != expected.text or actual.bytes != expected.bytes or
+      actual.caseIndex != expected.caseIndex or actual.fields.len != expected.fields.len:
+    return false
+  for i, field in actual.fields:
+    if not matches(field, expected.fields[i]): return false
+  true
 
 proc main() =
   doAssert paramCount() == 1
@@ -116,6 +150,16 @@ proc main() =
       of "instantiate":
         discard instantiateComponent(loadComponent(file))
         inc counts[0]
+      of "assert_uninstantiable":
+        let plan = loadComponent(file)
+        var trapped = false
+        try:
+          discard instantiateComponent(plan)
+        except ComponentError as error:
+          doAssert item["detail"].getStr() in error.msg, error.msg
+          trapped = true
+        doAssert trapped, "component start did not trap"
+        inc counts[3]
       of "reject":
         let detail = item["detail"].getStr()
         var rejected = false
@@ -139,16 +183,16 @@ proc main() =
         for value in action["args"]:
           args.add(value.toComponent(exportName))
         if item["kind"].getStr() == "assert_return":
-          let actual = instance.invoke(exportName, args)
+          let actual = instance.invokeForSpec(exportName, args)
           let expected = item["expected"]
           doAssert actual.len == expected.len
           for i, resultValue in actual:
-            doAssert matches(resultValue, expected[i].toComponent())
+            doAssert matches(resultValue, expected[i].toComponent(exportName))
           inc counts[2]
         else:
           var trapped = false
           try:
-            discard instance.invoke(exportName, args)
+            discard instance.invokeForSpec(exportName, args)
           except ComponentError as error:
             doAssert item["detail"].getStr() in error.msg, error.msg
             trapped = true

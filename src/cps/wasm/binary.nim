@@ -27,8 +27,8 @@ proc initBinaryReader*(data: openArray[byte]): BinaryReader =
   result.data = @data
   result.size = data.len
 
-proc viewBinaryReader(data: openArray[byte]): BinaryReader =
-  ## Only used within decodeModule, while its caller's buffer is alive.
+proc viewBinaryReader*(data: openArray[byte]): BinaryReader =
+  ## Use only while the caller's buffer is alive and its address is stable.
   result.size = data.len
   if data.len > 0:
     result.view = cast[ptr UncheckedArray[byte]](unsafeAddr data[0])
@@ -43,10 +43,13 @@ proc atEnd*(r: BinaryReader): bool =
 proc remaining*(r: BinaryReader): int =
   r.size - r.pos
 
-proc readByte*(r: var BinaryReader): byte =
+proc peekByte*(r: var BinaryReader): byte =
   if r.pos >= r.size:
     decodeError("unexpected end of binary data")
-  result = r.dataAt(r.pos)[]
+  r.dataAt(r.pos)[]
+
+proc readByte*(r: var BinaryReader): byte =
+  result = r.peekByte()
   inc r.pos
 
 proc readBytes*(r: var BinaryReader, n: int): seq[byte] =
@@ -152,6 +155,31 @@ proc readValType*(r: var BinaryReader): ValType =
   of 0x6F: result = vtExternRef
   else: decodeError("unknown value type: 0x" & b.toHex(2))
 
+when defined(wasmFunctionReferences):
+  proc readFunctionHeapType*(r: var BinaryReader): tuple[lane: ValType, index: uint32, shared: bool] =
+    let shared = when defined(wasmSharedCoreTypes): r.peekByte() == 0x65 else: false
+    if shared: discard r.readByte()
+    case r.peekByte()
+    of 0x70:
+      discard r.readByte()
+      return (vtFuncRef, 0'u32, shared)
+    of 0x6f:
+      if shared: decodeError("shared extern references are unavailable")
+      discard r.readByte()
+      return (vtExternRef, 0'u32, false)
+    of 0x73:
+      discard r.readByte()
+      return (vtFuncRef, WasmNoFuncHeapTag, shared)
+    else: discard
+    if shared: decodeError("invalid shared abstract heap type")
+    # Abstract heap types are single-byte codes. Only a concrete index
+    # uses s33, and its internal tag must leave room for the nofunc tag.
+    let start = r.pos
+    let heapType = r.readS64()
+    if r.pos - start > 5 or heapType < 0 or heapType >= WasmNoFuncHeapTag.int64 - 1:
+      decodeError("invalid or unsupported reference heap type")
+    (vtFuncRef, heapType.uint32 + 1, false)
+
 proc readBlockType*(r: var BinaryReader): BlockType =
   # Block type: 0x40 = empty, valtype byte, or s33 type index
   if r.atEnd(): decodeError("missing block type")
@@ -175,22 +203,140 @@ proc readBlockType*(r: var BinaryReader): BlockType =
       return BlockType(kind: btkTypeIdx, typeIdx: index)
   decodeError("block type s33 overflow")
 
-proc readFuncType*(r: var BinaryReader): FuncType =
+when defined(wasmFunctionReferences):
+  proc readSignatureLane(r: var BinaryReader, prior: openArray[FuncType],
+                         groupCount: int): tuple[lane: ValType, reference: CoreReferenceType] =
+    let prefix = r.peekByte()
+    if prefix notin [0x63'u8, 0x64'u8, 0x73'u8, 0x65'u8]:
+      return (r.readValType(), CoreReferenceType())
+    if prefix in [0x63'u8, 0x64'u8]: discard r.readByte()
+    let heapType = r.readFunctionHeapType()
+    let tag = heapType.index
+    result.lane = heapType.lane
+    result.reference.nonNull = prefix == 0x64
+    result.reference.member = tag
+    when defined(wasmSharedCoreTypes): result.reference.sharedAbstract = heapType.shared
+    if tag != 0 and tag != WasmNoFuncHeapTag:
+      let index = tag.uint64 - 1
+      if index >= prior.len.uint64 + groupCount.uint64:
+        decodeError("unknown core function heap type")
+      if index < prior.len.uint64:
+        let definition = prior[index.int].definition
+        if definition == nil: decodeError("reference heap type must name a core function type")
+        result.reference.member = definition.member.uint32 + 1
+        result.reference.group = definition.group
+      else:
+        result.reference.member = (index - prior.len.uint64).uint32 + 1
+
+proc readFuncType*(r: var BinaryReader, prior: openArray[FuncType] = [],
+                   groupCount = 0): FuncType =
+  when defined(wasmSharedCoreTypes):
+    if r.peekByte() == 0x65:
+      discard r.readByte()
+      result.shared = true
   let tag = r.readByte()
   if tag != 0x60:
     decodeError("expected func type tag 0x60, got 0x" & tag.toHex(2))
   let paramCount = r.readCount()
   result.params = newSeqOfCap[ValType](paramCount.int)
-  for i in 0 ..< paramCount.int:
-    result.params.add(r.readValType())
+  template readLanes(part: untyped, count: int) =
+    for i in 0 ..< count:
+      when defined(wasmFunctionReferences):
+        let (lane, reference) = r.readSignatureLane(prior, groupCount)
+        result.part.add(lane)
+        let annotate = reference.member != 0 or reference.nonNull or
+          (when defined(wasmSharedCoreTypes): reference.sharedAbstract else: false)
+        if annotate:
+          if result.references == nil: new(result.references)
+          result.references.part.setLen(i + 1)
+          result.references.part[i] = reference
+      else:
+        result.part.add(r.readValType())
+  readLanes(params, paramCount)
   let resultCount = r.readCount()
   result.results = newSeqOfCap[ValType](resultCount.int)
-  for i in 0 ..< resultCount.int:
-    result.results.add(r.readValType())
+  readLanes(results, resultCount)
 
-proc readLimits*(r: var BinaryReader): Limits =
+proc readCoreFunctionGroup*(r: var BinaryReader, prior: openArray[FuncType],
+                            maxMembers = high(uint16).int + 1,
+                            componentTopLevel = false): seq[FuncType] =
+  ## Bind references to this group by relative index. References to an
+  ## earlier group carry that group's identity rather than a module index.
+  if componentTopLevel and r.peekByte() == 0x00:
+    discard r.readByte()
+    if r.peekByte() != 0x50: decodeError("invalid component core subtype prefix")
+  let count = if r.peekByte() == 0x4e:
+    discard r.readByte()
+    r.readCount().int
+  else: 1
+  if count > min(maxMembers, high(uint16).int + 1):
+    decodeError("core function type index-space limit")
+  if count == 0: return
+  var group = CoreFunctionGroup(members: newSeqOfCap[CoreFunctionMember](count))
+  for i in 0 ..< count:
+    var current = CoreFunctionMember(localSuper: -1)
+    var superIndex = -1
+    let tag = r.peekByte()
+    if tag in {0x4f'u8, 0x50'u8}:
+      discard r.readByte()
+      current.nonFinal = tag == 0x50
+      case r.readU32()
+      of 0: discard
+      of 1:
+        let index = r.readU32()
+        if uint64(index) >= uint64(prior.len) + uint64(i):
+          decodeError("core function supertype must precede its subtype")
+        superIndex = index.int
+      else: decodeError("core function type has multiple supertypes")
+    current.signature = r.readFuncType(prior, count)
+    if superIndex >= 0:
+      var parent: ptr CoreFunctionMember
+      if superIndex < prior.len:
+        current.outerSuper = prior[superIndex].definition
+        if current.outerSuper != nil:
+          parent = addr current.outerSuper.group.members[current.outerSuper.member.int]
+      else:
+        current.localSuper = (superIndex - prior.len).int32
+        parent = addr group.members[current.localSuper.int]
+      if parent == nil or not parent.nonFinal:
+        decodeError("core function supertype is final or unavailable")
+      when not defined(wasmFunctionReferences):
+        if not current.signature.sameCoreSignature(parent.signature):
+          decodeError("core function supertype signature mismatch")
+      if parent.depth >= 63: decodeError("core function subtype depth limit")
+      current.depth = parent.depth + 1
+    group.members.add(move current)
+  when not defined(wasmFunctionReferences):
+    if count == 1 and not group.members[0].nonFinal and group.members[0].depth == 0:
+      return @[move group.members[0].signature]
+  result = newSeqOfCap[FuncType](count)
+  for i, member in group.members:
+    var signature = member.signature
+    signature.definition = CoreFunctionDefinition(group: group, member: i.uint16)
+    result.add(move signature)
+  when defined(wasmFunctionReferences):
+    for i, member in group.members:
+      when defined(wasmSharedCoreTypes):
+        if not result[i].hasSharedCoreLanes():
+          decodeError("shared core function has an unshared parameter or result")
+      if member.depth == 0: continue
+      let super = if member.localSuper >= 0: result[member.localSuper.int] else:
+        block:
+          let definition = member.outerSuper
+          var signature = definition.group.members[definition.member.int].signature
+          signature.definition = definition
+          signature
+      if not result[i].matchesCoreSignature(super):
+        decodeError("core function supertype signature mismatch")
+
+proc readLimits*(r: var BinaryReader, allowShared = false): Limits =
   let flag = r.readByte()
-  if flag notin [0'u8, 1]: decodeError("unsupported limits flags")
+  when defined(wasmSharedCoreTypes):
+    if flag > 3 or ((flag and 2) != 0 and not allowShared):
+      decodeError("unsupported limits flags")
+    result.shared = (flag and 2) != 0
+  else:
+    if flag > 1: decodeError("unsupported limits flags")
   result.min = r.readU32()
   if (flag and 0x01) != 0:
     result.hasMax = true
@@ -200,19 +346,40 @@ proc readLimits*(r: var BinaryReader): Limits =
     result.max = 0
 
 proc readMemType*(r: var BinaryReader): MemType =
-  result.limits = r.readLimits()
+  result.limits = r.readLimits(allowShared = true)
 
-proc readTableType*(r: var BinaryReader): TableType =
-  result.elemType = r.readValType()
-  result.limits = r.readLimits()
+when defined(wasmFunctionReferences):
+  proc readTableReference*(r: var BinaryReader, types: openArray[FuncType]):
+      tuple[lane: ValType, reference: CoreReferenceType] =
+    result = r.readSignatureLane(types, 0)
+    if result.lane notin {vtFuncRef, vtExternRef}:
+      decodeError("table or element type must be a reference")
 
-proc readGlobalType*(r: var BinaryReader): GlobalType =
-  result.valType = r.readValType()
-  let m = r.readByte()
-  case m
-  of 0x00: result.mut = mutConst
-  of 0x01: result.mut = mutVar
-  else: decodeError("invalid mutability flag: 0x" & m.toHex(2))
+  proc readTableInitializerPrefix*(r: var BinaryReader): bool =
+    if r.peekByte() != 0x40: return false
+    discard r.readByte()
+    if r.readByte() != 0: decodeError("invalid table initializer reserved byte")
+    true
+
+proc readTableType*(r: var BinaryReader, types: openArray[FuncType] = []): TableType =
+  when defined(wasmFunctionReferences):
+    (result.elemType, result.elementReference) = r.readTableReference(types)
+    result.limits = r.readLimits(allowShared = true)
+  else:
+    result.elemType = r.readValType()
+    result.limits = r.readLimits()
+
+proc readGlobalType*(r: var BinaryReader, types: openArray[FuncType] = []): GlobalType =
+  when defined(wasmFunctionReferences):
+    (result.valType, result.reference) = r.readSignatureLane(types, 0)
+  else:
+    result.valType = r.readValType()
+  let flags = r.readByte()
+  const maxFlags = when defined(wasmSharedCoreTypes): 3'u8 else: 1'u8
+  if flags > maxFlags: decodeError("invalid global flags: 0x" & flags.toHex(2))
+  result.mut = Mutability(flags and 1)
+  when defined(wasmSharedCoreTypes):
+    result.shared = (flags and 2) != 0
 
 
 # ---- Block type encoding for compact Instr pad field ----
@@ -244,10 +411,43 @@ proc blockTypeToPad(bt: BlockType, pc: int, wide: var seq[WideBlockType]): uint1
 
 # ---- Instruction decoder ----
 
-proc readMemArg(r: var BinaryReader): tuple[offset: uint32, align: uint32] =
-  let align = r.readU32()
-  let offset = r.readU32()
-  result = (offset: offset, align: align)
+proc readMemArg(r: var BinaryReader): tuple[offset, align: uint32, memory: uint16] =
+  const hasMemoryIndex = 1'u32 shl 6
+  let flags = r.readU32()
+  if flags >= (hasMemoryIndex shl 1): decodeError("invalid memory argument flags")
+  result.align = flags and not hasMemoryIndex
+  if (flags and hasMemoryIndex) != 0:
+    let memory = r.readU32()
+    if memory > uint16.high.uint32: decodeError("memory index exceeds interpreter limit")
+    result.memory = memory.uint16
+  result.offset = r.readU32()
+
+proc readAtomicInstruction(r: var BinaryReader): Instr =
+  ## Read after the 0xFE prefix using the pinned proposal's ordering encoding.
+  const operations = [opGlobalAtomicGet, opGlobalAtomicSet, opGlobalAtomicAdd,
+    opGlobalAtomicSub, opGlobalAtomicAnd, opGlobalAtomicOr, opGlobalAtomicXor,
+    opGlobalAtomicXchg, opGlobalAtomicCmpXchg]
+  let sub = r.readU32()
+  case sub
+  of 0x00 .. 0x02:
+    when defined(wasmAtomicWait):
+      const waitOps = [opMemoryAtomicNotify, opMemoryAtomicWait32, opMemoryAtomicWait64]
+      let arg = r.readMemArg()
+      Instr(op: waitOps[sub.int], pad: arg.memory, imm1: arg.offset, imm2: arg.align)
+    else: decodeError("atomic wait and notify are disabled")
+  of 0x03:
+    if r.readByte() != 0: decodeError("invalid atomic.fence immediate")
+    Instr(op: opAtomicFence)
+  of 0x10 .. 0x4e:
+    let arg = r.readMemArg()
+    Instr(op: opMemoryAtomic, pad: arg.memory, imm1: arg.offset, imm2: sub or (arg.align shl 8))
+  of 0x4f .. 0x57:
+    let op = operations[int(sub - 0x4f)]
+    let ordering = r.readByte().uint16
+    if not validGlobalAtomicOrdering(op, ordering): decodeError("invalid global atomic ordering")
+    Instr(op: op, pad: ordering, imm1: r.readU32())
+  else:
+    decodeError("unsupported 0xFE sub-opcode: " & $sub)
 
 proc readExpr*(r: var BinaryReader): Expr =
   ## Decode an expression (sequence of instructions terminated by opEnd).
@@ -321,6 +521,11 @@ proc readExpr*(r: var BinaryReader): Expr =
       let typeIdx = r.readU32()
       let tableIdx = r.readU32()
       instrs.add(Instr(op: opReturnCallIndirect, imm1: typeIdx, imm2: tableIdx))
+    of 0x14, 0x15: # call_ref / return_call_ref
+      when defined(wasmFunctionReferences):
+        instrs.add(Instr(op: (if b == 0x14: opCallRef else: opReturnCallRef),
+          imm1: r.readU32()))
+      else: decodeError("typed function references are disabled")
 
     # Exception handling
     of 0x08: # throw tagIdx
@@ -422,7 +627,7 @@ proc readExpr*(r: var BinaryReader): Expr =
         of 0x3D: opI64Store16
         of 0x3E: opI64Store32
         else: opI32Load # unreachable
-      instrs.add(Instr(op: op, imm1: ma.offset, imm2: ma.align))
+      instrs.add(Instr(op: op, pad: ma.memory, imm1: ma.offset, imm2: ma.align))
 
     of 0x3F: # memory.size
       let memIdx = r.readU32()
@@ -587,13 +792,21 @@ proc readExpr*(r: var BinaryReader): Expr =
 
     # Reference
     of 0xD0: # ref.null
-      let rt = r.readValType()
-      instrs.add(Instr(op: opRefNull, imm1: cast[uint32](rt.ord)))
+      when defined(wasmFunctionReferences):
+        let heapType = r.readFunctionHeapType()
+        instrs.add(Instr(op: opRefNull, imm1: heapType.lane.ord.uint32,
+          imm2: heapType.index, pad: heapType.shared.uint16))
+      else:
+        let rt = r.readValType()
+        instrs.add(Instr(op: opRefNull, imm1: cast[uint32](rt.ord)))
     of 0xD1: # ref.is_null
       instrs.add(Instr(op: opRefIsNull))
     of 0xD2: # ref.func
       let idx = r.readU32()
       instrs.add(Instr(op: opRefFunc, imm1: idx))
+    of 0xD4: # ref.as_non_null
+      when defined(wasmFunctionReferences): instrs.add(Instr(op: opRefAsNonNull))
+      else: decodeError("typed function references are disabled")
 
     # 0xFC prefix instructions
     of 0xFC:
@@ -653,11 +866,11 @@ proc readExpr*(r: var BinaryReader): Expr =
       let subOp = r.readU32()
       case subOp
       of 0:  # v128.load memarg
-        let al = r.readU32(); let off = r.readU32()
-        instrs.add(Instr(op: opV128Load, imm1: al, imm2: off))
+        let ma = r.readMemArg()
+        instrs.add(Instr(op: opV128Load, pad: ma.memory, imm1: ma.align, imm2: ma.offset))
       of 11: # v128.store memarg
-        let al = r.readU32(); let off = r.readU32()
-        instrs.add(Instr(op: opV128Store, imm1: al, imm2: off))
+        let ma = r.readMemArg()
+        instrs.add(Instr(op: opV128Store, pad: ma.memory, imm1: ma.align, imm2: ma.offset))
       of 12: # v128.const — 16 literal bytes follow
         var b16: array[16, byte]
         for i in 0..15: b16[i] = r.readByte()
@@ -768,6 +981,9 @@ proc readExpr*(r: var BinaryReader): Expr =
         # only implemented operations; unknown/unsupported ones must fail.
         decodeError("unsupported 0xFD sub-opcode: " & $subOp)
 
+    of 0xFE:
+      when defined(wasmSharedCoreTypes): instrs.add(r.readAtomicInstruction())
+      else: decodeError("atomic instructions are disabled")
     else:
       decodeError("unknown opcode: 0x" & b.toHex(2))
 
@@ -938,8 +1154,9 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opLocalGetI32ConstI32Add, imm1: a.imm1, imm2: b.imm1))
         i += 3; continue
       # local.get X; i32.load off; i32.add → push(TOS + mem[local[X]+off])
-      # Fused memory IR omits alignment; keep invalid memargs visible to validation.
-      if a.op == opLocalGet and b.op == opI32Load and c.op == opI32Add and b.imm2 <= 2'u32:
+      # Fused memory IR uses default memory and omits alignment.
+      if a.op == opLocalGet and b.op == opI32Load and c.op == opI32Add and
+          b.pad == 0 and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32LoadI32Add, imm1: a.imm1, imm2: b.imm1))
         i += 3; continue
       # i32.const C; i32.eq; br_if L → branch if TOS == C (imm1=C, imm2=L)
@@ -1019,7 +1236,7 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opI32ConstI32GeS, imm1: a.imm1))
         i += 2; continue
       # local.get X; i32.load offset → fused
-      if a.op == opLocalGet and b.op == opI32Load and b.imm2 <= 2'u32:
+      if a.op == opLocalGet and b.op == opI32Load and b.pad == 0 and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32Load, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # i32.const C; i32.eq → fused
@@ -1070,7 +1287,7 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opLocalTeeLocalGet, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # local.get X; i32.store offset → fused (store local to memory)
-      if a.op == opLocalGet and b.op == opI32Store and b.imm2 <= 2'u32:
+      if a.op == opLocalGet and b.op == opI32Store and b.pad == 0 and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32Store, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # ---- i64 local.get + arithmetic ----
@@ -1112,11 +1329,19 @@ proc decodeExprBytes*(data: openArray[byte], optimize: bool = true): Expr =
 
 # ---- Section decoders ----
 
-proc readTypeSection(r: var BinaryReader, m: var WasmModule) =
+proc readTypeSection(r: var BinaryReader, m: var WasmModule, allowFunctionSubtyping: bool) =
   let count = r.readCount()
   m.types = newSeqOfCap[FuncType](count.int)
   for i in 0 ..< count.int:
-    m.types.add(r.readFuncType())
+    when defined(wasmFunctionReferences):
+      let types = r.readCoreFunctionGroup(m.types)
+      m.types.add(types)
+    else:
+      if not allowFunctionSubtyping or r.peekByte() == 0x60:
+        m.types.add(r.readFuncType())
+      else:
+        let types = r.readCoreFunctionGroup(m.types)
+        m.types.add(types)
 
 proc readTagType*(r: var BinaryReader): uint32 =
   if r.readByte() != 0:
@@ -1136,7 +1361,7 @@ proc readImportSection(r: var BinaryReader, m: var WasmModule) =
       m.imports.add(Import(module: moduleName, name: name,
                            kind: ikFunc, funcTypeIdx: typeIdx))
     of 0x01:
-      let tt = r.readTableType()
+      let tt = r.readTableType(m.types)
       m.imports.add(Import(module: moduleName, name: name,
                            kind: ikTable, tableType: tt))
     of 0x02:
@@ -1144,7 +1369,7 @@ proc readImportSection(r: var BinaryReader, m: var WasmModule) =
       m.imports.add(Import(module: moduleName, name: name,
                            kind: ikMemory, memType: mt))
     of 0x03:
-      let gt = r.readGlobalType()
+      let gt = r.readGlobalType(m.types)
       m.imports.add(Import(module: moduleName, name: name,
                            kind: ikGlobal, globalType: gt))
     of 0x04:
@@ -1163,7 +1388,12 @@ proc readTableSection(r: var BinaryReader, m: var WasmModule) =
   let count = r.readCount()
   m.tables = newSeqOfCap[TableType](count.int)
   for i in 0 ..< count.int:
-    m.tables.add(r.readTableType())
+    when defined(wasmFunctionReferences):
+      if r.readTableInitializerPrefix():
+        m.tables.add(r.readTableType(m.types))
+        m.tableInitializers.add((i.uint32, r.readExpr()))
+        continue
+    m.tables.add(r.readTableType(m.types))
 
 proc readMemorySection(r: var BinaryReader, m: var WasmModule) =
   let count = r.readCount()
@@ -1176,7 +1406,7 @@ proc readGlobalSection(r: var BinaryReader, m: var WasmModule) =
   m.globals = newSeqOfCap[GlobalDef](count.int)
   for i in 0 ..< count.int:
     var g: GlobalDef
-    g.globalType = r.readGlobalType()
+    g.globalType = r.readGlobalType(m.types)
     g.init = r.readExpr()
     m.globals.add(g)
 
@@ -1205,8 +1435,13 @@ proc readElementSection(r: var BinaryReader, m: var WasmModule) =
   m.elements = newSeqOfCap[ElemSegment](count.int)
   for i in 0 ..< count.int:
     var seg: ElemSegment
-    let flags = r.readU32()
-    if flags > 7: decodeError("invalid element segment flags")
+    let rawFlags = r.readU32()
+    when defined(wasmSharedCoreTypes):
+      if rawFlags > 15: decodeError("invalid element segment flags")
+      seg.shared = (rawFlags and 8) != 0
+    else:
+      if rawFlags > 7: decodeError("invalid element segment flags")
+    let flags = rawFlags and 7
     # Element segment encoding uses a 3-bit flags field:
     # bit 0: passive/declarative (1) vs active with implicit table 0 (0)
     # bit 1: has explicit table index (active) or elem kind/type
@@ -1238,8 +1473,10 @@ proc readElementSection(r: var BinaryReader, m: var WasmModule) =
     # Read element type / elem kind
     if isPassiveOrDeclarative or hasTableIdxOrElemKind:
       if usesExpressions:
-        # Read reftype
-        seg.elemType = r.readValType()
+        when defined(wasmFunctionReferences):
+          (seg.elemType, seg.elementReference) = r.readTableReference(m.types)
+        else:
+          seg.elemType = r.readValType()
       else:
         # Read elemkind (0x00 = funcref)
         let elemKind = r.readByte()
@@ -1280,7 +1517,17 @@ proc readCodeSection(r: var BinaryReader, m: var WasmModule, optimize: bool) =
     for j in 0 ..< localDeclCount.int:
       var ld: LocalDecl
       ld.count = r.readU32()
-      ld.valType = r.readValType()
+      when defined(wasmFunctionReferences):
+        let prefix = r.peekByte()
+        if prefix in [0x63'u8, 0x73'u8, 0x65'u8]:
+          if prefix == 0x63: discard r.readByte()
+          let heapType = r.readFunctionHeapType()
+          ld.valType = heapType.lane
+          ld.functionType = heapType.index
+          when defined(wasmSharedCoreTypes): ld.sharedReference = heapType.shared
+        else:
+          ld.valType = r.readValType()
+      else: ld.valType = r.readValType()
       body.locals.add(ld)
     body.code = r.readCodeBody(optimize)
     # Ensure we consumed exactly the right number of bytes
@@ -1294,7 +1541,12 @@ proc readDataSection(r: var BinaryReader, m: var WasmModule) =
   m.datas = newSeqOfCap[DataSegment](count.int)
   for i in 0 ..< count.int:
     var seg: DataSegment
-    let flags = r.readU32()
+    let rawFlags = r.readU32()
+    when defined(wasmSharedCoreTypes):
+      seg.shared = (rawFlags and 8) != 0
+      let flags = rawFlags and not 8'u32
+    else:
+      let flags = rawFlags
     case flags
     of 0:
       # Active, memory 0, with offset expr
@@ -1311,7 +1563,7 @@ proc readDataSection(r: var BinaryReader, m: var WasmModule) =
       seg.memIdx = r.readU32()
       seg.offset = r.readExpr()
     else:
-      decodeError("unknown data segment flags: " & $flags)
+      decodeError("unknown data segment flags: " & $rawFlags)
     let dataLen = r.readU32()
     if uint64(dataLen) > uint64(r.size-r.pos): decodeError("data segment exceeds available bytes")
     seg.data = r.readBytes(int(dataLen))
@@ -1345,7 +1597,8 @@ proc readTagSection(r: var BinaryReader, m: var WasmModule) =
 # ---- Top-level decoder ----
 
 proc decodeModule*(data: openArray[byte], optimize: bool = true,
-                   retainCustomSections: bool = true): WasmModule =
+                   retainCustomSections: bool = true,
+                   allowFunctionSubtyping = false): WasmModule =
   ## Decode a WebAssembly binary module from raw bytes.
   ## Raises WasmDecodeError for malformed input.
   ## Proof frontends use optimize=false to retain original opcode boundaries.
@@ -1387,7 +1640,7 @@ proc decodeModule*(data: openArray[byte], optimize: bool = true,
 
     case sectionId
     of 0: readCustomSection(r, result, sectionSize, retainCustomSections)
-    of 1: readTypeSection(r, result)
+    of 1: readTypeSection(r, result, allowFunctionSubtyping)
     of 2: readImportSection(r, result)
     of 3: readFunctionSection(r, result)
     of 4: readTableSection(r, result)

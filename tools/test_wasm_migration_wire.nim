@@ -1,11 +1,12 @@
 import std/os
-import bl808/[wasm_migration_wire, wasm_scheduler, wasm_store]
+import bl808/[wasm_full_manager, wasm_migration_wire, wasm_scheduler, wasm_store]
 when defined(wasmChunkedMemory):
   import wasm_migration_state_fixture
 
 var image: seq[byte]
 
-proc prepare(migration: WasmTaskMigration): WasmSchedulerResult {.nimcall.} =
+proc prepare(migration: WasmTaskMigration, _: uint32, _: FullMemoryFactory,
+             _: pointer, _: bool): WasmSchedulerResult {.nimcall.} =
   const factory = when defined(wasmChunkedMemory): mutableMemoryFactory else: nil
   prepareFullWasmMigrationImage(
     cast[ptr UncheckedArray[byte]](addr image[0]), image.len.uint32,

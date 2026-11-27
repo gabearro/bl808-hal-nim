@@ -108,9 +108,9 @@ var
 
   # RX environment
   rxSwDescs*: array[RX_BUFFER_POOL_SIZE, RxSwDesc]
-  # Session identity for the 41 vendor DMA slots; not part of their wire layout.
-  rxStationIdentities: array[41, RxStationIdentity]
-  rxUploadEpochs: array[41, uint32]
+  # Session identity for each DMA slot, outside the hardware descriptor layout.
+  rxStationIdentities: array[WifiRxRingSlots, RxStationIdentity]
+  rxUploadEpochs: array[WifiRxRingSlots, uint32]
   rxVifEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
   rxMgtIdentities {.wifiCtrl.}: ptr RxMgtIdentityNode
   rxlControlActive {.wifiCtrl.}: bool
@@ -121,15 +121,15 @@ var
   rxKeyRevision {.wifiCtrl.}: uint64 = 1
   rxKeyLastChanged {.wifiCtrl.}: array[STA_INFO_TAB_ENTRIES + MAX_VIFS * 6, uint64]
 
-  # Blob RX DMA globals — these are what the MAC DMA engine actually reads
-  # from. Sizes from `nm`: rx_dma_hdrdesc=0x1004 (41 × 100), rx_swdesc_tab
-  # =0x3D8 (41 × 24), rx_payload_desc=0x854 (41 × 52), rx_payload_desc_buffer
-  # =0x11608 (41 × 1736). They must be addressable at their blob names so the
-  # MAC register writes in rxl_hwdesc_init land at the right physical pages.
-  rx_dma_hdrdesc* {.exportc, wifiRxDmaHd.}: array[4100, uint8]
-  rx_payload_desc* {.exportc, wifiRxDmaPd.}: array[2132, uint8]
-  rx_swdesc_tab* {.exportc, wifiRxDmaSw.}: array[984, uint8]
-  rx_payload_desc_buffer* {.exportc, wifiRxDmaBuf.}: array[71176, uint8]
+  # Keep the DMA section placement, symbol names, and per-slot layouts.
+  rx_dma_hdrdesc* {.exportc, wifiRxDmaHd.}:
+    array[WifiRxRingSlots * sizeof(RxHeaderHwDescView), uint8]
+  rx_payload_desc* {.exportc, wifiRxDmaPd.}:
+    array[WifiRxRingSlots * sizeof(RxPayloadHwDescView), uint8]
+  rx_swdesc_tab* {.exportc, wifiRxDmaSw.}:
+    array[WifiRxRingSlots * sizeof(RxSwTableDescView), uint8]
+  rx_payload_desc_buffer* {.exportc, wifiRxDmaBuf.}:
+    array[WifiRxRingSlots * sizeof(RxPayloadBufferView), uint8]
 
   # RX HW descriptor callback environment (from rxl_hwdesc.c).
   # The blob calls the function pointers at +20 and +24 directly in
@@ -216,10 +216,11 @@ var
   # The pinned rc.o starts its independent rate-control stream at one.
   rcPrngState* {.exportc: "rc_prng".}: uint32 = 1'u32
   rcTrialSerial {.wifiCtrl.}: array[5, uint32]
-  txRateTrialTag {.wifiCtrl.}: array[4, uint32]
+  txRateTrialTag {.wifiCtrl.}: array[
+    (when defined(bl808WifiSplitTxSlots): hostIpc.WifiTxDmaRecordCount else: 4), uint32]
   # Keep the new feedback metadata in Wi-Fi WRAM with the rate stats pool.
   rcRateSampleEpoch: array[5, uint16]
-  txRateSampleTag: array[4, uint32]
+  txRateSampleTag: typeof(txRateTrialTag)
 
   # Private WEP IV seed from sta_mgmt.o's initialized `next` variable.
   staKeyPrngState: uint32 = 1

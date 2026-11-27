@@ -7,16 +7,18 @@ when not defined(bl808WasmFullScheduler):
 
 import ./[wasm_full_manager, wasm_runtime, wasm_scheduler]
 import cps/wasm/runtime
+when defined(wasmManagedMigration):
+  import ./[wasm_steal_broker, wasm_steal_client]
 
 const
   WasmMigrationWireTag* = 0x5747'u16
   WasmMigrationWireMagic* = 0x474D'u16
-  WasmMigrationWireVersion* = 2'u8
+  WasmMigrationWireVersion* = when defined(wasmManagedMigration): 5'u8 else: 2'u8
   WasmMigrationWirePayloadBytes* = 504
-  WasmMigrationWireHeaderBytes* = 44
+  WasmMigrationWireHeaderBytes* = when defined(wasmManagedMigration): 56 else: 44
   WasmMigrationWirePartBytes* =
     WasmMigrationWirePayloadBytes - WasmMigrationWireHeaderBytes
-  WasmMigrationWireReplyBytes* = 24
+  WasmMigrationWireReplyBytes* = when defined(wasmManagedMigration): 28 else: 24
   WasmMigrationMaxSnapshotBytes* =
     (when defined(bl808lp): 512 else: 4096)
 
@@ -43,6 +45,7 @@ type
     mwsBadState = 8
     mwsPending = 9
     mwsBackingFailed = 10
+    mwsRelayPending = 11
 
   WasmMigrationWireState* = enum
     mwIdle
@@ -51,6 +54,7 @@ type
     mwPrepared
     mwActive
     mwPrepareFailed
+    mwCommitting
 
   WasmMigrationWireRequest* = object
     op*: WasmMigrationWireOp
@@ -65,6 +69,9 @@ type
     offset*: uint32
     count*: uint16
     sourceCoreBit*: uint16
+    when defined(wasmManagedMigration):
+      claim*: WasmStealClaim
+      relayViaM0*: bool
 
   WasmMigrationWireReply* = object
     status*: WasmMigrationWireStatus
@@ -73,6 +80,8 @@ type
     transferId*: uint32
     nextOffset*: uint32
     taskId*: uint32
+    when defined(wasmManagedMigration):
+      checkedSession*: uint32
 
   WasmMigrationReceiver* = object
     epoch*: uint32
@@ -97,6 +106,14 @@ type
     taskId*: uint32
     dropPending: bool
     staging: WasmPortableStaging
+    when defined(wasmManagedMigration):
+      worker: ptr WasmStealClient
+      claim: WasmStealClaim
+      checkedSession: uint32
+      checking: bool
+      accepting: bool
+      completed: tuple[bootId: uint32, coreBit: uint16, transferId, taskId: uint32,
+                       claim: WasmStealClaim]
     when defined(wasmStreamMigration):
       streamed: bool
     when defined(wasmStorageMigration):
@@ -108,7 +125,9 @@ type
 
 when defined(wasmMigrationWireHostTest):
   var wasmMigrationPrepareHook*:
-    proc(migration: WasmTaskMigration): WasmSchedulerResult {.nimcall.}
+    proc(migration: WasmTaskMigration, maxMemoryPages: uint32,
+         memoryFactory: FullMemoryFactory, memoryFactoryContext: pointer,
+         enforceMemoryQuota: bool): WasmSchedulerResult {.nimcall.}
 
 proc put16(buf: var openArray[byte], at: int, value: uint16) {.inline.} =
   buf[at] = value.byte
@@ -122,6 +141,19 @@ proc get16(buf: openArray[byte], at: int): uint16 {.inline.} =
 
 proc get32(buf: openArray[byte], at: int): uint32 {.inline.} =
   for i in 0 ..< 4: result = result or (buf[at + i].uint32 shl (8 * i))
+
+when defined(wasmManagedMigration):
+  const MigrationRelayBit = 1'u16 shl 15
+
+  proc wasmMigrationRelayTarget*(sourceCoreBit: uint16): uint16 =
+    case sourceCoreBit
+    of WasmStealD0.uint16: WasmStealLP.uint16
+    of WasmStealLP.uint16: WasmStealD0.uint16
+    else: 0
+
+  proc wasmMigrationRelayIngress*(request: openArray[byte]): bool {.inline.} =
+    request.len >= WasmMigrationWireHeaderBytes and
+      (request.get16(42) and MigrationRelayBit) != 0
 
 proc encodeWasmMigrationRequestHeader*(req: WasmMigrationWireRequest,
                                        outBuf: var openArray[byte]): int =
@@ -144,6 +176,13 @@ proc encodeWasmMigrationRequestHeader*(req: WasmMigrationWireRequest,
   outBuf.put32(36, req.offset)
   outBuf.put16(40, req.count)
   outBuf.put16(42, req.sourceCoreBit)
+  when defined(wasmManagedMigration):
+    if req.relayViaM0:
+      if wasmMigrationRelayTarget(req.sourceCoreBit) == 0: return 0
+      outBuf.put16(42, req.sourceCoreBit or MigrationRelayBit)
+    outBuf.put32(44, req.claim.ownerEpoch)
+    outBuf.put32(48, req.claim.jobId)
+    outBuf.put32(52, req.claim.token)
   WasmMigrationWireHeaderBytes + payload
 
 proc encodeWasmMigrationRequest*(req: WasmMigrationWireRequest,
@@ -170,6 +209,15 @@ proc decodeWasmMigrationRequest*(buf: openArray[byte],
     affinityMask: buf.get32(28), totalBytes: buf.get32(32),
     offset: buf.get32(36), count: buf.get16(40),
     sourceCoreBit: buf.get16(42))
+  when defined(wasmManagedMigration):
+    req.relayViaM0 = (req.sourceCoreBit and MigrationRelayBit) != 0
+    req.sourceCoreBit = req.sourceCoreBit and not MigrationRelayBit
+    if req.relayViaM0 and wasmMigrationRelayTarget(req.sourceCoreBit) == 0: return false
+    req.claim = WasmStealClaim(ownerEpoch: buf.get32(44),
+      jobId: buf.get32(48), token: buf.get32(52))
+    if req.claim != WasmStealClaim() and
+        (req.claim.ownerEpoch == 0 or req.claim.jobId == 0 or req.claim.token == 0):
+      return false
   if req.sourceCoreBit != 1 and req.sourceCoreBit != 2 and
       req.sourceCoreBit != 4:
     return false
@@ -192,6 +240,8 @@ proc encodeWasmMigrationReply*(reply: WasmMigrationWireReply,
   outBuf.put32(12, reply.nextOffset)
   outBuf[16] = reply.state.ord.byte
   outBuf.put32(20, reply.taskId)
+  when defined(wasmManagedMigration):
+    outBuf.put32(24, reply.checkedSession)
   WasmMigrationWireReplyBytes
 
 proc decodeWasmMigrationReply*(buf: openArray[byte],
@@ -199,14 +249,18 @@ proc decodeWasmMigrationReply*(buf: openArray[byte],
   if buf.len != WasmMigrationWireReplyBytes or
       buf.get16(0) != WasmMigrationWireMagic or
       buf[2] != WasmMigrationWireVersion or
-      buf[3] > mwsBackingFailed.ord.byte or
-      buf[16] > mwPrepareFailed.ord.byte or
+      buf[3] > (when defined(wasmManagedMigration): mwsRelayPending.ord.byte
+                else: mwsBackingFailed.ord.byte) or
+      buf[16] > (when defined(wasmManagedMigration): mwCommitting.ord.byte
+                 else: mwPrepareFailed.ord.byte) or
       buf[17] != 0 or buf[18] != 0 or buf[19] != 0:
     return false
   reply = WasmMigrationWireReply(status: WasmMigrationWireStatus(buf[3]),
     receiverEpoch: buf.get32(4), transferId: buf.get32(8),
     nextOffset: buf.get32(12), state: WasmMigrationWireState(buf[16]),
     taskId: buf.get32(20))
+  when defined(wasmManagedMigration):
+    reply.checkedSession = buf.get32(24)
   true
 
 proc initWasmMigrationReceiver*(receiver: var WasmMigrationReceiver,
@@ -254,6 +308,11 @@ proc clearTransfer(receiver: var WasmMigrationReceiver) =
   receiver.received = 0
   receiver.taskId = 0
   receiver.dropPending = false
+  when defined(wasmManagedMigration):
+    receiver.claim = WasmStealClaim()
+    receiver.checkedSession = 0
+    receiver.checking = false
+    receiver.accepting = false
   when defined(wasmStreamMigration):
     receiver.streamed = false
   when defined(wasmStorageMigration):
@@ -264,10 +323,14 @@ proc reapWasmMigrationReceiver*(receiver: var WasmMigrationReceiver,
                                 nowTick: uint64): bool =
   ## A stalled, uncommitted transfer holds only a bounded lease. An active
   ## migrated task is never killed or replayed because its source reset.
-  if receiver.state in {mwIdle, mwActive} or
+  if receiver.state in {mwIdle, mwActive, mwCommitting} or
       nowTick < receiver.lastActivityTick or
       nowTick - receiver.lastActivityTick < receiver.leaseTicks:
     return false
+  when defined(wasmManagedMigration):
+    if receiver.checking and receiver.state in {mwReceiving, mwPreparing, mwPrepared}:
+      receiver.dropPending = true
+      return true
   if receiver.taskId != 0:
     discard discardPreparedWasmTaskMigration(receiver.taskId)
   receiver.clearTransfer()
@@ -276,10 +339,17 @@ proc reapWasmMigrationReceiver*(receiver: var WasmMigrationReceiver,
 proc finishWasmMigrationReceiver*(receiver: var WasmMigrationReceiver): bool =
   ## Release the single transfer slot after the activated task terminates.
   if receiver.state != mwActive or receiver.taskId == 0: return false
+  when defined(wasmManagedMigration):
+    if receiver.claim.token != 0 and receiver.worker[].jobId == receiver.claim.jobId:
+      return false
   let task = getWasmTask(receiver.taskId)
   if task.state notin {wasmTaskExited, wasmTaskTrapped, wasmTaskKilled} and
       task.status != wasmSchedNoTask:
     return false
+  when defined(wasmManagedMigration):
+    if receiver.claim.token != 0:
+      receiver.completed = (receiver.sourceBootId, receiver.sourceCoreBit,
+        receiver.transferId, receiver.taskId, receiver.claim)
   receiver.clearTransfer()
   true
 
@@ -292,7 +362,8 @@ proc sameTransfer(receiver: WasmMigrationReceiver,
     receiver.fuelLimit == req.fuelLimit and
     receiver.fuelUsed == req.fuelUsed and
     receiver.affinityMask == req.affinityMask and
-    receiver.totalBytes == req.totalBytes
+    receiver.totalBytes == req.totalBytes and
+    (when defined(wasmManagedMigration): receiver.claim == req.claim else: true)
 
 proc storagePartPending(receiver: WasmMigrationReceiver): bool {.inline.} =
   when defined(wasmStorageMigration):
@@ -300,7 +371,69 @@ proc storagePartPending(receiver: WasmMigrationReceiver): bool {.inline.} =
   else: false
 
 proc needsWasmMigrationService*(receiver: WasmMigrationReceiver): bool {.inline.} =
-  receiver.state == mwPreparing or receiver.dropPending or receiver.storagePartPending()
+  receiver.state in {mwPreparing, mwCommitting} or receiver.dropPending or
+    receiver.storagePartPending() or
+    (when defined(wasmManagedMigration):
+      receiver.state == mwReceiving and receiver.claim.token != 0 and
+        receiver.checkedSession == 0
+    else: false)
+
+when defined(wasmManagedMigration):
+  proc bindWasmMigrationWorker*(receiver: var WasmMigrationReceiver,
+                                 worker: ptr WasmStealClient): bool =
+    if receiver.state != mwIdle or worker == nil or worker[].coreBit != receiver.coreBit:
+      return false
+    receiver.worker = worker
+    true
+
+  proc checkManagedDependencies(receiver: var WasmMigrationReceiver,
+                                probeOnly: bool): WasmMigrationWireStatus =
+    let worker = receiver.worker
+    if not receiver.checking:
+      if not worker[].beginWasmStealCheckHandoff(receiver.claim, receiver.sourceCoreBit.uint32,
+          probeOnly = probeOnly):
+        return mwsPrepareFailed
+      receiver.checking = true
+    case worker[].pollWasmSteal()
+    of wscPending: mwsPending
+    of wscHandoffChecked:
+      let job = addr worker[].handoffJob
+      if job.slot != receiver.slot or job.maxFuel != receiver.fuelLimit or
+          job.affinityMask != receiver.affinityMask or
+          (receiver.maxMemoryPages != 0 and job.maxMemoryPages > receiver.maxMemoryPages):
+        discard worker[].cancelWasmStealCheckHandoff()
+        receiver.checking = false
+        return mwsPrepareFailed
+      receiver.checkedSession = worker[].peerSession
+      if probeOnly:
+        discard worker[].cancelWasmStealCheckHandoff()
+        receiver.checking = false
+      mwsOk
+    else:
+      receiver.checking = false
+      mwsPrepareFailed
+
+  proc serviceManagedCommit(receiver: var WasmMigrationReceiver): WasmMigrationWireStatus =
+    let worker = receiver.worker
+    if not receiver.accepting:
+      if not worker[].beginWasmStealAcceptHandoff(receiver.taskId):
+        return mwsBadState
+      receiver.accepting = true
+    case worker[].pollWasmSteal()
+    of wscPending: mwsPending
+    of wscHandoffRetry:
+      discard worker[].retryWasmStealHandoff()
+      mwsPending
+    of wscReady:
+      if worker[].taskId != receiver.taskId or worker[].jobId != receiver.claim.jobId:
+        return mwsBadState
+      receiver.state = mwActive
+      mwsOk
+    of wscHandoffChecked:
+      if worker[].handoffStatus != wssBusy: return mwsBadState
+      receiver.accepting = false
+      mwsPending
+    else: mwsBadState
 
 proc receiveStorage(receiver: var WasmMigrationReceiver): ptr UncheckedArray[byte] {.inline.} =
   if receiver.staging.data != nil: receiver.staging.data
@@ -348,6 +481,10 @@ proc serviceWasmMigrationReceiver*(receiver: var WasmMigrationReceiver):
   ## Validation, SHA-256 and instantiation are never performed in the IPC
   ## handler. The sender polls mwoQuery until this reaches a terminal state.
   if receiver.dropPending:
+    when defined(wasmManagedMigration):
+      if receiver.checking:
+        if receiver.worker[].pollWasmSteal() == wscPending: return mwsPending
+        discard receiver.worker[].cancelWasmStealCheckHandoff()
     if receiver.taskId != 0:
       discard discardPreparedWasmTaskMigration(receiver.taskId)
     receiver.clearTransfer()
@@ -358,6 +495,25 @@ proc serviceWasmMigrationReceiver*(receiver: var WasmMigrationReceiver):
       receiver.partReady = true
       if receiver.partStatus == mwsBackingFailed: receiver.state = mwPrepareFailed
       return receiver.partStatus
+  when defined(wasmManagedMigration):
+    if receiver.state == mwCommitting:
+      result = receiver.serviceManagedCommit()
+      if result == mwsBadState:
+        discard discardPreparedWasmTaskMigration(receiver.taskId)
+        discard receiver.worker[].cancelWasmStealCheckHandoff()
+        receiver.taskId = 0
+        receiver.state = mwPrepareFailed
+      return
+    if receiver.state == mwReceiving and receiver.claim.token != 0 and
+        receiver.checkedSession == 0:
+      result = receiver.checkManagedDependencies(probeOnly = true)
+      if result == mwsPrepareFailed: receiver.state = mwPrepareFailed
+      return
+    if receiver.state == mwPreparing and receiver.claim.token != 0 and
+        receiver.checkedSession == 0:
+      result = receiver.checkManagedDependencies(probeOnly = false)
+      if result == mwsPrepareFailed: receiver.state = mwPrepareFailed
+      if result != mwsOk: return
   if receiver.state != mwPreparing: return mwsBadState
   var task: WasmSchedulerResult
   if receiver.taskId != 0:
@@ -378,29 +534,50 @@ proc serviceWasmMigrationReceiver*(receiver: var WasmMigrationReceiver):
       if not migration.staged.sealPortableStaging():
         task = WasmSchedulerResult(status: wasmSchedBackingFailed)
       else:
+        var pages = receiver.maxMemoryPages
+        let managed = when defined(wasmManagedMigration): receiver.claim.token != 0 else: false
+        var factory: FullMemoryFactory
+        var factoryContext: pointer
+        when defined(wasmChunkedMemory):
+          factory = receiver.memoryFactory
+          factoryContext = receiver.memoryFactoryContext
+        when defined(wasmManagedMigration):
+          if managed:
+            pages = receiver.worker[].handoffJob.maxMemoryPages
+            when defined(wasmChunkedMemory):
+              let backing = receiver.worker[].registeredWasmStealMemory()
+              if backing.factory != nil:
+                factory = backing.factory
+                factoryContext = backing.context
         when defined(wasmMigrationWireHostTest):
           if wasmMigrationPrepareHook == nil:
             task = WasmSchedulerResult(status: wasmSchedInitFailed)
           else:
-            task = wasmMigrationPrepareHook(migration)
-        elif defined(wasmChunkedMemory):
-          task = prepareFullWasmMigrationSlot(move migration, receiver.maxMemoryPages,
-            receiver.memoryFactory, receiver.memoryFactoryContext, allowPagedRestore = true)
+            task = wasmMigrationPrepareHook(migration, pages, factory, factoryContext, managed)
         else:
-          task = prepareFullWasmMigrationSlot(move migration, receiver.maxMemoryPages)
+          task = prepareFullWasmMigrationSlot(move migration, pages, factory,
+            factoryContext, allowPagedRestore = defined(wasmChunkedMemory),
+            enforceMemoryQuota = managed)
     except CatchableError:
       task = WasmSchedulerResult(status: wasmSchedInitFailed)
   if task.status == wasmSchedRestorePending and task.state == wasmTaskMigrating:
     receiver.taskId = task.id
     return mwsPending
-  if task.status != wasmSchedOk or task.state != wasmTaskMigrating:
-    if receiver.taskId != 0: discard discardPreparedWasmTaskMigration(receiver.taskId)
+  let wrongEntry = when defined(wasmManagedMigration):
+    receiver.claim.token != 0 and task.status == wasmSchedOk and
+      not preparedWasmMigrationEntryMatches(task.id, receiver.worker[].handoffJob.wasmStealExportName())
+  else: false
+  if wrongEntry or task.status != wasmSchedOk or task.state != wasmTaskMigrating:
+    let discardedId = if receiver.taskId != 0: receiver.taskId else: task.id
+    if discardedId != 0: discard discardPreparedWasmTaskMigration(discardedId)
     receiver.taskId = 0
+    when defined(wasmManagedMigration):
+      if receiver.checkedSession != 0: discard receiver.worker[].cancelWasmStealCheckHandoff()
     receiver.state = mwPrepareFailed
     return mwsPrepareFailed
   receiver.taskId = task.id
   receiver.state = mwPrepared
-  mwsOk
+  return mwsOk
 
 proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
                                request: openArray[byte],
@@ -412,15 +589,33 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
     receiverEpoch: receiver.epoch, transferId: receiver.transferId,
     nextOffset: receiver.received, state: receiver.state,
     taskId: receiver.taskId)
-  if routedSourceBit != 0 and req.sourceCoreBit != routedSourceBit:
+  let wrongRoute = when defined(wasmManagedMigration):
+    if req.relayViaM0:
+      routedSourceBit != WasmStealM0.uint16 or
+        receiver.coreBit != wasmMigrationRelayTarget(req.sourceCoreBit).uint32
+    else:
+      routedSourceBit != 0 and req.sourceCoreBit != routedSourceBit
+  else:
+    routedSourceBit != 0 and req.sourceCoreBit != routedSourceBit
+  if wrongRoute:
     reply.status = mwsInvalid
     return reply.encodeWasmMigrationReply(response)
+  when defined(wasmManagedMigration):
+    let completed = addr receiver.completed
+    if req.op in {mwoCommit, mwoQuery} and req.receiverEpoch == receiver.epoch and
+        req.claim.token != 0 and req.claim == completed.claim and
+        req.sourceBootId == completed.bootId and req.sourceCoreBit == completed.coreBit and
+        req.transferId == completed.transferId:
+      return WasmMigrationWireReply(status: mwsOk, state: mwActive,
+        receiverEpoch: receiver.epoch, transferId: req.transferId,
+        taskId: completed.taskId).encodeWasmMigrationReply(response)
   if req.op == mwoHello:
     if req.sourceBootId != 0 and receiver.state in
         {mwReceiving, mwPreparing, mwPrepared, mwPrepareFailed} and
         receiver.sourceCoreBit == req.sourceCoreBit and
         receiver.sourceBootId != req.sourceBootId:
-      if receiver.taskId != 0:
+      if receiver.taskId != 0 or
+          (when defined(wasmManagedMigration): receiver.checking else: false):
         receiver.dropPending = true
         reply.status = mwsPending
       else:
@@ -440,6 +635,8 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
       if streamed: WasmPortableHeaderBytes + WasmPortableStreamFooterBytes else: WasmPortableHeaderBytes
     else: WasmPortableHeaderBytes
     if streamed and not defined(wasmStreamMigration):
+      reply.status = mwsInvalid
+    elif (when defined(wasmManagedMigration): req.claim.token != 0 and receiver.worker == nil else: false):
       reply.status = mwsInvalid
     elif req.totalBytes > receiver.maxSnapshotBytes:
       reply.status = mwsTooLarge
@@ -466,10 +663,17 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
       receiver.affinityMask = req.affinityMask
       receiver.totalBytes = req.totalBytes
       receiver.received = 0
+      when defined(wasmManagedMigration):
+        receiver.claim = req.claim
       when defined(wasmStreamMigration):
         receiver.streamed = streamed
       receiver.lastActivityTick = nowTick
       receiver.state = mwReceiving
+    when defined(wasmManagedMigration):
+      if reply.status == mwsOk and receiver.claim.token != 0:
+        if receiver.state == mwPrepareFailed: reply.status = mwsPrepareFailed
+        elif receiver.state == mwReceiving and receiver.checkedSession == 0:
+          reply.status = mwsPending
   elif receiver.state == mwIdle or not receiver.sameTransfer(req):
     reply.status = mwsStaleTransfer
   elif receiver.dropPending:
@@ -477,7 +681,10 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
   else:
     case req.op
     of mwoPart:
-      if receiver.state != mwReceiving:
+      if receiver.state != mwReceiving or
+          (when defined(wasmManagedMigration):
+            receiver.claim.token != 0 and receiver.checkedSession == 0
+          else: false):
         reply.status = mwsBadState
         when defined(wasmStorageMigration):
           if receiver.state == mwPrepareFailed and receiver.partReady and
@@ -518,29 +725,42 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
         reply.status = mwsPending
       elif receiver.state == mwPrepareFailed:
         reply.status = mwsPrepareFailed
-      elif receiver.state != mwReceiving or not complete or receiver.storagePartPending():
+      elif receiver.state != mwReceiving or not complete or receiver.storagePartPending() or
+          (when defined(wasmManagedMigration):
+            receiver.claim.token != 0 and receiver.checkedSession == 0
+          else: false):
         reply.status = mwsBadState
       else:
+        when defined(wasmManagedMigration):
+          receiver.checkedSession = 0  # Recheck eligibility before preparing ownership.
         receiver.state = mwPreparing
         reply.status = mwsPending
     of mwoCommit:
       if receiver.state == mwActive:
         discard  # Idempotent commit after a lost reply.
+      elif receiver.state == mwCommitting:
+        reply.status = mwsPending
+      elif (when defined(wasmManagedMigration):
+          receiver.state == mwPrepared and receiver.claim.token != 0 and receiver.taskId != 0
+          else: false):
+        receiver.state = mwCommitting
+        reply.status = mwsPending
       elif receiver.state != mwPrepared or receiver.taskId == 0 or
           activateWasmTaskMigration(receiver.taskId) != wasmMigrationOk:
         reply.status = mwsBadState
       else:
         receiver.state = mwActive
     of mwoAbort:
-      if receiver.state == mwActive:
+      if receiver.state in {mwActive, mwCommitting}:
         reply.status = mwsBadState
-      elif receiver.taskId != 0:
+      elif receiver.taskId != 0 or
+          (when defined(wasmManagedMigration): receiver.checking else: false):
         receiver.dropPending = true
         reply.status = mwsPending
       else:
         receiver.clearTransfer()
     of mwoQuery:
-      if receiver.state == mwPreparing: reply.status = mwsPending
+      if receiver.state in {mwPreparing, mwCommitting}: reply.status = mwsPending
       elif receiver.state == mwPrepareFailed: reply.status = mwsPrepareFailed
     of mwoHello, mwoBegin, mwoBeginStream:
       discard
@@ -551,4 +771,10 @@ proc processWasmMigrationWire*(receiver: var WasmMigrationReceiver,
   reply.nextOffset = receiver.received
   reply.state = receiver.state
   reply.taskId = receiver.taskId
+  when defined(wasmManagedMigration):
+    reply.checkedSession = receiver.checkedSession
+    if req.op in {mwoBegin, mwoBeginStream} and reply.status == mwsPrepareFailed and
+        receiver.received == 0 and receiver.checkedSession == 0:
+      # A rejected preflight has no snapshot or worker reservation to keep.
+      receiver.clearTransfer()
   reply.encodeWasmMigrationReply(response)

@@ -22,6 +22,7 @@ type
   Sta = object
     link: CoListHdr
     instNbr, valid: uint8
+    postponedList: CoList
   Vif = object
     next: pointer
     vifType, state, staIdx: uint8
@@ -38,6 +39,8 @@ var
   stationEpochs: array[STA_INFO_TAB_ENTRIES, uint32]
   txResetEpoch: uint32
   env: tuple[activeList: CoList]
+  frameEnv: tuple[postponedCount: uint32]
+  frames: array[STA_INFO_TAB_ENTRIES, CoListHdr]
   sent: seq[tuple[vif, station: int]]
   readyHook, sendHook: proc()
   readyCalls, reconcileCalls: int
@@ -51,6 +54,7 @@ proc staInfoForIdx(index: uint8): ptr Sta =
   doAssert index < STA_INFO_TAB_ENTRIES.uint8, "station index was not checked"
   addr stas[index]
 proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
+proc txFrameEnv(): ptr typeof(frameEnv) = addr frameEnv
 proc staDeleteEpoch(index: uint8): uint32 =
   if index < STA_INFO_TAB_ENTRIES.uint8: stationEpochs[index] else: 0
 proc vifMgmtEnvView(): ptr typeof(env) = addr env
@@ -102,7 +106,11 @@ proc sta_mgmt_send_postponed_frame(vif, sta: pointer; limit: uint32): uint32 =
     sendHook = nil
     hook()
   if limit == 0: perSend else: min(limit, perSend)
-proc wifi_nimfw_reconcile_postponed_count() = inc reconcileCalls
+proc wifi_nimfw_reconcile_postponed_count() =
+  inc reconcileCalls
+  frameEnv.postponedCount = 0
+  for sta in stas:
+    if sta.postponedList.first != nil: inc frameEnv.postponedCount
 proc setup(enabled = true) =
   stas = default(typeof(stas))
   vifs = default(typeof(vifs))
@@ -114,6 +122,9 @@ proc setup(enabled = true) =
     vifs[i].staIdx = i.uint8
     stas[i].valid = 1
     stas[i].instNbr = i.uint8
+  for i in 0 ..< stas.len:
+    stas[i].postponedList.first = addr frames[i]
+  frameEnv.postponedCount = stas.len.uint32
   env = default(typeof(env))
   sent.setLen(0)
   readyHook = nil
@@ -145,6 +156,62 @@ proc activeVifs() =
 
 
 CASES = {
+    "scheduler_wakes": r'''
+setup()
+for sta in stas.mitems: sta.postponedList = default(CoList)
+frameEnv.postponedCount = 0
+now = high(uint32) - 100
+wifi_nimfw_service_tx(1)
+doAssert reconcileCalls == 1 and readyCalls == 0
+now += 200
+wifi_nimfw_service_tx(1)
+doAssert reconcileCalls == 1 and readyCalls == 0
+doAssert triggers == 2 and confirmations == 2
+
+stas[0].postponedList.first = addr frames[0]
+frameEnv.postponedCount = 1
+ready = false
+requestPostponedTx()
+requestPostponedTx()
+doAssert notifications == 1 and interrupts
+wifi_nimfw_service_tx(1)
+doAssert readyCalls == 1 and sent.len == 0 and reconcileCalls == 1
+wifi_nimfw_service_tx(1)
+doAssert readyCalls == 1, "blocked work kept polling"
+
+ready = true
+postponedTxChannelReady()
+resetting = true
+wifi_nimfw_service_tx(1)
+doAssert readyCalls == 1 and sent.len == 0
+resetting = false
+sendHook = proc() =
+  stas[0].postponedList.first = nil
+  frameEnv.postponedCount = 0
+wifi_nimfw_service_tx(1)
+doAssert sent == @[(0, 0)] and notifications == 2
+
+stas[1].postponedList.first = addr frames[1]
+# No request was posted and the software count is stale.
+now += PostponedTxReconcileUs
+sendHook = proc() =
+  stas[1].postponedList.first = nil
+  frameEnv.postponedCount = 0
+wifi_nimfw_service_tx(1)
+doAssert reconcileCalls == 2 and sent == @[(0, 0), (1, 1)]
+
+stas[0].postponedList.first = addr frames[0]
+frameEnv.postponedCount = 2
+requestPostponedTx()
+sendHook = proc() = dec frameEnv.postponedCount
+wifi_nimfw_service_tx(1)
+doAssert notifications == 4, "a full TX budget lost the next wake"
+sendHook = proc() =
+  stas[0].postponedList.first = nil
+  frameEnv.postponedCount = 0
+wifi_nimfw_service_tx(1)
+doAssert notifications == 4 and sent == @[(0, 0), (1, 1), (0, 0), (0, 0)]
+''',
     "service_admission": r'''
 for enabled in [false, true]:
   for index in 0 .. 255:
@@ -284,22 +351,40 @@ for enabled in [false, true]:
 }
 
 
-def source() -> str:
+def source(scheduler: bool) -> str:
     sta = (FW / "sta_management.nim").read_text()
     tx = (FW / "tx_layer.nim").read_text()
     vif = (FW / "vif_management.nim").read_text()
     code = "".join(procedure(sta, name) for name in [
         "staPostponedOwner", "staPostponedOwnerCurrent",
     ])
+    code += procedure(tx, "serviceStaPostponed")
     code += procedure(tx, "wifi_nimfw_service_sta_postponed")
     code += procedure(vif, "vif_mgmt_send_postponed_frame")
     code += procedure(vif, "vif_mgmt_reset")
     names = sorted(set(re.findall(r"\bnimFw\w+", code)))
     declarations = "var\n" + "".join(f"  {name}: uint32\n" for name in names)
-    return PLATFORM + declarations + code
+    support = ""
+    if scheduler:
+        support = r'''
+var now: uint32
+var notifications, triggers, confirmations: int
+const ClicMtimeBase = 0'u
+proc bl808_wifi_backend_signal_work() = inc notifications
+proc regRead(address: uint): uint32 = now
+proc wifiStepEnter(): bool = true
+proc wifiStepLeave() = discard
+proc txl_transmit_trigger() = inc triggers
+proc txl_frame_evt() = inc confirmations
+'''
+        support += (FW / "postponed_tx_work.nim").read_text()
+        code += procedure((FW / "task_init_main.nim").read_text(), "wifi_nimfw_service_tx")
+    return PLATFORM + declarations + support + code
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 @pytest.mark.parametrize("case", CASES)
 def test_postponed_service(tmp_path: Path, mode: str, case: str) -> None:
-    run_program(tmp_path, mode, source() + CASES[case])
+    scheduler = case == "scheduler_wakes"
+    run_program(tmp_path, mode, source(scheduler) + CASES[case],
+                defines=("bl808m0",) if scheduler else ())

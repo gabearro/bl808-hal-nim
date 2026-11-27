@@ -1,0 +1,5 @@
+package ox64:callback;
+
+world callback {
+  export run: async func(x: u32) -> u32;
+}

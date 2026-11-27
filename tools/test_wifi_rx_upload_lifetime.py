@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import RX_RING_CONFIG_IMPORT
 from test_wifi_rx_upload import PLATFORM as BASE
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,7 +167,7 @@ def test_rx_upload_slot_lifetime(tmp_path: Path, mode: str, pbuf_input: bool, mu
     elif mutation == "invalidate":
         parts["rxInvalidateUpload"] = parts["rxInvalidateUpload"].replace("    inc rxUploadEpochs[index]", "    discard")
     path = tmp_path / "upload_lifetime.nim"
-    path.write_text(PLATFORM + "".join(parts.values()) + upper + CHECKS)
+    path.write_text(RX_RING_CONFIG_IMPORT + PLATFORM + "".join(parts.values()) + upper + CHECKS)
     options = {"checked": [], "release": ["-d:release", "--assertions:on"],
                "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     if pbuf_input:

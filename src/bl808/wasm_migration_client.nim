@@ -7,6 +7,8 @@ when not defined(bl808WasmFullScheduler):
 
 import ./[wasm_migration_wire, wasm_scheduler, wasm_runtime]
 import cps/wasm/runtime
+when defined(wasmManagedMigration):
+  import ./[wasm_steal_broker, wasm_steal_client]
 when defined(wasmMigrationClientHostTest):
   import cps/runtime
   type WasmMigrationRpc* = proc(request: openArray[byte], response: pointer,
@@ -40,6 +42,8 @@ type
     failures*: uint32
     uncertain*: uint32
     bytes*: uint32
+    when defined(wasmManagedMigration):
+      relayPolls*: uint32
 
   WasmMigrationClient* = object
     state*: WasmMigrationClientState
@@ -56,6 +60,10 @@ type
     telemetry*: WasmMigrationClientTelemetry
     nextTransferId: uint32
     retired: bool
+    when defined(wasmManagedMigration):
+      worker: ptr WasmStealClient
+      claim: WasmStealClaim
+      awaitingAuthority: bool
     pendingOp: WasmMigrationWireOp
     retries: uint8
     offset: uint32
@@ -70,8 +78,16 @@ type
     responseBuf: array[WasmMigrationWireReplyBytes, byte]
 
 proc validRoute(sourceBit, targetBit: uint32): bool =
+  when defined(wasmManagedMigration):
+    if sourceBit != 1 and targetBit != 1:
+      return sourceBit in [2'u32, 4'u32] and
+        wasmMigrationRelayTarget(sourceBit.uint16).uint32 == targetBit
   (sourceBit == 1 and (targetBit == 2 or targetBit == 4)) or
     ((sourceBit == 2 or sourceBit == 4) and targetBit == 1)
+
+when defined(wasmManagedMigration):
+  proc usesRelay(client: WasmMigrationClient): bool {.inline.} =
+    client.sourceCoreBit != 1 and client.targetCoreBit != 1
 
 proc initWasmMigrationClient*(client: var WasmMigrationClient,
                               sourceBootId, targetCoreBit,
@@ -119,6 +135,29 @@ proc transferCapacity(client: WasmMigrationClient): uint32 {.inline.} =
     if client.streaming(): return client.streamLimit
   client.snapshot.migrationView().len.uint32
 
+proc exchangeEncoded(client: var WasmMigrationClient): bool =
+  let size = WasmMigrationWireHeaderBytes + client.partCount.int
+  client.responseLen = 0
+  when defined(wasmMigrationClientHostTest):
+    if wasmMigrationRpc == nil: return false
+    client.future = wasmMigrationRpc(
+      client.requestBuf.toOpenArray(0, size - 1),
+      addr client.responseBuf[0], client.responseBuf.len,
+      addr client.responseLen, client.timeoutMs)
+  else:
+    let target = if client.targetCoreBit == 1 or
+        (when defined(wasmManagedMigration): client.usesRelay() else: false):
+      ipcM0
+    elif client.targetCoreBit == 2:
+      ipcD0
+    else:
+      ipcLP
+    client.future = ipcCallTo(target, WasmMigrationWireTag,
+      client.requestBuf.toOpenArray(0, size - 1),
+      addr client.responseBuf[0], client.responseBuf.len,
+      addr client.responseLen, timeoutMs = client.timeoutMs)
+  client.future != nil
+
 proc send(client: var WasmMigrationClient,
           op: WasmMigrationWireOp): bool =
   let view = client.snapshot.migrationView()
@@ -130,7 +169,7 @@ proc send(client: var WasmMigrationClient,
       min(WasmMigrationWirePartBytes, view.len - client.offset.int).uint16
   else:
     0'u16
-  let req = WasmMigrationWireRequest(op: op,
+  var req = WasmMigrationWireRequest(op: op,
     receiverEpoch: client.receiverEpoch,
     sourceBootId: client.sourceBootId,
     sourceCoreBit: client.sourceCoreBit,
@@ -142,6 +181,9 @@ proc send(client: var WasmMigrationClient,
     totalBytes: client.transferCapacity(),
     offset: if op == mwoPart: client.offset else: 0'u32,
     count: count)
+  when defined(wasmManagedMigration):
+    req.claim = client.claim
+    req.relayViaM0 = client.usesRelay()
   let size = if op == mwoPart:
     if count == 0: return false
     if client.streaming():
@@ -158,22 +200,7 @@ proc send(client: var WasmMigrationClient,
   if size == 0: return false
   client.pendingOp = op
   client.partCount = count
-  client.responseLen = 0
-  when defined(wasmMigrationClientHostTest):
-    if wasmMigrationRpc == nil: return false
-    client.future = wasmMigrationRpc(
-      client.requestBuf.toOpenArray(0, size - 1),
-      addr client.responseBuf[0], client.responseBuf.len,
-      addr client.responseLen, client.timeoutMs)
-  else:
-    let target = if client.targetCoreBit == 1: ipcM0
-                 elif client.targetCoreBit == 2: ipcD0
-                 else: ipcLP
-    client.future = ipcCallTo(target, WasmMigrationWireTag,
-      client.requestBuf.toOpenArray(0, size - 1),
-      addr client.responseBuf[0], client.responseBuf.len,
-      addr client.responseLen, timeoutMs = client.timeoutMs)
-  client.future != nil
+  client.exchangeEncoded()
 
 proc failBeforeRetire(client: var WasmMigrationClient) =
   if client.sourceTaskId != 0 and not client.retired:
@@ -184,7 +211,7 @@ proc failBeforeRetire(client: var WasmMigrationClient) =
   inc client.telemetry.failures
 
 proc uncertain(client: var WasmMigrationClient) =
-  ## Once the source is retired, no timeout or stale reply may resume it.
+  ## A lost authorization or commit must leave the source non-runnable.
   if client.future != nil and client.future.finished: client.future = nil
   client.state = wmcUncertain
   inc client.telemetry.uncertain
@@ -205,10 +232,29 @@ proc startTransfer(client: var WasmMigrationClient, sourceTaskId: uint32,
   client.receiverEpoch = 0
   client.offset = 0
   client.retired = false
+  when defined(wasmManagedMigration):
+    client.awaitingAuthority = false
   client.retries = 0
   client.startTick = nowTick
   client.state = wmcPending
   inc client.telemetry.started
+
+when defined(wasmManagedMigration):
+  proc bindWasmMigrationSourceWorker*(client: var WasmMigrationClient,
+                                       worker: ptr WasmStealClient): bool =
+    if client.state notin {wmcIdle, wmcComplete, wmcFailed} or worker == nil or
+        worker[].coreBit != client.sourceCoreBit.uint32 or
+        worker[].bootId != client.sourceBootId:
+      return false
+    client.worker = worker
+    true
+
+  proc selectBrokerClaim(client: var WasmMigrationClient, sourceTaskId: uint32): bool =
+    client.claim = WasmStealClaim()
+    if client.worker == nil: return true
+    if sourceTaskId != client.worker[].taskId: return false
+    client.claim = client.worker[].currentWasmStealClaim()
+    client.claim.token != 0
 
 proc beginWasmTaskMigration*(client: var WasmMigrationClient,
                              sourceTaskId: uint32,
@@ -218,7 +264,14 @@ proc beginWasmTaskMigration*(client: var WasmMigrationClient,
   if not client.canBegin(sourceTaskId): return false
   let maxBytes = if staging.hasPortableStaging(): staging.len elif client.targetCoreBit == 4 or
       client.sourceCoreBit == 4: 512 else: 4096
-  var captured = beginWasmTaskMigrationCapture(sourceTaskId, maxBytes, staging)
+  when defined(wasmManagedMigration):
+    if not client.selectBrokerClaim(sourceTaskId): return false
+    var captured = if client.claim.token != 0:
+      beginBrokerWasmTaskMigrationCapture(sourceTaskId, maxBytes, staging)
+    else:
+      beginWasmTaskMigrationCapture(sourceTaskId, maxBytes, staging)
+  else:
+    var captured = beginWasmTaskMigrationCapture(sourceTaskId, maxBytes, staging)
   if captured.status notin {wasmMigrationOk, wasmMigrationPending}: return false
   let pending = captured.status == wasmMigrationPending
   when defined(wasmStreamMigration):
@@ -237,7 +290,12 @@ when defined(wasmStreamMigration):
     ## The receiver reserves this upper bound. The producer subsequently
     ## streams into the existing request buffer, retaining a chunk until ACK.
     if not client.canBegin(sourceTaskId): return false
-    var captured = beginWasmTaskMigrationStream(sourceTaskId, maxSnapshotBytes)
+    when defined(wasmManagedMigration):
+      if not client.selectBrokerClaim(sourceTaskId): return false
+      var captured = beginWasmTaskMigrationStream(sourceTaskId, maxSnapshotBytes,
+        brokerManaged = client.claim.token != 0)
+    else:
+      var captured = beginWasmTaskMigrationStream(sourceTaskId, maxSnapshotBytes)
     if captured.status != wasmMigrationOk: return false
     client.streamLimit = maxSnapshotBytes.uint32
     client.streamDone = false
@@ -268,7 +326,15 @@ proc nextPartOrPrepare(client: var WasmMigrationClient): bool =
   else:
     client.send(mwoPrepare)
 
-proc prepared(client: var WasmMigrationClient): bool =
+proc prepared(client: var WasmMigrationClient, checkedSession: uint32): bool =
+  when defined(wasmManagedMigration):
+    if client.claim.token != 0:
+      if not client.worker[].beginWasmStealAuthorizeHandoff(client.targetCoreBit, checkedSession):
+        client.failBeforeRetire()
+        return false
+      client.awaitingAuthority = true
+      inc client.telemetry.prepared
+      return true
   if retireWasmTaskMigration(client.sourceTaskId) != wasmMigrationOk:
     client.failBeforeRetire()
     return false
@@ -285,9 +351,26 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
     return client.state
   if nowTick >= client.startTick and
       nowTick - client.startTick >= client.maxTransferTicks:
-    if client.retired: client.uncertain()
+    if client.retired or (when defined(wasmManagedMigration): client.awaitingAuthority else: false):
+      client.uncertain()
     else: client.failBeforeRetire()
     return client.state
+  when defined(wasmManagedMigration):
+    if client.awaitingAuthority:
+      case client.worker[].pollWasmSteal()
+      of wscPending: discard
+      of wscHandoffRetry: discard client.worker[].retryWasmStealHandoff()
+      of wscIdle:
+        client.retired = true
+        client.awaitingAuthority = false
+        if not client.send(mwoCommit): client.uncertain()
+      of wscReady:
+        if client.worker[].handoffStatus == wssBusy:
+          client.awaitingAuthority = false
+          client.failBeforeRetire()
+        else: client.uncertain()
+      else: client.uncertain()
+      return client.state
   if client.future == nil:
     when defined(wasmStreamMigration):
       if client.streaming():
@@ -308,7 +391,7 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
     if client.retries < WasmMigrationRpcRetries.uint8:
       inc client.retries
       inc client.telemetry.retries
-      if client.send(client.pendingOp): return wmcPending
+      if client.exchangeEncoded(): return wmcPending
     if client.retired: client.uncertain()
     else: client.failBeforeRetire()
     return client.state
@@ -319,8 +402,19 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
     else: client.failBeforeRetire()
     return client.state
   let op = client.pendingOp
+  let checkedSession = when defined(wasmManagedMigration): reply.checkedSession else: 0'u32
   client.future = nil
   client.retries = 0
+  when defined(wasmManagedMigration):
+    if reply.status == mwsRelayPending:
+      if client.usesRelay() and reply.receiverEpoch == client.receiverEpoch and
+          reply.transferId == client.transferId and reply.state == mwIdle and
+          reply.nextOffset == 0 and reply.taskId == 0 and reply.checkedSession == 0:
+        inc client.telemetry.relayPolls
+        if client.exchangeEncoded(): return wmcPending
+      if client.retired: client.uncertain()
+      else: client.failBeforeRetire()
+      return client.state
   if op != mwoHello and (reply.receiverEpoch != client.receiverEpoch or
       reply.transferId != client.transferId) and
       reply.status notin {mwsStaleEpoch, mwsStaleTransfer}:
@@ -332,6 +426,12 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
     if client.retired: client.uncertain()
     else: client.failBeforeRetire()
     return client.state
+  when defined(wasmManagedMigration):
+    if op in {mwoBegin, mwoBeginStream} and client.claim.token != 0 and
+        reply.status == mwsPending and reply.state == mwReceiving and
+        reply.nextOffset == 0 and checkedSession == 0:
+      if not client.send(op): client.failBeforeRetire()
+      return client.state
   var sent = false
   case op
   of mwoHello:
@@ -346,18 +446,23 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
     sent = client.send(if client.streaming(): mwoBeginStream else: mwoBegin)
   of mwoBeginStream:
     if not client.streaming() or reply.status != mwsOk or
-        reply.state != mwReceiving or reply.nextOffset != 0:
+        reply.state != mwReceiving or reply.nextOffset != 0 or
+        (when defined(wasmManagedMigration): client.claim.token != 0 and checkedSession == 0
+         else: false):
       client.failBeforeRetire()
       return client.state
     sent = client.nextPartOrPrepare()
   of mwoBegin:
     if reply.status != mwsOk or reply.state notin
         {mwReceiving, mwPreparing, mwPrepared} or
+        (when defined(wasmManagedMigration):
+           client.claim.token != 0 and reply.state == mwReceiving and checkedSession == 0
+         else: false) or
         reply.nextOffset > client.snapshot.migrationView().len.uint32:
       client.failBeforeRetire()
       return client.state
     client.offset = reply.nextOffset
-    sent = if reply.state == mwPrepared: client.prepared()
+    sent = if reply.state == mwPrepared: client.prepared(checkedSession)
            elif reply.state == mwPreparing: client.send(mwoQuery)
            else: client.nextPartOrPrepare()
   of mwoPart:
@@ -376,11 +481,11 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
       client.telemetry.bytes += client.partCount.uint32
       sent = client.nextPartOrPrepare()
   of mwoPrepare, mwoQuery:
-    if reply.status == mwsPending and reply.state == mwPreparing:
+    if reply.status == mwsPending and reply.state in {mwPreparing, mwCommitting}:
       sent = client.send(mwoQuery)
     elif reply.status == mwsOk and reply.state == mwPrepared:
       sent = if client.retired: client.send(mwoCommit)
-             else: client.prepared()
+             else: client.prepared(checkedSession)
     elif client.retired and reply.status == mwsOk and reply.state == mwActive:
       client.state = wmcComplete
       client.snapshot = WasmTaskMigration()
@@ -391,6 +496,9 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
       else: client.failBeforeRetire()
       return client.state
   of mwoCommit:
+    if reply.status == mwsPending and reply.state == mwCommitting:
+      if not client.send(mwoQuery): client.uncertain()
+      return client.state
     if reply.status == mwsOk and reply.state == mwActive:
       client.state = wmcComplete
       client.snapshot = WasmTaskMigration()
@@ -410,9 +518,10 @@ proc pollWasmTaskMigration*(client: var WasmMigrationClient,
 
 proc retryWasmMigrationCommit*(client: var WasmMigrationClient,
                                nowTick: uint64): bool =
-  ## After an uncertain commit, query the same destination epoch/transfer.
-  ## A stale epoch means the source is gone and the result is unknown/lost.
-  if client.state != wmcUncertain or not client.retired or
+  ## Resolve an uncertain authorization or query the same destination
+  ## epoch and transfer after an uncertain commit.
+  if client.state != wmcUncertain or
+      not (client.retired or (when defined(wasmManagedMigration): client.awaitingAuthority else: false)) or
       client.receiverEpoch == 0 or
       (client.future != nil and not client.future.finished):
     return false
@@ -420,6 +529,8 @@ proc retryWasmMigrationCommit*(client: var WasmMigrationClient,
   client.state = wmcPending
   client.retries = 0
   client.startTick = nowTick
+  when defined(wasmManagedMigration):
+    if client.awaitingAuthority: return true
   if not client.send(mwoQuery):
     client.uncertain()
     return false

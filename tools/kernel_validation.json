@@ -84,7 +84,7 @@
       "kind": "qemu",
       "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_dma_test.nim"}],
       "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
-      "required": ["[PASS] M2M data verified", "[PASS] SPI DMA no-peer readback: 0x00", "=== Test Complete ==="],
+      "required": ["[PASS] Linked M2M data verified", "[PASS] Cancelled bulk SPI transfer", "[PASS] One-byte SPI transfer waits for DMA channels", "[PASS] Linked SPI DMA readback", "=== Test Complete ==="],
       "timeout": 18
     },
     {
@@ -397,7 +397,7 @@
       "name": "m0_usb_cdc_test",
       "tiers": ["full"],
       "kind": "qemu",
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_usb_cdc_test.nim"}],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_usb_cdc_test.nim", "defines": ["bl808UsbPioModel"]}],
       "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
       "required": ["[OK] USB device enumerated and configured", "[PASS] USB CDC loopback verified: Hello USB!", "=== Test Complete ==="],
       "timeout": 35

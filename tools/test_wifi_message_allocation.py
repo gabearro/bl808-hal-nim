@@ -10,6 +10,7 @@ from test_wifi_ap_teardown import procedure
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
+RX_RING_CONFIG_IMPORT = f'import "{ROOT / "src/bl808/wifi/rx_ring_config.nim"}"\n'
 
 PLATFORM = r'''
 type
@@ -133,6 +134,9 @@ def run_program(tmp_path: Path, mode: str, code: str, *, defines: tuple[str, ...
     if nim is None:
         pytest.skip("Nim is required")
     path = tmp_path / "allocation.nim"
+    if "WifiRxRingSlots" in code:
+        # Supply the compile-time setting to extracted RX routines.
+        code = RX_RING_CONFIG_IMPORT + code
     path.write_text(code)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "goto": ["--mm:arc", "--exceptions:goto"],

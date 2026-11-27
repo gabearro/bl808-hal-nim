@@ -20,6 +20,7 @@ const
   UsbFifoByteCountMask = 0x7FF'u32
   UsbConfiguredValue = 1'u8
   UsbAddressAfterConfig = 1'u32 shl 7
+  UsbSendZeroLength = 1'u32 shl 15
 
   DeviceDesc = [18'u8, 1, 0, 2, 2, 2, 0, 64,
                 0x09, 0x12, 0x08, 0xB8, 0, 1, 1, 2, 3, 1]
@@ -41,6 +42,8 @@ const
                  120, 0]
   SerialDesc = [26'u8, 3, 66, 0, 76, 0, 56, 0, 48, 0, 56, 0, 45, 0, 65, 0,
                 78, 0, 67, 0, 72, 0, 79, 0, 82, 0]
+  CdcProductDesc = [16'u8, 3, 67, 0, 68, 0, 67, 0, 32, 0, 65, 0, 67, 0, 77, 0]
+  CdcSerialDesc = [8'u8, 3, 48, 0, 48, 0, 49, 0]
   LineCoding = [0x00'u8, 0x84, 0x03, 0, 0, 0, 8] # 230400 8N1
 
 static:
@@ -51,6 +54,9 @@ static:
 
 var
   isConfigured: bool
+  isAddressed: bool
+  genericCdc: bool
+  cdcLineCoding: array[7, uint8]
   configurationEpoch: uint32
   rxRing: array[RxRingSize, uint8]
   rxHead, rxTail: int
@@ -61,6 +67,7 @@ var
   rxDmaBuf {.align: 64.}: array[64, uint8]
   txDmaBuf {.align: 64.}: array[64, uint8]
   rxBusy, txBusy: bool
+  txNeedsZlp, txZlpBusy: bool
 
 proc delayCycles(count: int) =
   for _ in 0 ..< count:
@@ -150,13 +157,18 @@ proc handleSetup() =
         case (value and 0xFF).uint8
         of 0: sendCtrl(LangDesc, length)
         of 1: sendCtrl(ManufacturerDesc, length)
-        of 2: sendCtrl(ProductDesc, length)
-        of 3: sendCtrl(SerialDesc, length)
+        of 2:
+          if genericCdc: sendCtrl(CdcProductDesc, length)
+          else: sendCtrl(ProductDesc, length)
+        of 3:
+          if genericCdc: sendCtrl(CdcSerialDesc, length)
+          else: sendCtrl(SerialDesc, length)
         else: usbCxStall()
       else: usbCxStall()
     of 5: # SET_ADDRESS
       usbCxDone()
       usbDeviceSetAddress(value.uint8)
+      isAddressed = (value and 0x7F) != 0
     of 9: # SET_CONFIGURATION
       if value == 0 or value == UsbConfiguredValue.uint16:
         if value == 0: inc configurationEpoch
@@ -174,9 +186,14 @@ proc handleSetup() =
   elif (requestType and 0x60) == 0x20 and index == 0:
     case request
     of 0x20: # SET_LINE_CODING: consume seven-byte data stage
-      if length == 7 and ctrlRead(7): usbCxDone()
+      if length == 7 and ctrlRead(7):
+        if genericCdc:
+          for i in 0 ..< cdcLineCoding.len: cdcLineCoding[i] = ctrlBuf[i]
+        usbCxDone()
       else: usbCxStall()
-    of 0x21: sendCtrl(LineCoding, length)
+    of 0x21:
+      if genericCdc: sendCtrl(cdcLineCoding, length)
+      else: sendCtrl(LineCoding, length)
     of 0x22: usbCxDone() # SET_CONTROL_LINE_STATE
     else: usbCxStall()
   else:
@@ -193,9 +210,15 @@ proc txFifoEmpty(): bool {.inline.} =
   (regRead(UsbDevFibc0) and UsbFifoByteCountMask) == 0
 
 proc startTx() =
-  if not isConfigured or txBusy or txHead == txTail: return
+  if not isConfigured or txBusy or txZlpBusy: return
   # DMA can finish filling the single-block FIFO before the host drains it.
   if not txFifoEmpty(): return
+  if txHead == txTail:
+    if txNeedsZlp:
+      txNeedsZlp = false
+      txZlpBusy = true
+      regSet(UsbDevInmps1, UsbSendZeroLength)
+    return
   let txDma = cast[ptr UncheckedArray[uint8]](
     cast[uint](addr txDmaBuf[0]) - OcramCachedBase + OcramBase)
   var n = 0
@@ -205,8 +228,13 @@ proc startTx() =
     inc n
   vdmaStart(VdmaF0Ctl, VdmaF0Addr, txDma, n, true, uncached = true)
   txBusy = true
+  # CDC hosts can hold full packets until a short packet ends the transfer.
+  txNeedsZlp = genericCdc and n == PacketSize
 
-proc initUsbAnchorSerial*() =
+proc initUsbAnchorSerial*(cdc = false) =
+  ## The generic CDC class uses the same VDMA transport and USB sequencing.
+  genericCdc = cdc
+  if cdc: cdcLineCoding = [0x00'u8, 0xC2, 0x01, 0, 0, 0, 8] # 115200 8N1
   # Startup zeros BSS through the cached address; retire that copy before
   # using the uncached alias for bulk IN staging.
   dcacheCleanInvalidateRange(cast[uint](addr txDmaBuf[0]), PacketSize.uint)
@@ -239,6 +267,7 @@ proc initUsbAnchorSerial*() =
   regClear(UsbPhyTst, 1'u32)
 
 proc configured*(): bool = isConfigured
+proc addressed*(): bool = isAddressed
 proc usbConfigurationEpoch*(): uint32 = configurationEpoch
 
 proc pollUsbAnchorSerial*() =
@@ -249,11 +278,18 @@ proc pollUsbAnchorSerial*() =
       # An OUT ZLP carries no stream data. Acknowledge its endpoint latch
       # before clearing the group bit so subsequent OUT packets can proceed.
       regWrite(UsbDevRxz, regRead(UsbDevRxz))
+    if txZlpBusy and (events and (1'u32 shl Isg2Tx0byte)) != 0 and
+        (regRead(UsbDevTxz) and 1) != 0:
+      regWrite(UsbDevTxz, 1)
+      txZlpBusy = false
     if (events and (1'u32 shl Isg2UsbRst)) != 0:
       inc configurationEpoch
       isConfigured = false
+      isAddressed = false
       rxBusy = false
       txBusy = false
+      txNeedsZlp = false
+      txZlpBusy = false
       rxHead = 0
       rxTail = 0
       txHead = 0

@@ -105,8 +105,8 @@ proc display(path, data: string) =
       echo "  note  the 8192 bytes took ", formatFloat(dataUs / 1000, ffDecimal, 1),
         " ms", (if whole: "" else: " or more (the capture ended first)"),
         "; the SPI clock alone needs ", formatFloat(frameUs / 1000, ffDecimal, 1),
-        " ms. The capture itself slows the CPU that feeds the FIFO (its DMA shares",
-        " the bus), so read the real frame rate from \"display frames\" in /stats."
+        " ms. The capture DMA shares the bus with the display DMA, so read",
+        " the normal frame rate from \"display frames\" in /stats."
       check dataUs >= frameUs * 0.98, "not faster than the configured clock allows"
       check (not whole) or dataUs < 90_000, "inside the 100 ms frame deadline"
     return

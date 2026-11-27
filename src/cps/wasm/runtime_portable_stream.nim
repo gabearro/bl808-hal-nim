@@ -210,7 +210,8 @@ proc readPortableStream*(vm: WasmVM, continuation: WasmContinuation,
         let entry = table[].elems[stream.index]
         let raw = wasmValueToRaw(entry)
         let vt = table[].tableType.elemType
-        if entry.kind != vt.toValueKind() or not portableReferenceValid(raw, vt, vm.store.funcs.len):
+        if entry.kind != vt.toValueKind() or
+            not vm.portableTableReferenceValid(table[].tableType, raw):
           return wpsUnsupportedState
         emitValue(raw.uint32)
     of pspGlobals:
@@ -230,7 +231,7 @@ proc readPortableStream*(vm: WasmVM, continuation: WasmContinuation,
           inc stream.index
         else:
           let raw = wasmValueToRaw(global[].value)
-          if vt.isRefType and not portableReferenceValid(raw, vt, vm.store.funcs.len):
+          if vt.isRefType and not vm.portableGlobalReferenceValid(global[].globalType, raw):
             return wpsUnsupportedState
           emitValue(raw)
     of pspElemFlags:

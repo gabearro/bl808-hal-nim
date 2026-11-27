@@ -25,13 +25,12 @@ proc nimFwScanRxFilterProbe*() {.exportc, cdecl, noinline.} =
 
 proc rx_swdesc_init*() {.exportc, cdecl.} =
   ## Initialize RX software descriptors.
-  ## Blob layout is 41 entries of 24 bytes. Each software descriptor stores its
-  ## paired RX header descriptor at offset +4.
+  ## Each software descriptor stores its paired RX header at offset +4.
   let saved = irqSave()
   defer: irqRestore(saved)
   inc rxInitializationEpoch
   rxStationIdentities = default(typeof(rxStationIdentities))
-  for rxSwTableIndex in 0 ..< 41:
+  for rxSwTableIndex in 0 ..< WifiRxRingSlots:
     inc rxUploadEpochs[rxSwTableIndex]
     rxSwTableDescAt(rxSwTableIndex).firstHeaderDesc =
       cast[pointer](rxHeaderHwDescAt(rxSwTableIndex))
@@ -59,8 +58,8 @@ proc rxInitializeHwDescriptors(resetAll: uint32): bool =
   # Constants
   const BAADF00D = 0xBAADF00D'u32
   const C0DEDBAD = 0xC0DEDBAD'u32
-  const HD_COUNT = 41
-  const PD_COUNT = 41
+  const HD_COUNT = WifiRxRingSlots
+  const PD_COUNT = WifiRxRingSlots
   # Each pool needs a current entry and a separate submitted entry. Check both
   # before changing either chain or publishing either DMA head.
   if resetAll == 0:
@@ -261,7 +260,7 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
   let printFn = cast[PrintFn](logFuncPtr)
   if putsFuncPtr != nil:
     cast[PutsFn](putsFuncPtr)("---------- rxl_hwdesc_dump -------\r\n")
-  printFn("rx_dma_hdrdesc: %d\r\n", 41.cint)
+  printFn("rx_dma_hdrdesc: %d\r\n", WifiRxRingSlots.cint)
   block:
     let enterFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(20))
     let leaveFn = cast[proc(level: uint32) {.cdecl.}](blOpsFunc(24))
@@ -269,7 +268,7 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
     let level = if entered: enterFn() else: 0'u32
     defer:
       if entered: leaveFn(level)
-    for headerDescDumpIndex in 0'u32 ..< 41:
+    for headerDescDumpIndex in 0'u32 ..< WifiRxRingSlots.uint32:
       let hd = rxHeaderDumpView(rxHeaderHwDescAt(headerDescDumpIndex.int))
       printFn("  [%2d]@%08lx: upatternrx %08lx next %08lx first_pbd_ptr %08lx, swdesc %p\r\n",
               headerDescDumpIndex.cint, cast[uint](hd).culong, hd.magic.culong,
@@ -282,8 +281,8 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
               hd.timestampLow.culong, hd.timestampHigh.culong,
               hd.rxVector1b.culong, hd.rxVector1c.culong, hd.rxVector1d.culong,
               hd.rxVector2a.culong, hd.rxVector2b.culong, hd.status.culong)
-  printFn("rx_payload_desc: %d\r\n", 41.cint)
-  for payloadDescDumpIndex in 0'u32 ..< 41:
+  printFn("rx_payload_desc: %d\r\n", WifiRxRingSlots.cint)
+  for payloadDescDumpIndex in 0'u32 ..< WifiRxRingSlots.uint32:
     let pd = rxPayloadHwDescAt(payloadDescDumpIndex.int)
     var pktLen: uint32 = 0
     if pd.bufferEnd != 0:
@@ -831,7 +830,7 @@ proc rxReleaseControlFrame(desc: pointer; generation: uint32;
   # Upper RX can publish the frame before a callback returns or reports an
   # error. Neither queued nor host-owned payloads belong to lower RX anymore.
   var queued = rxuCntrlEnvView().uploadList.first
-  var remaining = 41
+  var remaining = WifiRxRingSlots
   while queued != nil and remaining > 0:
     if cast[pointer](queued) == desc:
       ke_evt_set(0x00800000'u32)
@@ -1034,6 +1033,12 @@ proc rxlObserveStaWmm(desc: pointer; vif: ptr VifChannelView; sta: ptr StaInfoVi
   if updateStaWmmFromBeacon(vif, sta, frame, identity.length, (channel[0] shr 16).uint16):
     mmRequestStaEdcaRefresh(vif)
 
+when defined(radioDiag):
+  # JTAG-readable records for RX control dispatches over 2 ms. Each entry is
+  # [atMs, totalUs, frames, maxFrameUs, beacons, beaconCheckUs, upperUs, lastFc].
+  var wifiRxControlSlow*: array[16, array[8, uint32]]
+  var wifiRxControlSlowCount*: uint32
+
 proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ## Drain at most four queued MPDUs, matching the vendor's pre-decremented
   ## five-iteration budget. Run peer power-save/beacon processing before RX
@@ -1057,6 +1062,19 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
     if not recoveryRequested and cntrlEnv.processingFlag == 0 and
         cntrlEnv.queue.first != nil:
       ke_evt_set(0x00100000'u32)
+  when defined(radioDiag):
+    let eventStart = readTick()
+    var frameCount, maxFrameUs, beaconCount, beaconCheckUs, upperUs: uint32
+    var lastFc: uint32
+    defer:
+      let elapsed = uint32(min(ticksToUs(readTick() - eventStart),
+                               high(uint32).uint64))
+      if elapsed > 2_000'u32:
+        let slot = wifiRxControlSlowCount mod wifiRxControlSlow.len.uint32
+        wifiRxControlSlow[slot] = [
+          uint32(ticksToUs(eventStart) div 1000), elapsed, frameCount,
+          maxFrameUs, beaconCount, beaconCheckUs, upperUs, lastFc]
+        inc wifiRxControlSlowCount
   inc nimFwDbgRxlCntrlEvt
   nimFwDbgRxlCntrlHead = pointerAddrU32(cast[pointer](cntrlEnv.queue.first))
 
@@ -1112,6 +1130,9 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
         popped = true
     if not popped:
       continue
+    when defined(radioDiag):
+      inc frameCount
+      let frameStart = readTick()
 
     # Read SW descriptor and buffer chain
     if admission == rxFrameDrop:
@@ -1146,6 +1167,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
       let dbgFc =
         if dbgPayload != nil: cast[ptr uint16](dbgPayload)[].uint32
         else: 0'u32
+      when defined(radioDiag):
+        lastFc = dbgFc
       when defined(bl808WifiDirectCsiProbe):
         let rxNumber = nimFwDirectCsiRxCount
         inc nimFwDirectCsiRxCount
@@ -1258,6 +1281,9 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
             var tim: pointer
             var view: RxBeaconView
             defer: rxCloseBeaconView(view)
+            when defined(radioDiag):
+              inc beaconCount
+              let beaconStart = readTick()
             let beaconChanged = block:
               if frameIdentity.length.int > sizeof(RxPayloadBufferView):
                 view = rxOpenBeaconView(frameIdentity)
@@ -1268,6 +1294,9 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
                 let changed = mm_check_beacon(pBuf, pVif, pSta, addr timAddress)
                 tim = cast[pointer](timAddress)
                 changed
+            when defined(radioDiag):
+              beaconCheckUs += uint32(min(
+                ticksToUs(readTick() - beaconStart), high(uint32).uint64))
             if not currentFrame(): break frameWork
             if beaconChanged == high(uint32): break frameWork
             # WMM follows its own update count, not the RXU beacon fingerprint.
@@ -1291,9 +1320,18 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
       # Shared tail for all dispatch paths (blob has one rxu_cntrl_frame_handle
       # site after post-processing).
       if dispatchFrame and currentFrame():
+        when defined(radioDiag):
+          let upperStart = readTick()
         releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
+        when defined(radioDiag):
+          upperUs += uint32(min(ticksToUs(readTick() - upperStart),
+                                high(uint32).uint64))
         if not releaseFrame:
           break frameWork
+
+    when defined(radioDiag):
+      maxFrameUs = max(maxFrameUs, uint32(min(
+        ticksToUs(readTick() - frameStart), high(uint32).uint64)))
 
   # Unreachable exit (loop exits via return)
   ke_evt_set(0x00100000'u32)
@@ -1316,7 +1354,7 @@ proc rxl_cntrl_dump*() {.exportc, cdecl, noinline.} =
     return
   let logProc = cast[proc(level: uint32; tag, file: cstring; line: cint;
                           format: cstring) {.cdecl, varargs.}](logFn)
-  const SlotCount = 41
+  const SlotCount = WifiRxRingSlots
   var slots: array[SlotCount, uint8]
   var flags: array[SlotCount, uint32]
   var count = 0

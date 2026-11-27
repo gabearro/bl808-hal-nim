@@ -8,6 +8,8 @@
 ## All instances share the same register layout.
 
 import mmio, memmap
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  import dma, dmablock, dmafifo
 
 # =============================================================================
 # I2C register offsets
@@ -155,168 +157,218 @@ proc initI2c*(id: I2cId, speed: I2cSpeed, i2cClkHz: uint32): I2c =
   regSet(base + I2cIntSts, 0x3F'u32 shl I2cIntMaskOffset)
 
 # =============================================================================
-# Transfer helpers (internal)
+# Packet I/O shared by the synchronous and async drivers
 # =============================================================================
-proc waitComplete(i2c: I2c, timeout: uint32 = 500_000): I2cError =
-  ## Wait for transfer to complete. Returns error status.
-  var countdown = timeout
-  while countdown > 0:
-    let sts = regRead(i2c.base + I2cIntSts)
-    if (sts and (1'u32 shl I2cIntEnd)) != 0:
-      # Clear end interrupt
-      regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntEnd + 16))
-      # Check for NAK
-      if (sts and (1'u32 shl I2cIntNak)) != 0:
-        regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntNak + 16))
-        return i2cNak
-      # Check for arbitration lost
-      if (sts and (1'u32 shl I2cIntArb)) != 0:
-        regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntArb + 16))
-        return i2cArbLost
-      return i2cOk
-    countdown.dec
-  i2cTimeout
 
-proc startTransfer(i2c: I2c, address: uint8, isRead: bool, length: uint32,
-                   subAddr: uint32 = 0, subAddrLen: uint32 = 0) =
-  ## Configure and start an I2C transfer.
-  let base = i2c.base
+const
+  I2cPacketMax* = 256
+  I2cInterrupts = 0x3F'u32
+  I2cInterruptMask = I2cInterrupts shl I2cIntMaskOffset
+  I2cInterruptEnable = I2cInterrupts shl 24
+  I2cClearStatus = I2cInterrupts shl I2cIntClrOffset
+  I2cFifoThresholdMask = (1'u32 shl 16) or (1'u32 shl 24)
+  I2cFifoClear = (1'u32 shl I2cFifoTxClr) or (1'u32 shl I2cFifoRxClr)
+  BytesPerFifoWord = 4
 
-  # Clear FIFOs
-  regSet(base + I2cFifoConfig0,
-         (1'u32 shl I2cFifoTxClr) or (1'u32 shl I2cFifoRxClr))
+type I2cPacket* = object
+  bus: I2c
+  buffer: ptr UncheckedArray[byte]
+  size, position: int
+  reading: bool
+  started: bool
+  outcome: I2cError
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    dma: DmaFifoTransfer
+    txWords: seq[uint32]
 
-  # Clear all interrupt flags (clear bits are at +16 offset)
-  regWrite(base + I2cIntSts,
-           (1'u32 shl (I2cIntEnd + 16)) or (1'u32 shl (I2cIntNak + 16)) or
-           (1'u32 shl (I2cIntArb + 16)) or (1'u32 shl (I2cIntFifoErr + 16)))
+proc maskPacketInterrupts*(bus: I2c) =
+  regWrite(bus.base + I2cIntSts, I2cInterruptMask or I2cInterruptEnable)
+
+proc enablePacketInterrupts*(packet: I2cPacket) =
+  var wanted = (1'u32 shl I2cIntEnd) or (1'u32 shl I2cIntNak) or
+    (1'u32 shl I2cIntArb) or (1'u32 shl I2cIntFifoErr)
+  if packet.position < packet.size:
+    wanted = wanted or (1'u32 shl (if packet.reading: I2cIntRxFifo else: I2cIntTxFifo))
+  regWrite(packet.bus.base + I2cIntSts, I2cInterruptEnable or
+    ((I2cInterrupts and not wanted) shl I2cIntMaskOffset))
+
+func packWord(data: ptr UncheckedArray[byte]; offset, count: int): uint32 =
+  for i in 0 ..< count:
+    result = result or (data[offset + i].uint32 shl (8 * i))
+
+when not (defined(bl808m0) or defined(bl808d0) or defined(bl808lp)):
+  proc serviceFifo(packet: var I2cPacket) =
+    let base = packet.bus.base
+    while packet.position < packet.size:
+      let counts = regRead(base + I2cFifoConfig1)
+      let count = min(BytesPerFifoWord, packet.size - packet.position)
+      if packet.reading:
+        if (counts and I2cFifoRxCountMask) == 0: break
+        let word = regRead(base + I2cFifoRdata)
+        for i in 0 ..< count:
+          packet.buffer[packet.position + i] = byte((word shr (8 * i)) and 0xFF)
+      else:
+        if (counts and I2cFifoTxCountMask) == 0: break
+        regWrite(base + I2cFifoWdata, packWord(packet.buffer, packet.position, count))
+      packet.position += count
+
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  proc preparePacketDma(packet: var I2cPacket): bool =
+    let bus = packet.bus
+    var endpoint = DmaFifoEndpoint(enableRegister: bus.base + I2cFifoConfig0,
+                                    width: width32)
+    when defined(bl808m0) or defined(bl808lp):
+      endpoint.controller = CoreDmaId
+      case bus.id
+      of i2c0: endpoint.request = dmaPeriphI2c0Rx.uint32
+      of i2c1: endpoint.request = dmaPeriphI2c1Rx.uint32
+      else: return false
+    else:
+      endpoint.controller = dma2
+      case bus.id
+      of i2c2: endpoint.request = dmaMmI2c2Rx.uint32
+      of i2c3: endpoint.request = dmaMmI2c3Rx.uint32
+      else: return false
+    if packet.reading:
+      endpoint.direction = dmaFifoRead
+      endpoint.address = bus.base + I2cFifoRdata
+      endpoint.enableMask = 1'u32 shl I2cFifoDmaRxEn
+      return packet.dma.prepare(endpoint, packet.buffer, packet.size, pad = true)
+
+    inc endpoint.request
+    endpoint.direction = dmaFifoWrite
+    endpoint.address = bus.base + I2cFifoWdata
+    endpoint.enableMask = 1'u32 shl I2cFifoDmaTxEn
+    if ((cast[uint](packet.buffer) or packet.size.uint) and 3) == 0 and
+        dmaBufferInRam(cast[uint](packet.buffer), packet.size):
+      return packet.dma.prepare(endpoint, packet.buffer, packet.size)
+
+    let words = (packet.size + 3) div 4
+    packet.txWords.setLen(words)
+    for i in 0 ..< words:
+      let offset = 4 * i
+      packet.txWords[i] = packWord(packet.buffer, offset, min(4, packet.size - offset))
+    packet.dma.prepare(endpoint, addr packet.txWords[0], words * 4)
+
+proc usesDma*(packet: I2cPacket): bool =
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp): packet.started
+  else: false
+
+proc beginPacket*(packet: var I2cPacket; bus: I2c; address: uint8;
+                  data: ptr UncheckedArray[byte]; len: int; reading: bool;
+                  subAddress: int = -1): bool =
+  if packet.started or data == nil or len < 1 or len > I2cPacketMax or
+      (regRead(bus.base + I2cConfig) and (1'u32 shl I2cMasterEn)) != 0:
+    return false
+
+  packet.bus = bus
+  packet.buffer = data
+  packet.size = len
+  packet.position = 0
+  packet.reading = reading
+  packet.outcome = i2cOk
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    if not packet.preparePacketDma(): return false
+
+  let base = bus.base
+  regSet(base + I2cFifoConfig0, I2cFifoClear)
+  regClear(base + I2cFifoConfig1, I2cFifoThresholdMask)
+  regWrite(base + I2cIntSts, I2cInterruptMask or I2cClearStatus or I2cInterruptEnable)
 
   var cfg = regRead(base + I2cConfig)
-
-  # Set slave address
-  cfg = (cfg and not I2cSlvAddrMask) or ((address.uint32 and 0x7F) shl I2cSlvAddrShift)
-
-  # Direction
-  if isRead:
-    cfg = cfg or (1'u32 shl I2cPktDir)
-  else:
-    cfg = cfg and not (1'u32 shl I2cPktDir)
-
-  # Packet length (n-1)
-  let pktLen = if length > 0: length - 1 else: 0'u32
-  cfg = (cfg and not I2cPktLenMask) or ((pktLen and 0xFF) shl I2cPktLenShift)
-
-  # Sub-address
-  if subAddrLen > 0:
+  cfg = cfg and not (I2cSlvAddrMask or I2cPktLenMask or
+    I2cSubAddrBcMask or (1'u32 shl I2cSubAddrEn) or (1'u32 shl I2cPktDir))
+  cfg = cfg or ((address.uint32 and 0x7F) shl I2cSlvAddrShift) or
+    ((len - 1).uint32 shl I2cPktLenShift)
+  if reading: cfg = cfg or (1'u32 shl I2cPktDir)
+  if subAddress >= 0:
     cfg = cfg or (1'u32 shl I2cSubAddrEn)
-    cfg = (cfg and not I2cSubAddrBcMask) or (((subAddrLen - 1) and 0x03) shl I2cSubAddrBcShift)
-    regWrite(base + I2cSubAddr, subAddr)
-  else:
-    cfg = cfg and not (1'u32 shl I2cSubAddrEn)
-
+    regWrite(base + I2cSubAddr, subAddress.uint32)
   regWrite(base + I2cConfig, cfg)
 
-  # Start transfer by setting master enable
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    if not packet.dma.start():
+      packet.dma.release()
+      return false
+  else:
+    if not reading: packet.serviceFifo()
+  packet.started = true
   regSet(base + I2cConfig, 1'u32 shl I2cMasterEn)
+  true
 
-# =============================================================================
-# Public API
-# =============================================================================
-proc write*(i2c: I2c, address: uint8, data: openArray[uint8]): I2cError =
-  ## Write data to an I2C slave.
+proc pollPacket*(packet: var I2cPacket): bool =
+  ## Test for completion. The owner must call endPacket once, even on error.
+  if not packet.started: return true
+  let status = regRead(packet.bus.base + I2cIntSts)
+  if (status and (1'u32 shl I2cIntNak)) != 0:
+    packet.outcome = i2cNak
+    return true
+  if (status and (1'u32 shl I2cIntArb)) != 0:
+    packet.outcome = i2cArbLost
+    return true
+  if (status and (1'u32 shl I2cIntFifoErr)) != 0:
+    packet.outcome = i2cFifoError
+    return true
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    case packet.dma.status()
+    of dmaBlockIdle, dmaBlockError:
+      packet.outcome = i2cFifoError
+      return true
+    of dmaBlockRunning: return false
+    of dmaBlockDone: packet.position = packet.size
+  else:
+    packet.serviceFifo()
+  if (status and (1'u32 shl I2cIntEnd)) == 0 or
+      (regRead(packet.bus.base + I2cBusBusy) and 1) != 0:
+    return false
+  if packet.position != packet.size:
+    packet.outcome = i2cFifoError
+  true
+
+proc endPacket*(packet: var I2cPacket; cancelled = false): I2cError =
+  if not packet.started: return i2cFifoError
+  let base = packet.bus.base
+  regWrite(base + I2cIntSts, I2cInterruptMask or I2cClearStatus or I2cInterruptEnable)
+  regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    packet.dma.release(not cancelled and packet.outcome == i2cOk)
+  regSet(base + I2cFifoConfig0, I2cFifoClear)
+  packet.started = false
+  packet.buffer = nil
+  if cancelled: i2cTimeout else: packet.outcome
+
+proc transfer(i2c: I2c; address: uint8; data: ptr UncheckedArray[byte];
+              len: int; reading: bool; subAddress = -1): I2cError =
+  if len == 0: return i2cOk
+  var packet: I2cPacket
+  if not packet.beginPacket(i2c, address, data, len, reading, subAddress):
+    return i2cFifoError
+  var remaining = 500_000
+  while remaining > 0:
+    if packet.pollPacket():
+      return packet.endPacket()
+    dec remaining
+  packet.endPacket(cancelled = true)
+
+proc write*(i2c: I2c; address: uint8; data: openArray[uint8]): I2cError =
   if data.len == 0: return i2cOk
-  let base = i2c.base
+  i2c.transfer(address, cast[ptr UncheckedArray[byte]](unsafeAddr data[0]),
+               data.len, reading = false)
 
-  # Load TX FIFO before starting
-  for i in 0 ..< min(data.len, I2cFifoDepth.int):
-    regWrite(base + I2cFifoWdata, data[i].uint32)
-
-  startTransfer(i2c, address, isRead = false, length = data.len.uint32)
-
-  # Feed remaining data
-  var idx = I2cFifoDepth.int
-  while idx < data.len:
-    let txFree = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
-    if txFree > 0:
-      regWrite(base + I2cFifoWdata, data[idx].uint32)
-      idx.inc
-
-  # Wait for transfer to complete
-  result = waitComplete(i2c)
-  # Disable master after transfer
-  regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
-
-proc read*(i2c: I2c, address: uint8, buf: var openArray[uint8]): I2cError =
-  ## Read data from an I2C slave.
+proc read*(i2c: I2c; address: uint8; buf: var openArray[uint8]): I2cError =
   if buf.len == 0: return i2cOk
-  let base = i2c.base
+  i2c.transfer(address, cast[ptr UncheckedArray[byte]](addr buf[0]),
+               buf.len, reading = true)
 
-  startTransfer(i2c, address, isRead = true, length = buf.len.uint32)
-
-  # Read data from RX FIFO
-  var idx = 0
-  var timeout = 500_000'u32
-  while idx < buf.len and timeout > 0:
-    let rxCount = (regRead(base + I2cFifoConfig1) and I2cFifoRxCountMask) shr I2cFifoRxCountShift
-    if rxCount > 0:
-      buf[idx] = (regRead(base + I2cFifoRdata) and 0xFF).uint8
-      idx.inc
-    else:
-      timeout.dec
-
-  if timeout == 0:
-    regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
-    return i2cTimeout
-
-  result = waitComplete(i2c)
-  regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
-
-proc writeReg*(i2c: I2c, address: uint8, regAddr: uint8, data: openArray[uint8]): I2cError =
-  ## Write to a register (sub-address) on an I2C slave.
+proc writeReg*(i2c: I2c; address, regAddr: uint8; data: openArray[uint8]): I2cError =
   if data.len == 0: return i2cOk
-  let base = i2c.base
+  i2c.transfer(address, cast[ptr UncheckedArray[byte]](unsafeAddr data[0]),
+               data.len, reading = false, subAddress = regAddr.int)
 
-  # Load TX data
-  for i in 0 ..< min(data.len, I2cFifoDepth.int):
-    regWrite(base + I2cFifoWdata, data[i].uint32)
-
-  startTransfer(i2c, address, isRead = false, length = data.len.uint32,
-                subAddr = regAddr.uint32, subAddrLen = 1)
-
-  var idx = I2cFifoDepth.int
-  while idx < data.len:
-    let txFree = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
-    if txFree > 0:
-      regWrite(base + I2cFifoWdata, data[idx].uint32)
-      idx.inc
-
-  result = waitComplete(i2c)
-  regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
-
-proc readReg*(i2c: I2c, address: uint8, regAddr: uint8, buf: var openArray[uint8]): I2cError =
-  ## Read from a register (sub-address) on an I2C slave.
+proc readReg*(i2c: I2c; address, regAddr: uint8; buf: var openArray[uint8]): I2cError =
   if buf.len == 0: return i2cOk
-  let base = i2c.base
-
-  startTransfer(i2c, address, isRead = true, length = buf.len.uint32,
-                subAddr = regAddr.uint32, subAddrLen = 1)
-
-  var idx = 0
-  var timeout = 500_000'u32
-  while idx < buf.len and timeout > 0:
-    let rxCount = (regRead(base + I2cFifoConfig1) and I2cFifoRxCountMask) shr I2cFifoRxCountShift
-    if rxCount > 0:
-      buf[idx] = (regRead(base + I2cFifoRdata) and 0xFF).uint8
-      idx.inc
-    else:
-      timeout.dec
-
-  if timeout == 0:
-    regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
-    return i2cTimeout
-
-  result = waitComplete(i2c)
-  regClear(base + I2cConfig, 1'u32 shl I2cMasterEn)
+  i2c.transfer(address, cast[ptr UncheckedArray[byte]](addr buf[0]),
+               buf.len, reading = true, subAddress = regAddr.int)
 
 proc writeRegByte*(i2c: I2c, address: uint8, regAddr: uint8, value: uint8): I2cError =
   ## Convenience: write a single byte to a register.

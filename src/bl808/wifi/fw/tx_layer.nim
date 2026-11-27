@@ -185,19 +185,26 @@ proc txlEnqueuePrepared(param, linkPtr: pointer; queueIdx: uint32) =
 when defined(bl808m0):
   const
     TxFeedbackRateMask = 0x3FFF'u32
-    TxFeedbackSlotAttempts = 4
+    TxFeedbackRetryMask = 7'u32 shl 29
+    TxFeedbackRateRetries = 4'u32 shl 29
+    # The primary rate gets the initial transmission plus four retries.
+    # The eight-attempt frame limit leaves at most three for the next rate.
+    TxFeedbackPrimaryAttempts = 5'u32
 
   proc txlHostSlot(desc: ptr HostTxDescView): int =
-    # Same slot geometry as ipc_host_init. Reject internal descriptors before
-    # looking at the overlapping inline buffer past desc.callback.
-    const wrapperOffset = 6932'u
-    const wrapperSize = 620'u
-    let first = cast[uint](addr ipcSharedEnv[0]) + wrapperOffset +
-      offsetof(IpcHostTxWrapperView, txDesc).uint
-    let offset = cast[uint](desc) - first
-    if offset >= wrapperSize * txRateTrialTag.len.uint or offset mod wrapperSize != 0:
-      return -1
-    (offset div wrapperSize).int
+    when defined(bl808WifiSplitTxSlots):
+      hostIpc.ipcHostTxDmaIndex(ipcHostTxWrapperFromDesc(desc))
+    else:
+      # Same slot geometry as ipc_host_init. Reject internal descriptors before
+      # looking at the overlapping inline buffer past desc.callback.
+      const wrapperOffset = 6932'u
+      const wrapperSize = 620'u
+      let first = cast[uint](addr ipcSharedEnv[0]) + wrapperOffset +
+        offsetof(IpcHostTxWrapperView, txDesc).uint
+      let offset = cast[uint](desc) - first
+      if offset >= wrapperSize * txRateTrialTag.len.uint or offset mod wrapperSize != 0:
+        return -1
+      (offset div wrapperSize).int
 
   proc txlPolicyRates(policy: ptr HostTxRateTemplateView): array[4, uint32] {.inline.} =
     [policy.rateWord, policy.retryRateControl0, policy.retryRateControl1,
@@ -753,9 +760,10 @@ when defined(bl808m0):
     if attempts > 8:
       return
     let words = txlPolicyRates(policy)
-    for i in 0 ..< (attempts.int + TxFeedbackSlotAttempts - 1) div TxFeedbackSlotAttempts:
-      if (words[i] and 0x8000_0000'u32) == 0:
-        return
+    if (words[0] and TxFeedbackRetryMask) != TxFeedbackRateRetries or
+        (attempts > TxFeedbackPrimaryAttempts and
+          (words[1] and TxFeedbackRetryMask) != TxFeedbackRateRetries):
+      return
     result = TxRateFeedback(session: txlCaptureSession(desc), trial: trial, samples: samples,
                             attempts: attempts.uint8, failed: failed)
     for i, word in words:
@@ -779,7 +787,8 @@ when defined(bl808m0):
     let activeTrial = txlCurrentRateTrial(staIdx)
     let trialSlot = (feedback.trial and 3).int
     let sampleShift = trialSlot * 4
-    let reachedTrialSlot = trialSlot * TxFeedbackSlotAttempts < feedback.attempts.int
+    let reachedTrialSlot = trialSlot == 0 or
+      (trialSlot == 1 and feedback.attempts.uint32 > TxFeedbackPrimaryAttempts)
     var trial = activeTrial
     if activeTrial.tag == 0 and feedback.trial != 0 and epochCurrent and reachedTrialSlot:
       # A second completion can credit a finished trial before its chain is restored.
@@ -799,7 +808,7 @@ when defined(bl808m0):
       samples = samples or (0xF'u16 shl sampleShift)
     rcAccountCounters(staIdx, feedback.attempts.uint32,
       feedback.attempts.uint32 - (not feedback.failed).uint32,
-      unsafeAddr feedback.rates, finishTrial, samples)
+      unsafeAddr feedback.rates, finishTrial, samples, TxFeedbackPrimaryAttempts)
 
 proc txlCfmPending(acList: ptr CoList): bool {.inline.} =
   acList.first != nil
@@ -1451,6 +1460,8 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   # Count the owner before PS notification can drain the postponed queue.
   let frameEnv = txFrameEnv()
   frameEnv.postponedCount = frameEnv.postponedCount + 1
+  when defined(bl808m0):
+    if vifTx.vifType == VIF_TYPE_STA: requestPostponedTx()
   apm_tx_int_ps_postpone(param, staEntry)
   return 1'u8
 
@@ -2740,6 +2751,12 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       inc nimFwDbgTxTrigNotReady
       return  # THD not ready (bit 31 clear) -- .L126
 
+    when defined(bl808WifiSplitTxSlots):
+      template releasePrimaryHostSlot(waitingForSuccessor: bool) =
+        if hostMarker != nil and hostIpc.ipcHostTxPrimaryDone(
+            ipcHostTxWrapperFromDesc(desc), waitingForSuccessor):
+          bl808_wifi_backend_signal_work()
+
     # Check for chained descriptors at desc[8] and desc[108]
     let nextDesc = desc.queueFirst
     if nextDesc != nil:
@@ -2780,6 +2797,8 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       let secStatus = volatileLoad(cast[ptr uint32](cast[uint](secView) +
         offsetof(HostTxHwDescView, controlFlags).uint))
       if (secStatus and 0x80000000'u32) == 0:
+        when defined(bl808WifiSplitTxSlots):
+          releasePrimaryHostSlot(true)
         # The reference only rearms the AC timer until the successor is done.
         inc nimFwDbgTxTrigSecNotReady
         nimFwDbgTxTrigSecCtrl = secStatus
@@ -2789,6 +2808,9 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
         blmac_abs_timer_set(ac, ipcBase + TX_TIMEOUT_LOCAL[ac])
         return
       # Successor DONE: fall through to pop path (.L134).
+
+    when defined(bl808WifiSplitTxSlots):
+      releasePrimaryHostSlot(false)
 
     when defined(bl808WifiDiagEapolRfGain):
       let index = nimFwDbgEapolRfGainCount
@@ -2991,6 +3013,7 @@ proc txl_reset*(): bool {.exportc, cdecl, discardable.} =
     txlAcPending[ac] = 0
     txlAcBusy[ac] = false
   txCtrl.resetInProgress = 0
+  when defined(bl808m0): postponedTxChannelReady()
   true
 
 proc txl_machdr_format*(param: pointer) {.exportc, cdecl.} =
@@ -3859,13 +3882,19 @@ proc wifi_nimfw_reconcile_postponed_count() =
     nimFwDbgPostponedReconcileNew = actual
     frameEnv.postponedCount = actual
 
-proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =
+proc serviceStaPostponed(limit: uint32; reconcile: bool): uint32 =
   ## Bounded service hook for STA-mode frames deferred by txl_cntrl_push_int
   ## while the channel scheduler was temporarily not admitting TX.
+  when defined(bl808m0) and defined(radioProfiler):
+    let span = beginProfileSpan()
   let saved = irqSave()
-  defer: irqRestore(saved)
+  defer:
+    irqRestore(saved)
+    when defined(bl808m0) and defined(radioProfiler):
+      endProfileSpan(span, prWifiDeferredTx, work = result)
   inc nimFwDbgPostponedServiceCalls
   if txlResetting(): return 0
+  if reconcile: wifi_nimfw_reconcile_postponed_count()
   let resetEpoch = txResetEpoch
   let maxFrames = if limit == 0'u32: 1'u32 else: limit
   var owners: array[MAX_VIFS, StaQueueIdentity]
@@ -3875,7 +3904,8 @@ proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.}
         vif.staIdx >= STA_INFO_TAB_ENTRIES.uint8:
       continue
     let sta = staInfoForIdx(vif.staIdx)
-    if sta.valid != 0 and sta.instNbr == staPostponedVifIndex:
+    if sta.valid != 0 and sta.instNbr == staPostponedVifIndex and
+        sta.postponedList.first != nil:
       owners[staPostponedVifIndex] = staPostponedOwner(cast[pointer](sta))
   var sent = 0'u32
   for owner in owners:
@@ -3894,9 +3924,15 @@ proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.}
     sent += postponedFramesSent
     nimFwDbgPostponedServiceSent += postponedFramesSent
     if sent >= maxFrames: break
-  if sent == 0'u32 and txResetEpoch == resetEpoch and not txlResetting():
-    wifi_nimfw_reconcile_postponed_count()
+  when defined(bl808m0):
+    if sent >= maxFrames and txResetEpoch == resetEpoch and
+        txFrameEnv().postponedCount != 0:
+      requestPostponedTx()
   sent
+
+proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =
+  ## Synchronous callers can ask to reconcile and service the queue now.
+  serviceStaPostponed(limit, reconcile = true)
 
 proc rfc_channel_ops*(channel: uint32): uint32 {.exportc, cdecl.}
 

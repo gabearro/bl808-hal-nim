@@ -1,0 +1,5 @@
+package ox64:maps@0.2.0;
+
+world map-demo {
+  export roundtrip: func(entries: map<u8, u64>) -> map<u8, u64>;
+}

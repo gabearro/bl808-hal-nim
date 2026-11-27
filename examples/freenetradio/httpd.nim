@@ -34,6 +34,8 @@
 import std/macros
 import ./text, ./timebase, ./status, ./presets, ./remote, ./ir_nec, ./ui,
        ./diag, ./about, ./webpage, ./netio
+when defined(bl808m0) and defined(radioProfiler):
+  import bl808/kernel/profiler
 
 const
   RequestMax* = 1024
@@ -86,6 +88,8 @@ type
     frameOut: bool           # a frame was handed out; release the display next
     recording: bool          # this reply holds `ui.capture`
     waitSinceMs: uint64
+    when defined(bl808m0) and defined(radioProfiler):
+      profileReader: bool
 
   StackUsageProc* = proc(unused, total: var int) {.nimcall.}
 
@@ -501,6 +505,37 @@ proc posted(body: openArray[char]; form: bool; field: string): Text[256] =
   elif validUtf8(body):
     result.add body
 
+when defined(bl808m0) and defined(radioProfiler):
+  proc profileReply(r: var Reply; isGet, isPost: bool;
+                    path, body: openArray[char]) =
+    expireProfile()
+    if isPost and (path.equals("/profile/start") or path.equals("/profile/start-summary")):
+      var windowMs = 30_000'u32
+      if body.len != 0 and (not parseUint(body, windowMs) or
+                           windowMs notin 100'u32 .. 120_000'u32):
+        r.plain("400 Bad Request", "expected a duration in milliseconds (100 to 120000)\n")
+      elif startProfile(windowMs, recordTrace = path.equals("/profile/start")):
+        r.plain("200 OK", "recording\n")
+      else:
+        r.plain("409 Conflict", "profiler busy or out of memory\n")
+    elif isPost and path.equals("/profile/stop"):
+      stopProfile()
+      r.plain("200 OK", "stopped\n")
+    elif isGet and path.equals("/profile/capture"):
+      if recordingProfile():
+        r.plain("409 Conflict", "recording\n")
+      else:
+        var size: int
+        let data = borrowProfile(size)
+        if data == nil:
+          r.plain("404 Not Found", "no capture\n")
+        else:
+          r.profileReader = true
+          r.respond("200 OK", "application/octet-stream",
+            Chunk(data: cast[ptr UncheckedArray[byte]](data), len: size))
+    else:
+      r.plain("404 Not Found", "not found\n")
+
 proc begin*(r: var Reply; req: openArray[char]; headLen, bodyLen: int;
             diagRoutes = DiagEnabled) =
   ## Route a complete request (`scan` said `scReady`), act on it and set up
@@ -531,6 +566,11 @@ proc begin*(r: var Reply; req: openArray[char]; headLen, bodyLen: int;
 
   r.stage = sgDone
   r.html = acceptsHtml(head)
+
+  when defined(bl808m0) and defined(radioProfiler):
+    if path.startsWith("/profile/"):
+      r.profileReply(isGet, isPost, path, body)
+      return
 
   if isGet and path.equals("/"):
     # Every browser accepts gzip; there is no plain copy.
@@ -730,6 +770,10 @@ proc finish*(r: var Reply) =
   ## The connection is over (reply complete, client gone or out of time):
   ## give back anything the reply was holding.
   r.stopRecording()
+  when defined(bl808m0) and defined(radioProfiler):
+    if r.profileReader:
+      releaseProfile()
+      r.profileReader = false
   r.stage = sgDone
 
 # ---- One connection's exchange ---------------------------------------------------

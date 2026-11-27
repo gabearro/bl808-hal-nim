@@ -1,0 +1,6 @@
+package ox64:future-fixture;
+
+world future-bounce {
+    export bounce: func(value: future<u8>) -> future<u8>;
+    export tagged-bounce: func(value: tuple<future<u8>, u32>) -> tuple<future<u8>, u32>;
+}

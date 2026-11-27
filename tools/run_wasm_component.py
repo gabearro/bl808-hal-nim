@@ -41,7 +41,15 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
                function_equality_case=False, contract_equality_case=False,
                instance_equality_case=False, contract_capture_case=False,
                lexical_resource_value_case=False, local_lower_case=False,
-               generated_core_case=False, cross_post_return_case=False, tag_case=False):
+               generated_core_case=False, cross_post_return_case=False, tag_case=False,
+               multi_memory_case=False, resource_visibility_case=False,
+               name_attributes_case=False, core_function_types_case=False, map_case=False,
+               fixed_list_case=False, context_case=False, resource_ascription_case=False,
+               callback_case=False, subtasks_case=False, lp_subtasks_diagnostic=None,
+               subtask_cancellation=False, stackful_case=False, sync_lower_case=False,
+               async_borrow_case=False, future_wait_case=False, future_transfer_case=False,
+               stream_case=False, host_endpoint_case=False, guest_thread_case=False,
+               error_context_case=False, thread_spawn_case=False):
     linker = "tools/wasm_full_qemu.ld" if core == "lp" else "tools/wasm_full_qemu_large.ld"
     label = "core-graph" if core_graph_case else "option-string" if option_string_case else "qwords" if qwords_case else "words" if words_case else "char" if char_case else "flags" if flags_case else "tuple" if tuple_case else "result" if result_case else "enum" if enum_case else "variant" if variant_case else "option" if option_case else "record-mixed" if mixed_case else "record" if record_case else "bytes" if bytes_case else "string-result" if string_result else "string" if string else "scalar"
     if nested_case:
@@ -94,9 +102,50 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
         label = "cross-post-return"
     if tag_case:
         label = "tag-link"
+    if multi_memory_case:
+        label = "multi-memory"
+    if resource_visibility_case:
+        label = "resource-visibility"
+    if resource_ascription_case:
+        label = "resource-ascription"
+    if name_attributes_case:
+        label = "name-attributes"
+    if core_function_types_case:
+        label = "core-function-types"
+    if map_case:
+        label = "map"
+    if fixed_list_case:
+        label = "fixed-list"
+    if context_case:
+        label = "context"
+    if error_context_case:
+        label = "error-context"
+    if callback_case:
+        label = "callback-turns"
+    if subtasks_case:
+        label = "async-subtasks-cross-component" if lp_subtasks_diagnostic == "cross" else "async-subtasks"
+        if subtask_cancellation:
+            label = "async-subtask-cancellation"
+        if stackful_case:
+            label = "async-stackful"
+        if sync_lower_case:
+            label = "async-sync-lower"
+        if async_borrow_case:
+            label = "async-borrows-cross-component" if lp_subtasks_diagnostic else "async-borrows"
+        if future_wait_case:
+            label = "future-wait"
+        if future_transfer_case:
+            label = "future-transfer"
+        if stream_case:
+            label = "stream-partial"
+        if host_endpoint_case:
+            label = "host-endpoint"
+        if guest_thread_case:
+            label = "thread-spawn" if thread_spawn_case else "guest-threads"
     elf = OUT / f"component-{label}-qemu-{core}.elf"
     memory_flags = ""
-    lp_ram_bytes = 32768 if foreign_borrow_case or host_definition_case or cross_post_return_case else 16384
+    lp_ram_bytes = 32768 if (foreign_borrow_case or host_definition_case or
+                              cross_post_return_case or lp_subtasks_diagnostic) else 16384
     if core == "lp":
         if nested_case or definition_relay_case:
             stack = 4928
@@ -108,7 +157,7 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
             stack = 4960
         elif foreign_borrow_case:
             stack = 6656
-        elif host_definition_case:
+        elif host_definition_case or lp_subtasks_diagnostic:
             stack = 6144
         elif option_string_case:
             stack = 4224
@@ -118,6 +167,10 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
             stack = 3136
         elif local_lower_case:
             stack = 6400
+        elif sync_lower_case:
+            stack = 5120
+        elif instance_equality_case or fixed_list_case or context_case or error_context_case:
+            stack = 4608
         elif cross_post_return_case:
             stack = 8192
         else:
@@ -127,11 +180,14 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
             memory_flags += f"-Wl,--defsym=__qemu_lp_ram_override={lp_ram_bytes} "
     elif core == "d0" and nested_value_case:
         memory_flags = "-Wl,--defsym=__qemu_stack_override=12288 "
+    elif core == "d0" and async_borrow_case:
+        memory_flags = "-Wl,--defsym=__qemu_stack_override=20480 "
     elif (nested_case or interface_case or resource_case or foreign_borrow_case or
           resource_bundle_case or linked_resource_bundle_case or typed_import_case or
           host_definition_case or core_module_case or definition_relay_case or nested_instance_case or
           outer_capture_case or function_equality_case or contract_equality_case or instance_equality_case or
-          contract_capture_case or lexical_resource_value_case or cross_post_return_case):
+          contract_capture_case or lexical_resource_value_case or cross_post_return_case or
+          resource_visibility_case or resource_ascription_case or subtasks_case):
         memory_flags = "-Wl,--defsym=__qemu_stack_override=16384 "
     if core == "d0" and lexical_resource_value_case:
         memory_flags += "-Wl,--defsym=__qemu_heap_override=294912 "
@@ -141,7 +197,30 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
         "--gcc.linkerexe:riscv64-unknown-elf-gcc", "--mm:arc",
         "-d:useMalloc", "-d:nimNoLibc", "-d:noSignalHandler",
         f"-d:bl808{core}", "-d:bl808WasmFull",
-        *(["-d:wasmComponentLocalReentry"] if core == "lp" and local_lower_case else []),
+        *(["-d:wasmComponentCanonicalNames"] if name_attributes_case else []),
+        *(["-d:wasmComponentFixedLists"] if fixed_list_case else []),
+        *(["-d:wasmComponentContext"] if context_case else []),
+        *(["-d:wasmComponentErrorContext"] if error_context_case else []),
+        *(["-d:wasmComponentAsyncCallbacks"] if callback_case or subtasks_case else []),
+        *(["-d:wasmComponentSubtasksDiagnosticQemu"] if lp_subtasks_diagnostic == "cross" else []),
+        *(["-d:wasmComponentCancellationQemu"] if subtask_cancellation else []),
+        *(["-d:wasmComponentStackful"] if stackful_case or sync_lower_case or future_wait_case or
+          guest_thread_case or
+          (async_borrow_case and core != "lp") else []),
+        *(["-d:wasmComponentFutures"] if future_wait_case or future_transfer_case else []),
+        *(["-d:wasmComponentFutureWaitQemu"] if future_wait_case else []),
+        *(["-d:wasmComponentFutureTransferQemu"] if future_transfer_case else []),
+        *(["-d:wasmComponentStreams", "-d:wasmComponentStreamQemu"] if stream_case else []),
+        *(["-d:wasmComponentStreams", "-d:wasmComponentHostEndpoints",
+           "-d:wasmComponentHostEndpointQemu"] if host_endpoint_case else []),
+        *(["-d:wasmComponentThreads", "-d:wasmComponentGuestThreadsQemu"] if guest_thread_case else []),
+        *(["-d:wasmComponentThreadSpawn", "-d:wasmFunctionReferences",
+           "-d:wasmComponentThreadSpawnQemu"] if thread_spawn_case else []),
+        *(["-d:wasmComponentStackfulQemu"] if stackful_case else []),
+        *(["-d:wasmComponentSyncLowerQemu"] if sync_lower_case else []),
+        *(["-d:wasmComponentAsyncBorrowsQemu"] if async_borrow_case else []),
+        *(["-d:wasmComponentAsyncBorrowsForeignQemu"] if async_borrow_case and lp_subtasks_diagnostic else []),
+        *(["-d:wasmComponentLocalReentry"] if core == "lp" and (local_lower_case or sync_lower_case) else []),
         "-d:wasmComponentLinkedResourceBundleQemu" if linked_resource_bundle_case else
         "-d:wasmComponentResourceBundleQemu" if resource_bundle_case else
         "-d:wasmComponentTypedImportQemu" if typed_import_case else
@@ -159,6 +238,17 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
         "-d:wasmComponentGeneratedCoreQemu" if generated_core_case else
         "-d:wasmComponentCrossPostReturnQemu" if cross_post_return_case else
         "-d:wasmComponentTagLinkQemu" if tag_case else
+        "-d:wasmComponentMultiMemoryQemu" if multi_memory_case else
+        "-d:wasmComponentResourceVisibilityQemu" if resource_visibility_case else
+        "-d:wasmComponentResourceAscriptionQemu" if resource_ascription_case else
+        "-d:wasmComponentCallbackQemu" if callback_case else
+        "-d:wasmComponentSubtasksQemu" if subtasks_case else
+        "-d:wasmComponentNameAttributesQemu" if name_attributes_case else
+        "-d:wasmComponentCoreFunctionTypesQemu" if core_function_types_case else
+        "-d:wasmComponentMapQemu" if map_case else
+        "-d:wasmComponentFixedListQemu" if fixed_list_case else
+        "-d:wasmComponentContextQemu" if context_case else
+        "-d:wasmComponentErrorContextQemu" if error_context_case else
         "-d:wasmComponentForeignBorrowQemu" if foreign_borrow_case else
         "-d:wasmComponentNestedValueQemu" if nested_value_case else
         "-d:wasmComponentNestedListQemu" if nested_list_case else
@@ -184,11 +274,13 @@ def check_qemu(core, cpu, march, abi, model, string=False, string_result=False,
         "-d:wasmComponentStringResultQemu" if string_result else
         "-d:wasmComponentStringQemu" if string else "-d:wasmComponentQemu",
         *(["-d:wasmChunkedMemory", "-d:WasmMemoryChunkBytesConfig=512"]
-          if label not in ("scalar", "nested-bool", "named-interface", "resource", "foreign-borrow",
+          if not (subtasks_case and core == "lp") and label not in (
+                           "scalar", "nested-bool", "named-interface", "resource", "foreign-borrow",
                            "typed-import", "host-definition", "core-module", "definition-relay",
                            "nested-instance", "outer-capture", "function-equality",
                            "contract-equality", "instance-equality", "contract-capture",
-                           "lexical-resource-value", "tag-link") else []),
+                           "lexical-resource-value", "tag-link", "resource-visibility", "resource-ascription",
+                           "name-attributes", "core-function-types", "callback-turns") else []),
         "--noMain:on", "--threads:off", "--checks:off", "--assertions:off",
         "--stackTrace:off", "--lineTrace:off", "--panics:on",
         f"--passC:-march={march} -mabi={abi} -mcmodel=medany -ffunction-sections -fdata-sections -fno-builtin",
@@ -1016,8 +1108,14 @@ def main():
                              cwd=ROOT, capture_output=True, text=True)
     assert verdict.returncode != 0 and "type mismatch" in verdict.stderr, verdict.stderr
     components.append(tag_binary)
+    attributes = OUT / "name_attributes.wasm"
+    run("wasm-tools", "strip", "--all", "tools/wasm_component_name_attributes.wat",
+        "-o", str(attributes))
+    run("wasm-tools", "validate", "--features=cm-canon-names", str(attributes))
+    components.append(attributes)
     output = run("nim", "c", "-r", "--skipUserCfg", "--skipParentCfg",
         "--skipProjCfg", "--path:src", "--checks:on", "--assertions:on",
+        "-d:wasmComponentCanonicalNames",
         "--nimcache:" + str(OUT / "nimcache"), "--out:" + str(OUT / "test"),
         "tools/test_wasm_component.nim", *map(str, components))
     assert "component scalar ABI:ok" in output, output
@@ -1095,6 +1193,7 @@ def main():
     if args.qemu_interface:
         for core, target in CORES.items():
             check_qemu(core, *target, interface_case=True)
+            check_qemu(core, *target, name_attributes_case=True)
     if args.qemu_typed_imports:
         for core, target in CORES.items():
             check_qemu(core, *target, host_definition_case=True)

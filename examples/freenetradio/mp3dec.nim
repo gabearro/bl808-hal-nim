@@ -5,19 +5,20 @@
 ## Built as upstream builds it: Layer III only (Layer I/II frames are found
 ## and reported as `dsUnsupportedLayer`), scalar kernels, 16-bit output
 ## rounded half away from zero. Procedures keep minimp3's names and order so
-## this file can be read next to `vendor/nanomp3-core/src/minimp3.rs`. Every
-## float expression is evaluated in upstream's order, which keeps the output
-## bit-identical (`tests/t_mp3dec.nim` checks that against the Rust decoder).
+## this file can be read next to `vendor/nanomp3-core/src/minimp3.rs`. The
+## default build keeps the same floating-point operation order for the
+## reference tests. The D0 playback worker can use fused operations.
 ##
-## Pure Nim, no HAL imports, no heap: one `Mp3Decoder` is about 22 KB and is
-## allocated once by the audio task. `decode` uses under 1 KB of stack on the
-## M0 (measured with -fstack-usage).
+## No HAL imports or heap: one `Mp3Decoder` is about 22 KB and is allocated
+## once by the audio task. `decode` uses under 1 KB of stack on the M0
+## (measured with -fstack-usage).
 
 import ./mp3tables
 
-# Upstream compiles the decoder at opt-level 3, and Rust never fuses a
-# multiply and an add; a fused one would round differently.
-{.localPassC: "-O3 -ffp-contract=off".}
+when defined(bl808d0):
+  {.localPassC: "-O3 -ffp-contract=fast".}
+else:
+  {.localPassC: "-O3 -ffp-contract=off".}
 
 const
   MaxSamplesPerFrame* = 1152 * 2
@@ -51,6 +52,7 @@ type
     dsReservoirUnavailable  ## needs bit-reservoir data that was not decoded
     dsCorrupt
     dsUnsupportedLayer      ## Layer I/II (not decoded, as upstream's build)
+    dsPending               ## An asynchronous decoder owns the submitted input.
 
   FrameInfo* = object
     samplesProduced*: int   ## per channel; 0 when no audio came out
@@ -868,15 +870,22 @@ func toPcm16(x: float32): int16 {.inline.} =
   ## minimp3's, which maps (-1.5, -0.5] to 0). NaN becomes 0.
   if x != x:
     return 0
-  if x >= 32767.0'f32:
-    return 32767
-  if x <= -32768.0'f32:
-    return -32768
-  let t = int32(x) # truncates toward zero
-  let frac = x - float32(t)
-  if frac >= 0.5'f32: int16(t + 1)
-  elif frac <= -0.5'f32: int16(t - 1)
-  else: int16(t)
+  when defined(bl808m0):
+    # RMM rounds ties away from zero. The conversion saturates at int32
+    # limits, so clipping the integer also handles values outside that range.
+    var rounded: int32
+    {.emit: ["asm (\"fcvt.w.s %0, %1, rmm\" : \"=r\"(", rounded, ") : \"f\"(", x, "));"].}
+    int16(clamp(rounded, -32768'i32, 32767'i32))
+  else:
+    if x >= 32767.0'f32:
+      return 32767
+    if x <= -32768.0'f32:
+      return -32768
+    let t = int32(x) # truncates toward zero
+    let frac = x - float32(t)
+    if frac >= 0.5'f32: int16(t + 1)
+    elif frac <= -0.5'f32: int16(t - 1)
+    else: int16(t)
 
 func mp3dSynthPair(lins: array[SynFloats, float32]; row: int;
                    first, second: var float32) {.inline.} =
@@ -905,8 +914,8 @@ func mp3dSynthPair(lins: array[SynFloats, float32]; row: int;
   a = a + z(0) * -5.0'f32
   second = a
 
-func mp3dSynth(grbuf: array[2 * 576, float32]; xl, xr: int;
-               pcm: var openArray[int16]; dst, nch: int;
+func mp3dSynth(grbuf: array[2 * 576, float32]; xl: int;
+               pcm: var openArray[int16]; dst: int; nch: static int;
                lins: var array[SynFloats, float32]; lb: int) =
   ## Two subband samples (`grbuf[xl..]` left, `grbuf[xr..]` right) into 64
   ## PCM frames at `pcm[dst]`. `lb` is the float index of the first row of
@@ -916,7 +925,7 @@ func mp3dSynth(grbuf: array[2 * 576, float32]; xl, xr: int;
   template row(r: int): int = lb + 4 * r
 
   for c in 0 ..< nch:
-    let x = if c == 0: xl else: xr
+    let x = xl + 576 * c
     lins[row(240 + 15) + c] = grbuf[x + 18 * 16]
     lins[row(240 + 15) + 2 + c] = grbuf[x]
     lins[row(240 + 31) + c] = grbuf[x + 1 + 18 * 16]
@@ -933,7 +942,7 @@ func mp3dSynth(grbuf: array[2 * 576, float32]; xl, xr: int;
 
   for i in countdown(14, 0):
     for c in 0 ..< nch:
-      let x = if c == 0: xl else: xr
+      let x = xl + 576 * c
       lins[row(240 + i) + c] = grbuf[x + 18 * (31 - i)]
       lins[row(240 + i) + 2 + c] = grbuf[x + 1 + 18 * (31 - i)]
       lins[row(240 + 16 + i) + c] = grbuf[x + 1 + 18 * (1 + i)]
@@ -947,19 +956,27 @@ func mp3dSynth(grbuf: array[2 * 576, float32]; xl, xr: int;
       template w1(k: int): float32 = SynthWin[w + 2 * k + 1]
       var b = vz(0) * w1(0) + vy(0) * w0(0)
       var a = vz(0) * w0(0) - vy(0) * w1(0)
-      for k in countup(1, 7, 2):
+      # Keep each tap's expression and the left-to-right accumulation order.
+      template tap(k: static int) =
         b = b + (vz(k) * w1(k) + vy(k) * w0(k))
-        a = a + (vy(k) * w1(k) - vz(k) * w0(k))
-        if k < 7:
-          b = b + (vz(k + 1) * w1(k + 1) + vy(k + 1) * w0(k + 1))
-          a = a + (vz(k + 1) * w0(k + 1) - vy(k + 1) * w1(k + 1))
+        when (k and 1) == 0:
+          a = a + (vz(k) * w0(k) - vy(k) * w1(k))
+        else:
+          a = a + (vy(k) * w1(k) - vz(k) * w0(k))
+      tap(1)
+      tap(2)
+      tap(3)
+      tap(4)
+      tap(5)
+      tap(6)
+      tap(7)
       # Lanes 0/1 are the even samples, 2/3 the odd ones, 32 frames later.
       let c = lane and (nch - 1)
       let half = 32 * (lane shr 1)
       pcm[dst + c + (15 - i + half) * nch] = toPcm16(a)
       pcm[dst + c + (17 + i + half) * nch] = toPcm16(b)
 
-func mp3dSynthGranule(d: var Mp3Decoder; nbands, nch: int;
+func mp3dSynthGranule(d: var Mp3Decoder; nbands: int; nch: static int;
                       pcm: var openArray[int16]; dst: int) =
   for ch in 0 ..< nch:
     mp3dDctII(d.grbuf, 576 * ch, nbands)
@@ -968,8 +985,7 @@ func mp3dSynthGranule(d: var Mp3Decoder; nbands, nch: int;
     d.syn[i] = d.qmfState[i]
 
   for i in countup(0, nbands - 1, 2):
-    mp3dSynth(d.grbuf, i, 576 * (nch - 1) + i, pcm, dst + 32 * nch * i, nch,
-              d.syn, 64 * i)
+    mp3dSynth(d.grbuf, i, pcm, dst + 32 * nch * i, nch, d.syn, 64 * i)
 
   # Standard (not MINIMP3_NONSTANDARD_BUT_LOGICAL) behaviour: a mono frame
   # only advances the left channel's filterbank history, so a later switch
@@ -1110,7 +1126,10 @@ proc decode*(d: var Mp3Decoder; mp3: openArray[byte]; pcm: var openArray[int16];
     for igr in 0 ..< granules:
       zeroMem(addr d.grbuf, sizeof(d.grbuf))
       l3Decode(d, bs, grInfo, igr * nch, nch)
-      mp3dSynthGranule(d, 18, nch, pcm, igr * 576 * nch)
+      if nch == 2:
+        mp3dSynthGranule(d, 18, 2, pcm, igr * 1152)
+      else:
+        mp3dSynthGranule(d, 18, 1, pcm, igr * 576)
     info.samplesProduced = d.header.frameSamples
     result.status = dsDecoded
   else:

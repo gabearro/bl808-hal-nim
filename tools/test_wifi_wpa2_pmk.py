@@ -39,6 +39,22 @@ def test_wpa2_pmk_matches_reference(tmp_path: Path, flags: list[str]) -> None:
         expected = hashlib.pbkdf2_hmac("sha1", passphrase, ssid, 4096, dklen=32)
         code.append(f"doAssert deriveWpa2Pmk({literal(passphrase)}, {literal(ssid)}, pmk)")
         code.append(f"doAssert @pmk == {literal(expected)}")
+    # Exercise both PBKDF2 block boundaries with CPS-sized slices.
+    for (passphrase, ssid), chunk in [(cases[0], 1), (cases[-1], 64),
+                                      (cases[-2], 257)]:
+        expected = hashlib.pbkdf2_hmac("sha1", passphrase, ssid, 4096, dklen=32)
+        code.extend([
+            "block:",
+            "  var deriver: Wpa2PmkDeriver",
+            f"  doAssert deriver.startWpa2PmkDeriver({literal(passphrase)}, {literal(ssid)})",
+            "  var status = pmkPending",
+            "  while status == pmkPending:",
+            f"    status = deriver.stepWpa2PmkDeriver({chunk})",
+            "  doAssert status == pmkReady",
+            f"  doAssert @(deriver.pmk) == {literal(expected)}",
+            "  deriver.clearWpa2PmkDeriver()",
+            "  doAssert not deriver.finished",
+        ])
     for length, ssid_len in [(7, 4), (64, 4), (8, 33)]:
         code.append(f"doAssert not deriveWpa2Pmk({literal(b'P' * length)}, "
                     f"{literal(b'S' * ssid_len)}, pmk)")

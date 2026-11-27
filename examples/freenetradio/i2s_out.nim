@@ -254,7 +254,9 @@ when defined(bl808m0):
     o.i2s.setFifoThresholds(0, 0)
     buildList()
 
-    o.dma = initDma(dma0)
+    o.dma = openDma(dma0)
+    let channel = o.dma.reserveChannel(DmaChannel)
+    doAssert channel == DmaChannel
     o.dma.stopChannel(DmaChannel)
     o.dma.clearTcInterrupt(DmaChannel)
     o.dma.clearErrInterrupt(DmaChannel)

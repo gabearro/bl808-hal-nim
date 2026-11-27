@@ -6,7 +6,8 @@ proc wifiSendStaKeepaliveUntilAckAsync*(
     serviceIterations: uint32 = 1'u32): CpsFuture[WifiKeepaliveStats] {.cps.} =
   ## Send STA keepalive frames until the requested ACK count is observed or
   ## the attempt budget is exhausted. This is the CPS orchestration layer for
-  ## coexistence tests; the TX primitive and bounded service pump stay sync.
+  ## coexistence tests; CPS drives the firmware between attempts when its
+  ## service hook is installed.
   let ackBefore = wifiStaKeepaliveAckOkCount()
   let failBefore = wifiStaKeepaliveFailCount()
   let cfmBefore = wifiStaKeepaliveConfirmCount()
@@ -20,7 +21,7 @@ proc wifiSendStaKeepaliveUntilAckAsync*(
   while wifiStaKeepaliveAckOkCount() - ackBefore < targetAck and
       stats.attempts < attemptBudget:
     inc stats.attempts
-    wifiServicePump(count)
+    wifiWakeServiceOrPump(count)
     var nextDelayUs = txPeriodUs
     case wifiSendStaKeepaliveFrame()
     of wifiOk:
@@ -30,13 +31,13 @@ proc wifiSendStaKeepaliveUntilAckAsync*(
       nextDelayUs = busyPeriodUs
     else:
       inc stats.failures
-    wifiServicePump(count)
+    wifiWakeServiceOrPump(count)
     await sleepUs(nextDelayUs)
 
   let confirmDeadline = readTick() + usToTicks(confirmDrainMs.uint64 * 1000'u64)
   while wifiStaKeepaliveConfirmCount() - cfmBefore < stats.frames and
       readTick() < confirmDeadline:
-    wifiServicePump(count)
+    wifiWakeServiceOrPump(count)
     await sleepUs(1000'u64)
 
   stats.ackDelta = wifiStaKeepaliveAckOkCount() - ackBefore

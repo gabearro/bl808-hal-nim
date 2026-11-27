@@ -12,6 +12,7 @@ proc wifiBeginScanWait(timeoutMs: uint32): CpsFuture[uint32] =
       completeWifiScan(0'u32)
     )
   wifiCompletePendingEvents()
+  bl808_wifi_backend_signal_work()
   # Return the local, not the global: the pump above may have completed+nil'd
   # the global, but `fut` is the real (now-finished) future the await needs.
   return fut
@@ -27,4 +28,5 @@ proc wifiBeginConnectWait(timeoutMs: uint32): CpsFuture[WifiError] =
       completeWifiConnect(wifiFail)
     )
   wifiCompletePendingEvents()
+  bl808_wifi_backend_signal_work()
   return fut

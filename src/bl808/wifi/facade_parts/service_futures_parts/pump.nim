@@ -1,6 +1,4 @@
-proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
-  ## One bounded WiFi control-plane service step. The MAC/firmware timing
-  ## remains below this layer; CPS callers use this instead of ad hoc polls.
+proc wifiServiceWanted(): bool =
   let hasPending =
     (wifiScanFuture != nil and not wifiScanFuture.finished) or
     (wifiConnectFuture != nil and not wifiConnectFuture.finished) or
@@ -9,17 +7,15 @@ proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
     wifiDisconnectIssuePending
   # The peer indication can clear the host link before SM's cleanup replies
   # or station-delete retry timer arrive. Keep servicing that firmware owner.
-  if not hasPending and sm_state != SmDisconnectingState and
-      not wifiApEnabled and not wifiBackendConnected():
+  hasPending or sm_state == SmDisconnectingState or
+    wifiApEnabled or wifiBackendConnected()
+
+proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
+  ## Compatibility entry for callers that cannot yield. The scheduler hook
+  ## below uses a separate service entry without a busy-wait delay.
+  if not wifiServiceWanted():
     return
   let count = if iterations == 0'u32: 1'u32 else: iterations
   wifiBackendPoll(count)
   wifiNimFirmwareServiceTx(count)
   wifiCompletePendingEvents()
-
-proc wifiServiceTask*(periodUs: uint32 = 1000'u32,
-                      iterations: uint32 = 8'u32): CpsVoidFuture {.cps.} =
-  let delay = if periodUs == 0'u32: 1'u32 else: periodUs
-  while true:
-    wifiServicePump(iterations)
-    await sleepUs(delay.uint64)

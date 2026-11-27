@@ -1,0 +1,22 @@
+(component
+  (core func $yield (canon thread.yield))
+  (core func $get (canon context.get i32 0))
+  (core func $set (canon context.set i32 0))
+  (core func $return (canon task.return (result u32)))
+  (core module $m
+    (import "" "y" (func $yield (result i32)))
+    (import "" "g" (func $get (result i32)))
+    (import "" "s" (func $set (param i32)))
+    (import "" "r" (func $return (param i32)))
+    (func $pause (param $value i32) (result i32)
+      (call $set (local.get $value))
+      (if (call $yield) (then unreachable))
+      (if (i32.ne (call $get) (local.get $value)) (then unreachable))
+      (i32.add (local.get $value) (i32.const 1)))
+    (func (export "run") (param $value i32)
+      (call $return (call $pause (local.get $value)))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "y" (func $yield)) (export "g" (func $get))
+    (export "s" (func $set)) (export "r" (func $return))))))
+  (func (export "run") async (param "x" u32) (result u32)
+    (canon lift (core func $i "run") async)))

@@ -1,0 +1,10 @@
+package ox64:fixed-lists@0.2.0;
+
+world fixed-list-direct {
+  export single: func(items: list<s64, 1>) -> list<s64, 1>;
+  export reverse: func(items: list<u32, 3>) -> list<u32, 3>;
+}
+
+world fixed-list-indirect {
+  export sum-large: func(items: list<u32, 17>) -> u32;
+}

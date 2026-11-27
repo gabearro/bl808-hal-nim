@@ -31,6 +31,14 @@ type
     svExternRef
     svUnknown  # Bottom type — matches anything (after unreachable)
 
+when defined(wasmFunctionReferences):
+  type OperandType = object
+    lane: StackVal
+    reference: CoreReferenceType
+else:
+  type OperandType = StackVal
+
+type
   ValidationEventKind* = enum
     veFunctionBegin, veInstructionBegin, veOperandPush, veOperandPop,
     veControlPush, veControlPop, veUnreachable, veInstructionEnd, veFunctionEnd,
@@ -51,8 +59,8 @@ type
 
   CtrlFrame = object
     opcode: Opcode          # block, loop, if
-    startTypes: seq[StackVal]  # input types
-    endTypes: seq[StackVal]    # output types
+    startTypes: seq[OperandType]
+    endTypes: seq[OperandType]
     height: int             # operand stack height at entry
     unreachable: bool       # after unreachable/br/return/br_table
 
@@ -68,7 +76,10 @@ type
     localEnds: seq[uint64]
     localCount: uint64
     labels: seq[CtrlFrame]    # control frame stack
-    operands: seq[StackVal]   # operand type stack
+    operands: seq[OperandType]
+    when defined(wasmFunctionReferences):
+      signature: FuncType
+      functionTypeIndices: seq[uint32]
     numImportFuncs: int
     numImportGlobals: int
     vectorConstants: int
@@ -76,6 +87,28 @@ type
     labelChecks, catchChecks: bool
     functionIndex, instructionIndex: uint32
     opcode: Opcode
+
+proc lane(value: OperandType): StackVal {.inline.} =
+  when defined(wasmFunctionReferences): value.lane
+  else: value
+
+proc operand(lane: StackVal, reference = CoreReferenceType()): OperandType {.inline.} =
+  when defined(wasmFunctionReferences): OperandType(lane: lane, reference: reference)
+  else: lane
+
+proc matchesOperand(actual, expected: OperandType): bool =
+  if actual.lane == svUnknown or expected.lane == svUnknown: return true
+  if actual.lane != expected.lane: return false
+  when defined(wasmFunctionReferences):
+    if expected.lane in {svFuncRef, svExternRef}:
+      return matchesCoreReference(actual.reference, expected.reference)
+  true
+
+proc matchesOperands(actual, expected: openArray[OperandType]): bool =
+  if actual.len != expected.len: return false
+  for i, value in actual:
+    if not matchesOperand(value, expected[i]): return false
+  true
 
 proc emitEvent(ctx: ValidationContext, kind: ValidationEventKind,
     valueType = svUnknown, polymorphic = false) =
@@ -93,8 +126,8 @@ proc emitFrame(ctx: ValidationContext, kind: ValidationEventKind, frame: CtrlFra
     valueType: svUnknown,
     frameOpcode: frame.opcode, frameHeight: frame.height,
     frameUnreachable: frame.unreachable)
-  for value in frame.startTypes: event.startTypes.add value
-  for value in frame.endTypes: event.endTypes.add value
+  for value in frame.startTypes: event.startTypes.add value.lane
+  for value in frame.endTypes: event.endTypes.add value.lane
   ctx.trace[].add event
 
 # ---------------------------------------------------------------------------
@@ -111,23 +144,37 @@ proc valToStack(vt: ValType): StackVal =
   of vtFuncRef: svFuncRef
   of vtExternRef: svExternRef
 
-proc valsToStack(vts: seq[ValType]): seq[StackVal] =
-  for vt in vts:
-    result.add(valToStack(vt))
+proc parameterOperands(ft: FuncType): seq[OperandType] =
+  result = newSeqOfCap[OperandType](ft.params.len)
+  for i, vt in ft.params:
+    when defined(wasmFunctionReferences):
+      result.add(operand(valToStack(vt), ft.coreParamReference(i)))
+    else: result.add(valToStack(vt))
+
+proc resultOperands(ft: FuncType): seq[OperandType] =
+  result = newSeqOfCap[OperandType](ft.results.len)
+  for i, vt in ft.results:
+    when defined(wasmFunctionReferences):
+      result.add(operand(valToStack(vt), ft.coreResultReference(i)))
+    else: result.add(valToStack(vt))
 
 proc validErr(msg: string) =
   raise newException(ValidationError, msg)
 
-proc localType(ctx: ValidationContext, index: uint32): ValType =
+proc localDeclaration(ctx: ValidationContext, index: uint32): LocalDecl =
   if uint64(index) >= ctx.localCount: validErr("local index out of range")
-  if uint64(index) < uint64(ctx.locals.len): return ctx.locals[int(index)]
+  if uint64(index) < uint64(ctx.locals.len):
+    return LocalDecl(count: 1, valType: ctx.locals[int(index)])
   var low = 0
   var limit = ctx.localEnds.len
   while low < limit:
     let middle = low+(limit-low) div 2
     if ctx.localEnds[middle] <= uint64(index): low = middle+1
     else: limit = middle
-  ctx.localDecls[low].valType
+  ctx.localDecls[low]
+
+proc localType(ctx: ValidationContext, index: uint32): ValType {.inline.} =
+  ctx.localDeclaration(index).valType
 
 proc validateStage(code: uint32) {.inline.} =
   when defined(bl808lp) and defined(bl808WasmTrace):
@@ -139,46 +186,82 @@ proc validateStage(code: uint32) {.inline.} =
 # Operand stack operations
 # ---------------------------------------------------------------------------
 
-proc pushOp(ctx: var ValidationContext, sv: StackVal) =
-  ctx.operands.add(sv)
-  ctx.emitEvent(veOperandPush, sv)
+proc pushOp(ctx: var ValidationContext, value: OperandType) =
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and value.lane in {svFuncRef, svExternRef} and
+        not value.reference.isSharedCoreReference():
+      validErr("shared core function uses an unshared reference")
+  ctx.operands.add(value)
+  ctx.emitEvent(veOperandPush, value.lane)
 
-proc pushOps(ctx: var ValidationContext, svs: seq[StackVal]) =
+when defined(wasmFunctionReferences):
+  proc pushOp(ctx: var ValidationContext, lane: StackVal) {.inline.} =
+    ctx.pushOp(operand(lane))
+
+proc pushOps(ctx: var ValidationContext, svs: seq[OperandType]) =
   for sv in svs:
     ctx.pushOp(sv)
 
-proc popOp(ctx: var ValidationContext): StackVal =
+proc popOp(ctx: var ValidationContext): OperandType =
   if ctx.labels.len > 0:
     let frame = ctx.labels[^1]
     if ctx.operands.len == frame.height:
       if frame.unreachable:
         ctx.emitEvent(veOperandPop, svUnknown, polymorphic = true)
-        return svUnknown
+        return operand(svUnknown)
       validErr("type mismatch: operand stack underflow")
   elif ctx.operands.len == 0:
     validErr("type mismatch: operand stack underflow")
   result = ctx.operands.pop()
-  ctx.emitEvent(veOperandPop, result)
+  ctx.emitEvent(veOperandPop, result.lane)
 
-proc popExpect(ctx: var ValidationContext, expected: StackVal): StackVal =
+proc popExpect(ctx: var ValidationContext, expected: OperandType): OperandType =
   let actual = ctx.popOp()
-  if actual == svUnknown: return expected
-  if expected == svUnknown: return actual
-  if actual != expected:
-    validErr("type mismatch: expected " & $expected & ", got " & $actual)
+  if actual.lane == svUnknown: return expected
+  if not matchesOperand(actual, expected):
+    validErr("type mismatch: expected " & $expected.lane & ", got " & $actual.lane)
   actual
 
-proc popOps(ctx: var ValidationContext, expected: seq[StackVal]): seq[StackVal] =
-  result = newSeq[StackVal](expected.len)
+when defined(wasmFunctionReferences):
+  proc popExpect(ctx: var ValidationContext, expected: StackVal): OperandType {.inline.} =
+    ctx.popExpect(operand(expected))
+
+proc popOps(ctx: var ValidationContext, expected: seq[OperandType]): seq[OperandType] =
+  result = newSeq[OperandType](expected.len)
   for i in countdown(expected.len - 1, 0):
     result[i] = ctx.popExpect(expected[i])
+
+when defined(wasmFunctionReferences):
+  proc functionReference(ctx: ValidationContext, tag: uint32, nonNull = false,
+                         sharedAbstract = false): CoreReferenceType =
+    if tag notin [0'u32, WasmNoFuncHeapTag]:
+      return ctx.types[tag.int - 1].coreFunctionReference(nonNull)
+    result = CoreReferenceType(member: tag, nonNull: nonNull)
+    when defined(wasmSharedCoreTypes): result.sharedAbstract = sharedAbstract
+
+proc localOperand(ctx: ValidationContext, index: uint32): OperandType =
+  let local = ctx.localDeclaration(index)
+  let lane = valToStack(local.valType)
+  when defined(wasmFunctionReferences):
+    let reference = if index.uint64 < ctx.locals.len.uint64:
+        ctx.signature.coreParamReference(index.int)
+      else: ctx.functionReference(local.functionType, sharedAbstract =
+        (when defined(wasmSharedCoreTypes): local.sharedReference else: false))
+    operand(lane, reference)
+  else: lane
+
+proc pushLocal(ctx: var ValidationContext, index: uint32) =
+  ctx.pushOp(ctx.localOperand(index))
+
+proc popLocal(ctx: var ValidationContext, index: uint32) =
+  discard ctx.popExpect(ctx.localOperand(index))
 
 # ---------------------------------------------------------------------------
 # Control frame operations
 # ---------------------------------------------------------------------------
 
 proc pushCtrl(ctx: var ValidationContext, op: Opcode,
-              startTypes, endTypes: seq[StackVal]) =
+              startTypes, endTypes: seq[OperandType]) =
   let frame = CtrlFrame(
     opcode: op,
     startTypes: startTypes,
@@ -204,7 +287,7 @@ proc popCtrl(ctx: var ValidationContext): CtrlFrame =
   ctx.emitFrame(veControlPop, frame)
   frame
 
-proc labelTypes(frame: CtrlFrame): seq[StackVal] =
+proc labelTypes(frame: CtrlFrame): seq[OperandType] =
   ## For loop, the branch target expects startTypes (restart).
   ## For block/if, the branch target expects endTypes (exit).
   if frame.opcode == opLoop:
@@ -229,12 +312,12 @@ proc setUnreachable(ctx: var ValidationContext) =
 # Block type resolution
 # ---------------------------------------------------------------------------
 
-proc resolveBlockType(ctx: ValidationContext, bt: BlockType): (seq[StackVal], seq[StackVal]) =
+proc resolveBlockType(ctx: ValidationContext, bt: BlockType): (seq[OperandType], seq[OperandType]) =
   case bt.kind
   of btkEmpty:
     (@[], @[])
   of btkValType:
-    (@[], @[valToStack(bt.valType)])
+    (@[], @[operand(valToStack(bt.valType))])
   of btkTypeIdx:
     if uint64(bt.typeIdx) >= uint64(ctx.types.len):
       validErr("invalid block type index: " & $bt.typeIdx)
@@ -242,7 +325,10 @@ proc resolveBlockType(ctx: ValidationContext, bt: BlockType): (seq[StackVal], se
     if uint64(idx) >= uint64(ctx.types.len):
       validErr("invalid block type index: " & $idx)
     let ft = ctx.types[int(idx)]
-    (valsToStack(ft.params), valsToStack(ft.results))
+    when defined(wasmSharedCoreTypes):
+      if ctx.signature.shared and not ft.shared:
+        validErr("shared core function uses an unshared block type")
+    (ft.parameterOperands(), ft.resultOperands())
 
 # ---------------------------------------------------------------------------
 # Instruction validation
@@ -259,6 +345,63 @@ proc exceptionTagType(module: WasmModule, index: uint32): FuncType =
   result = module.types[int(typeIndex)]
   if result.results.len != 0: validErr("exception tag type must have no results")
 
+when defined(wasmSharedCoreTypes):
+  proc requireSharedCallee(ctx: ValidationContext, signature: FuncType) =
+    if ctx.signature.shared and not signature.shared:
+      validErr("shared core function calls an unshared function type")
+
+proc tableType(ctx: ValidationContext, index: uint32, op: static string): TableType =
+  if index.uint64 >= ctx.tables.len.uint64: validErr(op & ": invalid table index")
+  result = ctx.tables[index.int]
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and not result.limits.shared:
+      validErr("shared core function accesses an unshared table")
+
+proc elementSegment(ctx: ValidationContext, module: WasmModule, index: uint32,
+                    op: static string): ElemSegment =
+  if index.uint64 >= module.elements.len.uint64: validErr(op & ": invalid element index")
+  result = module.elements[index.int]
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and not result.shared:
+      validErr("shared core function accesses an unshared element segment")
+
+template tableOperand(value: TableType | ElemSegment): OperandType =
+  when defined(wasmFunctionReferences): operand(valToStack(value.elemType), value.elementReference)
+  else: operand(valToStack(value.elemType))
+
+proc requireIndirectTable(ctx: ValidationContext, index: uint32, op: static string) =
+  let table {.cursor.} = ctx.tableType(index, op)
+  if table.elemType != vtFuncRef:
+    validErr(op & ": table must contain function references")
+  when defined(wasmSharedCoreTypes):
+    if table.elementReference.isSharedCoreReference():
+      validErr(op & ": shared function references require table.get and call_ref")
+
+proc globalType(ctx: ValidationContext, index: uint32, op: static string): GlobalType =
+  if index.uint64 >= ctx.globals.len.uint64: validErr(op & ": invalid global index")
+  result = ctx.globals[index.int]
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and not result.shared:
+      validErr("shared core function accesses an unshared global")
+
+proc globalOperand(value: GlobalType): OperandType =
+  when defined(wasmFunctionReferences): operand(valToStack(value.valType), value.reference)
+  else: operand(valToStack(value.valType))
+
+proc checkMemory(ctx: ValidationContext, index: uint32, op: static string) =
+  if index.uint64 >= ctx.mems.len.uint64: validErr(op & ": invalid memory index")
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and not ctx.mems[index.int].limits.shared:
+      validErr("shared core function accesses an unshared memory")
+
+proc checkDataSegment(ctx: ValidationContext, module: WasmModule,
+                      index: uint32, op: static string) =
+  if module.dataCount < 0: validErr(op & " requires data count section")
+  if index.uint64 >= module.datas.len.uint64: validErr(op & ": invalid data index")
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and not module.datas[index.int].shared:
+      validErr("shared core function accesses an unshared data segment")
+
 proc validateInstr(ctx: var ValidationContext, instr: Instr,
                     module: WasmModule, expression: Expr) =
   let brTables = expression.brTables
@@ -272,13 +415,16 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     return
   let code = uint16(ord(instr.op))
   let metadata = instructionMetadata(code)
+  when defined(wasmSharedCoreTypes):
+    if ctx.signature.shared and instr.op in {opThrow, opThrowRef}:
+      validErr("shared core function accesses unshared module state")
   if metadata.memoryArgument:
     if ctx.mems.len == 0: validErr("memory instruction without memory")
+    ctx.checkMemory(instr.pad.uint32, "memory argument")
     let alignment = if metadata.vectorArgument: instr.imm1 else: instr.imm2
     if alignment > uint32(metadata.maxAlignment):
       validErr("memory alignment exceeds natural alignment")
-  if metadata.memoryIndex and uint64(instr.imm1) >= uint64(ctx.mems.len):
-    validErr("memory instruction: invalid memory index")
+  if metadata.memoryIndex: ctx.checkMemory(instr.imm1, "memory instruction")
   if code >= 0x300 and code <= 0x342:
     let rule = staticRule(instr.op)
     let lanes = simdLaneCount(code)
@@ -325,7 +471,7 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
 
   of opEnd:
     let frame = ctx.popCtrl()
-    if frame.opcode == opIf and frame.startTypes != frame.endTypes:
+    if frame.opcode == opIf and not matchesOperands(frame.startTypes, frame.endTypes):
       validErr("if without else: parameter and result types differ")
     ctx.pushOps(frame.endTypes)
 
@@ -345,7 +491,7 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     if uint64(instr.imm1) >= uint64(brTables.len):
       validErr("br_table: invalid table index")
     let targets = brTables[instr.imm1.int]
-    template targetTypes(depth: uint32): seq[StackVal] =
+    template targetTypes(depth: uint32): seq[OperandType] =
       block:
         if uint64(depth) >= uint64(ctx.labels.len):
           validErr("br_table: invalid label depth")
@@ -358,10 +504,10 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
         validErr("br_table: label arity mismatch")
       if ctx.labelChecks:
         ctx.emitFrame(veLabelCheck, ctx.labels[ctx.labels.len-1-depth.int])
-      var actual = newSeq[StackVal](types.len)
+      var actual = newSeq[OperandType](types.len)
       for i in countdown(types.high, 0):
         actual[i] = ctx.popOp()
-        if actual[i] != svUnknown and actual[i] != types[i]:
+        if not matchesOperand(actual[i], types[i]):
           validErr("br_table: label type mismatch")
       ctx.pushOps(actual)
     if ctx.labelChecks:
@@ -381,23 +527,36 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     if uint64(funcIdx) >= uint64(ctx.funcs.len):
       validErr("call: invalid function index " & $funcIdx)
     let ft = ctx.funcs[int(funcIdx)]
-    discard ctx.popOps(valsToStack(ft.params))
-    ctx.pushOps(valsToStack(ft.results))
+    when defined(wasmSharedCoreTypes): ctx.requireSharedCallee(ft)
+    discard ctx.popOps(ft.parameterOperands())
+    ctx.pushOps(ft.resultOperands())
 
   of opCallIndirect:
     if uint64(instr.imm1) >= uint64(ctx.types.len):
       validErr("call_indirect: invalid type index " & $instr.imm1)
     let typeIdx = instr.imm1
-    if uint64(instr.imm2) >= uint64(ctx.tables.len):
-      validErr("call_indirect: invalid table index " & $instr.imm2)
-    let tableIdx = instr.imm2
-    if ctx.tables[int(tableIdx)].elemType != vtFuncRef:
-      validErr("call_indirect: table must contain function references")
+    ctx.requireIndirectTable(instr.imm2, "call_indirect")
     # Pop i32 index
     discard ctx.popExpect(svI32)
     let ft = ctx.types[int(typeIdx)]
-    discard ctx.popOps(valsToStack(ft.params))
-    ctx.pushOps(valsToStack(ft.results))
+    discard ctx.popOps(ft.parameterOperands())
+    ctx.pushOps(ft.resultOperands())
+
+  of opCallRef, opReturnCallRef:
+    when defined(wasmFunctionReferences):
+      let typeIndex = instr.imm1
+      if typeIndex.uint64 >= ctx.types.len.uint64:
+        validErr("call_ref: invalid type index")
+      let ft = ctx.types[typeIndex.int]
+      when defined(wasmSharedCoreTypes): ctx.requireSharedCallee(ft)
+      discard ctx.popExpect(operand(svFuncRef, ctx.functionReference(typeIndex + 1)))
+      discard ctx.popOps(ft.parameterOperands())
+      if instr.op == opReturnCallRef:
+        if not matchesOperands(ft.resultOperands(), ctx.labels[0].endTypes):
+          validErr("return_call_ref: callee return type mismatch")
+        ctx.setUnreachable()
+      else: ctx.pushOps(ft.resultOperands())
+    else: validErr("typed function references are disabled")
 
   # ---- Tail calls (return_call, return_call_indirect) ----
   of opReturnCall:
@@ -405,44 +564,28 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     if uint64(funcIdx) >= uint64(ctx.funcs.len):
       validErr("return_call: invalid function index " & $funcIdx)
     let ft = ctx.funcs[int(funcIdx)]
-    # Callee return types must match the current function's return types
-    if ctx.labels.len > 0:
-      let outerFrame = ctx.labels[0]
-      let calleeResults = valsToStack(ft.results)
-      if calleeResults.len != outerFrame.endTypes.len:
-        validErr("return_call: callee return arity mismatch")
-      for i in 0 ..< calleeResults.len:
-        if calleeResults[i] != outerFrame.endTypes[i]:
-          validErr("return_call: callee return type mismatch")
-    discard ctx.popOps(valsToStack(ft.params))
+    when defined(wasmSharedCoreTypes): ctx.requireSharedCallee(ft)
+    if not matchesOperands(ft.resultOperands(), ctx.labels[0].endTypes):
+      validErr("return_call: callee return type mismatch")
+    discard ctx.popOps(ft.parameterOperands())
     ctx.setUnreachable()
 
   of opReturnCallIndirect:
     let typeIdx = instr.imm1
     if uint64(typeIdx) >= uint64(ctx.types.len):
       validErr("return_call_indirect: invalid type index " & $typeIdx)
-    let tableIdx = instr.imm2
-    if uint64(tableIdx) >= uint64(ctx.tables.len):
-      validErr("return_call_indirect: invalid table index " & $tableIdx)
-    if ctx.tables[int(tableIdx)].elemType != vtFuncRef:
-      validErr("return_call_indirect: table must contain function references")
+    ctx.requireIndirectTable(instr.imm2, "return_call_indirect")
     discard ctx.popExpect(svI32)  # table index
     let ft = ctx.types[int(typeIdx)]
-    if ctx.labels.len > 0:
-      let outerFrame = ctx.labels[0]
-      let calleeResults = valsToStack(ft.results)
-      if calleeResults.len != outerFrame.endTypes.len:
-        validErr("return_call_indirect: callee return arity mismatch")
-      for i in 0 ..< calleeResults.len:
-        if calleeResults[i] != outerFrame.endTypes[i]:
-          validErr("return_call_indirect: callee return type mismatch")
-    discard ctx.popOps(valsToStack(ft.params))
+    if not matchesOperands(ft.resultOperands(), ctx.labels[0].endTypes):
+      validErr("return_call_indirect: callee return type mismatch")
+    discard ctx.popOps(ft.parameterOperands())
     ctx.setUnreachable()
 
   # ---- Exception handling (try_table, throw, throw_ref) ----
   of opThrow:
     # imm1 = tag index; pops tag's param types, then unreachable
-    discard ctx.popOps(valsToStack(exceptionTagType(module, instr.imm1).params))
+    discard ctx.popOps(exceptionTagType(module, instr.imm1).parameterOperands())
     ctx.setUnreachable()
 
   of opThrowRef:
@@ -458,13 +601,16 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let clauses = catchTables[int(instr.imm2)]
     # Catch depths are relative to the OUTER context, before pushing try_table.
     for clause in clauses:
+      when defined(wasmSharedCoreTypes):
+        if ctx.signature.shared and clause.kind != ckCatchAll:
+          validErr("shared core function uses an unshared exception tag or reference")
       if uint64(clause.labelDepth) >= uint64(ctx.labels.len): validErr("catch: invalid label depth")
-      var payload: seq[StackVal]
+      var payload: seq[OperandType]
       if clause.kind in {ckCatch, ckCatchRef}:
-        payload = valsToStack(exceptionTagType(module, clause.tagIdx).params)
-      if clause.kind in {ckCatchRef, ckCatchAllRef}: payload.add svExternRef
+        payload = exceptionTagType(module, clause.tagIdx).parameterOperands()
+      if clause.kind in {ckCatchRef, ckCatchAllRef}: payload.add operand(svExternRef)
       let target = ctx.labels[ctx.labels.len-1-int(clause.labelDepth)]
-      if payload != target.labelTypes: validErr("catch: target label type mismatch")
+      if not matchesOperands(payload, target.labelTypes): validErr("catch: target label type mismatch")
       if ctx.catchChecks: ctx.emitFrame(veLabelCheck, target)
     discard ctx.popOps(startTypes)
     ctx.pushCtrl(opBlock, startTypes, endTypes)
@@ -475,8 +621,8 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
 
   of opSelect:
     discard ctx.popExpect(svI32)
-    let t1 = ctx.popOp()
-    let t2 = ctx.popOp()
+    let t1 = ctx.popOp().lane
+    let t2 = ctx.popOp().lane
     if t1 != svUnknown and t2 != svUnknown and t1 != t2:
       validErr("select: type mismatch")
     if t1 in {svFuncRef, svExternRef} or t2 in {svFuncRef, svExternRef}:
@@ -506,49 +652,88 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let idx = instr.imm1
     if idx >= ctx.localCount:
       validErr("local.get: invalid local index " & $idx)
-    ctx.pushOp(valToStack(ctx.localType(idx)))
+    ctx.pushLocal(idx)
 
   of opLocalSet:
     let idx = instr.imm1
     if idx >= ctx.localCount:
       validErr("local.set: invalid local index " & $idx)
-    discard ctx.popExpect(valToStack(ctx.localType(idx)))
+    ctx.popLocal(idx)
 
   of opLocalTee:
     let idx = instr.imm1
     if idx >= ctx.localCount:
       validErr("local.tee: invalid local index " & $idx)
-    let expected = valToStack(ctx.localType(idx))
-    let val = ctx.popExpect(expected)
-    ctx.pushOp(val)
+    ctx.popLocal(idx)
+    ctx.pushLocal(idx)
 
   of opGlobalGet:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.globals.len):
-      validErr("global.get: invalid global index " & $idx)
-    ctx.pushOp(valToStack(ctx.globals[int(idx)].valType))
+    ctx.pushOp(globalOperand(ctx.globalType(instr.imm1, "global.get")))
 
   of opGlobalSet:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.globals.len):
-      validErr("global.set: invalid global index " & $idx)
-    if ctx.globals[int(idx)].mut != mutVar:
-      validErr("global.set: immutable global " & $idx)
-    discard ctx.popExpect(valToStack(ctx.globals[int(idx)].valType))
+    let global {.cursor.} = ctx.globalType(instr.imm1, "global.set")
+    if global.mut != mutVar: validErr("global.set: immutable global " & $instr.imm1)
+    discard ctx.popExpect(globalOperand(global))
+
+  of opGlobalAtomicGet .. opGlobalAtomicCmpXchg:
+    when defined(wasmSharedCoreTypes):
+      let global {.cursor.} = ctx.globalType(instr.imm1, "global.atomic")
+      if global.valType notin {vtI32, vtI64}:
+        validErr("global.atomic requires an i32 or i64 global")
+      if not validGlobalAtomicOrdering(instr.op, instr.pad):
+        validErr("invalid global atomic ordering")
+      let value = globalOperand(global)
+      if instr.op != opGlobalAtomicGet:
+        if global.mut != mutVar: validErr("global.atomic: immutable global")
+        discard ctx.popExpect(value)
+        if instr.op == opGlobalAtomicCmpXchg: discard ctx.popExpect(value)
+      if instr.op != opGlobalAtomicSet: ctx.pushOp(value)
+    else:
+      validErr("global atomic instructions are disabled")
+
+  of opMemoryAtomic:
+    when defined(wasmSharedCoreTypes):
+      let access = memoryAtomicSpec(instr.imm2 and 0xff)
+      if access.kind == maInvalid: validErr("unknown memory atomic operation")
+      if instr.imm2 shr 8 != access.alignment.uint32:
+        validErr("memory atomic alignment must match the access width")
+      ctx.checkMemory(instr.pad.uint32, "memory atomic")
+      let lane = valToStack(access.lane)
+      if access.kind != maLoad: discard ctx.popExpect(lane)
+      if access.kind == maCompareExchange: discard ctx.popExpect(lane)
+      discard ctx.popExpect(svI32)
+      if access.kind != maStore: ctx.pushOp(lane)
+    else:
+      validErr("atomic instructions are disabled")
+
+  of opMemoryAtomicNotify, opMemoryAtomicWait32, opMemoryAtomicWait64:
+    when defined(wasmSharedCoreTypes) and defined(wasmAtomicWait):
+      let wide = instr.op == opMemoryAtomicWait64
+      if instr.imm2 != (if wide: 3'u32 else: 2'u32):
+        validErr("memory atomic alignment must match the access width")
+      ctx.checkMemory(instr.pad.uint32, "memory atomic")
+      if instr.op == opMemoryAtomicNotify:
+        discard ctx.popExpect(svI32)
+      else:
+        discard ctx.popExpect(svI64) # timeout in nanoseconds
+        discard ctx.popExpect(if wide: svI64 else: svI32)
+      discard ctx.popExpect(svI32)
+      ctx.pushOp(svI32)
+    else:
+      validErr("atomic wait and notify are disabled")
+
+  of opAtomicFence:
+    when not defined(wasmSharedCoreTypes): validErr("atomic instructions are disabled")
 
   # ---- Table ----
   of opTableGet:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.tables.len):
-      validErr("table.get: invalid table index")
+    let table {.cursor.} = ctx.tableType(instr.imm1, "table.get")
     discard ctx.popExpect(svI32)
-    ctx.pushOp(valToStack(ctx.tables[int(idx)].elemType))
+    ctx.pushOp(tableOperand(table))
 
   of opTableSet:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.tables.len):
-      validErr("table.set: invalid table index")
-    discard ctx.popExpect(valToStack(ctx.tables[int(idx)].elemType))
+    let table {.cursor.} = ctx.tableType(instr.imm1, "table.set")
+    discard ctx.popExpect(tableOperand(table))
     discard ctx.popExpect(svI32)
 
   # ---- Memory loads ----
@@ -613,10 +798,14 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
       else:
         validErr("ref.null: invalid reference type")
         svUnknown
-    ctx.pushOp(vt)
+    when defined(wasmFunctionReferences):
+      if instr.imm2 != 0 and (vt != svFuncRef or not validFunctionHeapTag(instr.imm2, ctx.types.len)):
+        validErr("ref.null: invalid function heap type")
+      ctx.pushOp(operand(vt, ctx.functionReference(instr.imm2, sharedAbstract = instr.pad != 0)))
+    else: ctx.pushOp(vt)
 
   of opRefIsNull:
-    let t = ctx.popOp()
+    let t = ctx.popOp().lane
     if t != svUnknown and t != svFuncRef and t != svExternRef:
       validErr("ref.is_null: expected reference type, got " & $t)
     ctx.pushOp(svI32)
@@ -626,76 +815,83 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
       validErr("ref.func: invalid function index " & $instr.imm1)
     if not hasDeclaredReference(ctx.declaredReferences, instr.imm1):
       validErr("ref.func: undeclared function reference " & $instr.imm1)
-    ctx.pushOp(svFuncRef)
+    when defined(wasmFunctionReferences):
+      ctx.pushOp(operand(svFuncRef, ctx.functionReference(ctx.functionTypeIndices[instr.imm1.int] + 1,
+        nonNull = true)))
+    else: ctx.pushOp(svFuncRef)
+
+  of opRefAsNonNull:
+    when defined(wasmFunctionReferences):
+      var value = ctx.popOp()
+      if value.lane notin {svFuncRef, svExternRef, svUnknown}:
+        validErr("ref.as_non_null: expected a reference type")
+      value.reference.nonNull = true
+      ctx.pushOp(value)
+    else: validErr("typed function references are disabled")
 
   # ---- Bulk memory ----
   of opMemoryInit:
     if ctx.mems.len == 0: validErr("memory.init without memory")
-    if module.dataCount < 0: validErr("memory.init requires data count section")
-    if uint64(instr.imm1) >= uint64(module.datas.len): validErr("memory.init: invalid data index")
-    if uint64(instr.imm2) >= uint64(ctx.mems.len): validErr("memory.init: invalid memory index")
+    ctx.checkDataSegment(module, instr.imm1, "memory.init")
+    ctx.checkMemory(instr.imm2, "memory.init")
     discard ctx.popExpect(svI32)  # size
     discard ctx.popExpect(svI32)  # source offset
     discard ctx.popExpect(svI32)  # dest offset
 
   of opDataDrop:
-    if module.dataCount < 0: validErr("data.drop requires data count section")
-    if uint64(instr.imm1) >= uint64(module.datas.len): validErr("data.drop: invalid data index")
+    ctx.checkDataSegment(module, instr.imm1, "data.drop")
 
   of opMemoryCopy:
     if ctx.mems.len == 0: validErr("memory.copy without memory")
-    if uint64(instr.imm1) >= uint64(ctx.mems.len) or uint64(instr.imm2) >= uint64(ctx.mems.len):
-      validErr("memory.copy: invalid memory index")
+    ctx.checkMemory(instr.imm1, "memory.copy")
+    ctx.checkMemory(instr.imm2, "memory.copy")
     discard ctx.popExpect(svI32)  # size
     discard ctx.popExpect(svI32)  # source
     discard ctx.popExpect(svI32)  # dest
 
   of opMemoryFill:
     if ctx.mems.len == 0: validErr("memory.fill without memory")
-    if uint64(instr.imm1) >= uint64(ctx.mems.len): validErr("memory.fill: invalid memory index")
+    ctx.checkMemory(instr.imm1, "memory.fill")
     discard ctx.popExpect(svI32)  # size
     discard ctx.popExpect(svI32)  # value
     discard ctx.popExpect(svI32)  # dest
 
   # ---- Bulk table ----
   of opTableInit:
-    if uint64(instr.imm1) >= uint64(module.elements.len): validErr("table.init: invalid element index")
-    if uint64(instr.imm2) >= uint64(ctx.tables.len): validErr("table.init: invalid table index")
-    if module.elements[int(instr.imm1)].elemType != ctx.tables[int(instr.imm2)].elemType:
+    let segment {.cursor.} = ctx.elementSegment(module, instr.imm1, "table.init")
+    let table {.cursor.} = ctx.tableType(instr.imm2, "table.init")
+    if not matchesOperand(tableOperand(segment), tableOperand(table)):
       validErr("table.init: incompatible element/table types")
     discard ctx.popExpect(svI32)  # size
     discard ctx.popExpect(svI32)  # source offset
     discard ctx.popExpect(svI32)  # dest offset
 
   of opElemDrop:
-    if uint64(instr.imm1) >= uint64(module.elements.len): validErr("elem.drop: invalid element index")
+    discard ctx.elementSegment(module, instr.imm1, "elem.drop")
 
   of opTableCopy:
-    if uint64(instr.imm1) >= uint64(ctx.tables.len) or uint64(instr.imm2) >= uint64(ctx.tables.len):
-      validErr("table.copy: invalid table index")
-    if ctx.tables[int(instr.imm1)].elemType != ctx.tables[int(instr.imm2)].elemType:
+    let destination {.cursor.} = ctx.tableType(instr.imm1, "table.copy")
+    let source {.cursor.} = ctx.tableType(instr.imm2, "table.copy")
+    if not matchesOperand(tableOperand(source), tableOperand(destination)):
       validErr("table.copy: incompatible table types")
     discard ctx.popExpect(svI32)  # size
     discard ctx.popExpect(svI32)  # source
     discard ctx.popExpect(svI32)  # dest
 
   of opTableGrow:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.tables.len): validErr("table.grow: invalid table index")
+    let table {.cursor.} = ctx.tableType(instr.imm1, "table.grow")
     discard ctx.popExpect(svI32)
-    discard ctx.popExpect(valToStack(ctx.tables[int(idx)].elemType))
+    discard ctx.popExpect(tableOperand(table))
     ctx.pushOp(svI32)
 
   of opTableSize:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.tables.len): validErr("table.size: invalid table index")
+    discard ctx.tableType(instr.imm1, "table.size")
     ctx.pushOp(svI32)
 
   of opTableFill:
-    let idx = instr.imm1
-    if uint64(idx) >= uint64(ctx.tables.len): validErr("table.fill: invalid table index")
+    let table {.cursor.} = ctx.tableType(instr.imm1, "table.fill")
     discard ctx.popExpect(svI32)
-    discard ctx.popExpect(valToStack(ctx.tables[int(idx)].elemType))
+    discard ctx.popExpect(tableOperand(table))
     discard ctx.popExpect(svI32)
 
   # ---- Superinstructions (fused) — same typing as individual ops ----
@@ -704,8 +900,8 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let idx2 = instr.imm2
     if idx1 >= ctx.localCount or idx2 >= ctx.localCount:
       validErr("fused local.get: invalid local index")
-    ctx.pushOp(valToStack(ctx.localType(idx1)))
-    ctx.pushOp(valToStack(ctx.localType(idx2)))
+    ctx.pushLocal(idx1)
+    ctx.pushLocal(idx2)
 
   of opLocalGetI32Add:
     let idx = instr.imm1
@@ -757,30 +953,32 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let getIdx = instr.imm2
     if setIdx >= ctx.localCount or getIdx >= ctx.localCount:
       validErr("fused: invalid local index")
-    discard ctx.popExpect(valToStack(ctx.localType(setIdx)))
-    ctx.pushOp(valToStack(ctx.localType(getIdx)))
+    ctx.popLocal(setIdx)
+    ctx.pushLocal(getIdx)
   of opLocalTeeLocalGet:
     let teeIdx = instr.imm1
     let getIdx = instr.imm2
     if teeIdx >= ctx.localCount or getIdx >= ctx.localCount:
       validErr("fused: invalid local index")
-    let val = ctx.popExpect(valToStack(ctx.localType(teeIdx)))
-    ctx.pushOp(val)  # tee keeps value
-    ctx.pushOp(valToStack(ctx.localType(getIdx)))
+    ctx.popLocal(teeIdx)
+    ctx.pushLocal(teeIdx)
+    ctx.pushLocal(getIdx)
   of opLocalGetI32Const:
     let idx = instr.imm1
     if idx >= ctx.localCount: validErr("fused: invalid local index")
-    ctx.pushOp(valToStack(ctx.localType(idx)))
+    ctx.pushLocal(idx)
     ctx.pushOp(svI32)
   of opI32AddLocalSet:
     let idx = instr.imm1
     if idx >= ctx.localCount: validErr("fused: invalid local index")
+    if ctx.localType(idx) != vtI32: validErr("fused i32.add: local must be i32")
     discard ctx.popExpect(svI32)
     discard ctx.popExpect(svI32)
     # i32.add result stored to local (no push)
   of opI32SubLocalSet:
     let idx = instr.imm1
     if idx >= ctx.localCount: validErr("fused: invalid local index")
+    if ctx.localType(idx) != vtI32: validErr("fused i32.sub: local must be i32")
     discard ctx.popExpect(svI32)
     discard ctx.popExpect(svI32)
     # i32.sub result stored to local (no push)
@@ -802,6 +1000,8 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let idx2 = instr.imm2
     if idx1 >= ctx.localCount or idx2 >= ctx.localCount:
       validErr("fused: invalid local index")
+    if ctx.localType(idx1) != vtI32 or ctx.localType(idx2) != vtI32:
+      validErr("fused i32.add: locals must be i32")
     # Push both locals, then add: net effect = push i32
     ctx.pushOp(svI32)
   of opLocalGetLocalGetI32Sub:
@@ -809,15 +1009,19 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let idx2 = instr.imm2
     if idx1 >= ctx.localCount or idx2 >= ctx.localCount:
       validErr("fused: invalid local index")
+    if ctx.localType(idx1) != vtI32 or ctx.localType(idx2) != vtI32:
+      validErr("fused i32.sub: locals must be i32")
     ctx.pushOp(svI32)
   of opLocalGetI32ConstI32Sub:
     let idx = instr.imm1
     if idx >= ctx.localCount: validErr("fused: invalid local index")
+    if ctx.localType(idx) != vtI32: validErr("fused i32.sub: local must be i32")
     # local.get X; i32.const C; i32.sub → push i32
     ctx.pushOp(svI32)
   of opLocalGetI32ConstI32Add:
     let idx = instr.imm1
     if idx >= ctx.localCount: validErr("fused: invalid local index")
+    if ctx.localType(idx) != vtI32: validErr("fused i32.add: local must be i32")
     ctx.pushOp(svI32)
   of opLocalGetLocalTee:
     # local.get X; local.tee Y → push local[X], tee to Y (net: push 1 value)
@@ -825,7 +1029,9 @@ proc validateInstr(ctx: var ValidationContext, instr: Instr,
     let teeIdx = instr.imm2
     if getIdx >= ctx.localCount or teeIdx >= ctx.localCount:
       validErr("fused: invalid local index")
-    ctx.pushOp(valToStack(ctx.localType(getIdx)))
+    ctx.pushLocal(getIdx)
+    ctx.popLocal(teeIdx)
+    ctx.pushLocal(teeIdx)
   of opI32ConstI32GtU:
     # i32.const C; i32.gt_u → pop i32, push i32 (comparison result)
     discard ctx.popExpect(svI32)
@@ -892,10 +1098,13 @@ proc validateFunctionImpl(module: WasmModule, funcIdx: int,
     functionIndex: uint32(funcIdx),
     opcode: opBlock,
   )
+  when defined(wasmFunctionReferences):
+    ctx.functionTypeIndices = context.functionTypeIndices
+    ctx.signature = funcType
 
   # Push initial frame for function body
   ctx.emitEvent(veFunctionBegin)
-  let resultTypes = valsToStack(funcType.results)
+  let resultTypes = funcType.resultOperands()
   ctx.pushCtrl(opBlock, @[], resultTypes)
 
   # Validate each instruction
@@ -931,10 +1140,11 @@ proc validateFunction*(module: WasmModule, funcIdx: int,
 # ---------------------------------------------------------------------------
 
 proc validateModule*(module: WasmModule, trace: ptr seq[ValidationEvent] = nil,
-    labelChecks = false, catchChecks = false) =
+    labelChecks = false, catchChecks = false, allowMultipleMemories = false,
+    allowFunctionSubtyping = false) =
   ## Validate an entire WASM module: types, functions, tables, memories,
   ## globals, exports, start function.
-  let context = validateModuleContext(module)
+  let context = validateModuleContext(module, allowMultipleMemories, allowFunctionSubtyping)
   for index in context.importedFunctions..<context.functions.len:
     try:
       validateFunctionImpl(module, index, trace, labelChecks, catchChecks, context)

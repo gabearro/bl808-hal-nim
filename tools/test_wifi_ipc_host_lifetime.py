@@ -396,6 +396,70 @@ for initialIrq in [false, true]:
 """
 
 
+SPLIT_CHECKS = r"""
+proc confirm(pthis, hostId: pointer): cint {.cdecl.} =
+  seen.add(cast[uint](hostId))
+  # The record still belongs to this confirmation while the callback runs.
+  doAssert ipc_host_txdesc_get(addr envA[0]) == nil
+  ipc_host_txbuf_free(hostId)
+  0
+
+let env = cast[pointer](addr envA[0])
+callbackTable[0] = cast[pointer](confirm)
+ipc_host_init(env, addr callbackTable[0], addr poolA[0], nil)
+let ongoing = loadPtr(env, EnvListOngoingOff)
+let confirmations = loadPtr(env, EnvListCfmOff)
+var records: array[WifiTxDmaRecordCount, pointer]
+var packets: array[WifiTxPacketBufferCount, pointer]
+for i in 0 ..< WifiTxHostSlotCount:
+  packets[i] = ipc_host_txbuf_get(env)
+  records[i] = ipc_host_txdesc_get(env)
+  doAssert records[i] != nil and packets[i] != nil
+  ipc_host_txdesc_push(env, packets[i])
+  doAssert listPopFront(ongoing) == records[i]
+  storeU32(records[i], 64, (i + 1).uint32)
+doAssert ipc_host_txdesc_get(env) == nil
+
+let irq = ipcHostIrqSave()
+for i in 0 ..< WifiTxHostSlotCount:
+  doAssert ipcHostTxPrimaryDone(records[i], true)
+  doAssert not ipcHostTxPrimaryDone(records[i], true)
+ipcHostIrqRestore(irq)
+doAssert ipc_host_txdesc_left(env, 0, 0) == WifiTxHostSlotCount.cint
+
+for i in WifiTxHostSlotCount ..< WifiTxDmaRecordCount:
+  packets[i] = ipc_host_txbuf_get(env)
+  records[i] = ipc_host_txdesc_get(env)
+  doAssert records[i] != nil and records[i] notin records[0 ..< i]
+  ipc_host_txdesc_push(env, packets[i])
+  doAssert listPopFront(ongoing) == records[i]
+for i in WifiTxDmaRecordCount ..< WifiTxPacketBufferCount:
+  packets[i] = ipc_host_txbuf_get(env)
+for i, packet in packets:
+  doAssert packet != nil and packet notin packets[0 ..< i]
+doAssert ipc_host_txbuf_get(env) == nil
+doAssert ipc_host_txdesc_get(env) == nil
+
+# A credit returned on DONE allows another submission without clearing any
+# old DMA state. Simulate the existing safe retirement of the first record.
+doAssert loadU32(records[0], 64) == 1
+listPushBack(confirmations, records[0])
+ipc_host_irq(env, 1'u32 shl IpcIrqE2aTxCfmPos)
+doAssert seen == @[cast[uint](packets[0])]
+doAssert ipc_host_txbuf_get(env) == packets[0]
+doAssert ipc_host_txdesc_get(env) == nil  # the second batch still owns all credits
+
+# A flush may retire a frame that never reached primary DONE.
+let firstUnfinished = WifiTxHostSlotCount
+listPushBack(confirmations, records[firstUnfinished])
+ipc_host_irq(env, 1'u32 shl IpcIrqE2aTxCfmPos)
+doAssert seen == @[cast[uint](packets[0]), cast[uint](packets[firstUnfinished])]
+doAssert ipc_host_txdesc_left(env, 0, 0) == 1
+doAssert ipc_host_txdesc_get(env) in [records[0], records[firstUnfinished]]
+doAssert loadU32(records[1], 64) == 2
+"""
+
+
 def program(case: str, mutation: str | None) -> str:
     layout = (HOST / "layout.nim").read_text()
     types = (HOST / "callback_types.nim").read_text()
@@ -476,6 +540,12 @@ def program(case: str, mutation: str | None) -> str:
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", joined)))
     )
     diag = ""
+    if case == "split_tx":
+        layout = "{.define: bl808WifiSplitTxSlots.}\nimport std/bitops\n" + layout
+        pool = (HOST / "tx_dma_pool.nim").read_text()
+        joined = "\n".join([sources["list_helpers.nim"], sources["callbacks.nim"], pool,
+                           sources["init.nim"], sources["tx_shared.nim"], sources["irq.nim"]])
+        return layout + types + runtime_types + PLATFORM + helpers + debug + joined + SPLIT_CHECKS
     if case in {"tx_policy_scope", "tcp_policy_scope"}:
         define = ("bl808WifiDiagDhcpTxAttempts" if case == "tx_policy_scope"
                   else "bl808WifiDiagTcpPath")
@@ -488,7 +558,7 @@ def program(case: str, mutation: str | None) -> str:
 
 CASES = ["nested", "tx_policy_scope", "tcp_policy_scope", "reinit", "new_pool", "shared_pool", "aba", "nested_reset",
          "independent", "pop", "push", "txbuf", "after_pop", "snapshot",
-         "init_atomic", "submit_atomic", "pre_pop", "ack_reset", "debug_reset", "tbtt_reset"]
+         "init_atomic", "submit_atomic", "pre_pop", "ack_reset", "debug_reset", "tbtt_reset", "split_tx"]
 MUTANTS = {"invalidate": "reinit", "pop_lock": "pop", "push_lock": "push",
            "txbuf_lock": "txbuf", "dispatch_guard": "reinit",
            "completion_guard": "reinit", "callback_snapshot": "snapshot",
@@ -498,7 +568,8 @@ MUTANTS = {"invalidate": "reinit", "pop_lock": "pop", "push_lock": "push",
            "tbtt_guard": "tbtt_reset", "debug_loop": "debug_reset"}
 
 
-def run(tmp_path: Path, case: str, mode: str, mutation: str | None = None) -> None:
+def run(tmp_path: Path, case: str, mode: str, mutation: str | None = None,
+        defines: tuple[str, ...] = ()) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("Nim is required")
@@ -507,6 +578,7 @@ def run(tmp_path: Path, case: str, mode: str, mutation: str | None = None) -> No
     command = [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on"]
     if mode == "release": command += ["-d:release"]
     if mode == "asan": command += ["--passC:-fsanitize=address", "--passL:-fsanitize=address"]
+    command += [f"-d:{define}" for define in defines]
     command += ["--checks:on", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}", str(path)]
     result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=90)
@@ -520,6 +592,11 @@ def run(tmp_path: Path, case: str, mode: str, mutation: str | None = None) -> No
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_ipc_host_lifetime(tmp_path: Path, case: str, mode: str) -> None:
     run(tmp_path, case, mode)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_split_tx_expanded(tmp_path: Path, mode: str) -> None:
+    run(tmp_path, "split_tx", mode, defines=("WifiTxHostSlotCount=8", "WifiTxDmaRecordCount=16"))
 
 
 @pytest.mark.parametrize("mutation", MUTANTS)

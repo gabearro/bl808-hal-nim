@@ -2779,7 +2779,7 @@ when defined(bl808AllcoreWasmHttp):
       discard console.sendLine("[M0] allcore_http_wifi_init_done")
     when defined(bl808AllcoreWifiApEngineBench):
       if not runAllcoreApEngineBench(): return
-    wifiInstallServiceHook(periodUs = 1000'u32, iterations = 16'u32)
+    wifiInstallServiceHook(periodUs = 1000'u32)
     var connectAttempts = 0'u32
     var joinedTarget = wifiTargetPrimary
     var netif: ptr Netif

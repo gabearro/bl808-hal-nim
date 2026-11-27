@@ -9,6 +9,8 @@ proc declaredFunctionReferences*(module: WasmModule): seq[uint32] =
     for instruction in expr.code:
       if instruction.op == opRefFunc: references.add instruction.imm1
   for global in module.globals: scan(global.init)
+  when defined(wasmFunctionReferences):
+    for initializer in module.tableInitializers: scan(initializer.init)
   for segment in module.elements:
     scan(segment.offset)
     for expr in segment.init: scan(expr)

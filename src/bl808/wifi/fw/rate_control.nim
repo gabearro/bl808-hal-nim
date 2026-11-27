@@ -467,7 +467,7 @@ proc rc_calc_tp*(stats: pointer; sampleIdx: uint8): uint32 {.exportc, cdecl.} =
 
 proc rcAccountCounters(staIdx: uint8; attemptCount, failureCount: uint32;
                        sentRates: ptr array[4, uint16]; finishTrial: bool;
-                       sentSamples = 0'u16) =
+                       sentSamples = 0'u16; firstSlotAttempts = 4'u32) =
   let saved = irqSave()
   defer: irqRestore(saved)
   inc nimFwDbgRcUpdateCalls
@@ -518,8 +518,9 @@ proc rcAccountCounters(staIdx: uint8; attemptCount, failureCount: uint32;
     if attempts == 0:
       break
 
-    let slotAttempts = if failures > 3: 4'u32 else: attempts
-    let slotFailures = if failures > 3: 4'u32 else: failures
+    let slotBudget = if retrySlotIndex == 0: firstSlotAttempts else: 4'u32
+    let slotAttempts = if failures >= slotBudget: slotBudget else: attempts
+    let slotFailures = min(failures, slotBudget)
     var retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx
     if sentRates != nil:
       let sentRate = sentRates[][retrySlotIndex]

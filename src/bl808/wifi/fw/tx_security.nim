@@ -1,5 +1,6 @@
-## Private key bindings for four host slots, four internal slots, and a beacon.
-const TxSecurityReservationCount = 9
+# Host DMA records, four internal frames, and a beacon can all retain a key.
+const TxSecurityReservationCount =
+  (when defined(bl808WifiSplitTxSlots): hostIpc.WifiTxDmaRecordCount else: 4) + 5
 
 type TxSecurityReservation = object
   descriptor: pointer

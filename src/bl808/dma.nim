@@ -1,7 +1,7 @@
 ## BL808 DMA controller driver.
 ##
 ## DMA0 at 0x2000C000 — 8 channels, MCU subsystem (M0/LP)
-## DMA1 at 0x20071000 — 8 channels, MCU subsystem
+## DMA1 at 0x20071000 — 4 channels, MCU subsystem
 ## DMA2 at 0x30001000 — 8 channels, MM subsystem (D0)
 ##
 ## All share the same register layout. Each channel can do:
@@ -11,6 +11,8 @@
 ## - Linked list (scatter-gather) transfers
 
 import mmio, memmap
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  import core
 
 # =============================================================================
 # Global DMA register offsets
@@ -120,12 +122,33 @@ type
     dmaPeriphUart2Tx  = 5
     dmaPeriphI2c0Rx   = 6
     dmaPeriphI2c0Tx   = 7
+    dmaPeriphIrTx     = 8
+    dmaPeriphGpioTx   = 9
     dmaPeriphSpi0Rx   = 10
     dmaPeriphSpi0Tx   = 11
+    dmaPeriphAudioRx  = 12
+    dmaPeriphAudioTx  = 13
     dmaPeriphI2c1Rx   = 14
     dmaPeriphI2c1Tx   = 15
     dmaPeriphI2sRx    = 16
     dmaPeriphI2sTx    = 17
+    dmaPeriphPdmRx    = 18
+    dmaPeriphAdcRx    = 22
+    dmaPeriphDacTx    = 23
+
+  DmaMmPeriphId* = enum
+    ## Peripheral request IDs for DMA2.
+    dmaMmUart3Rx = 0
+    dmaMmUart3Tx = 1
+    dmaMmSpi1Rx  = 2
+    dmaMmSpi1Tx  = 3
+    dmaMmI2c2Rx  = 6
+    dmaMmI2c2Tx  = 7
+    dmaMmI2c3Rx  = 8
+    dmaMmI2c3Tx  = 9
+    dmaMmDsiRx   = 10
+    dmaMmDsiTx   = 11
+    dmaMmDbiTx   = 22
 
   DmaTransferConfig* = object
     srcAddr*: uint32
@@ -165,18 +188,19 @@ proc dmaBase(id: DmaId): uint =
 # =============================================================================
 # DMA controller initialization
 # =============================================================================
-proc initDma*(id: DmaId): Dma =
-  ## Initialize a DMA controller: enable it and clear all interrupts.
+proc controllerId*(dma: Dma): DmaId {.inline.} = dma.id
+
+proc openDma*(id: DmaId): Dma =
+  ## Enable a clocked DMA controller without changing any channel or status.
   result.base = dmaBase(id)
   result.id = id
-  let base = result.base
+  regSet(result.base + DmaTopConfig, 1'u32)
 
-  # Enable the DMA controller
-  regSet(base + DmaTopConfig, 1'u32)
-
-  # Clear all TC and error interrupts
-  regWrite(base + DmaIntTcClear, 0xFF'u32)
-  regWrite(base + DmaIntErrClear, 0xFF'u32)
+proc initDma*(id: DmaId): Dma =
+  ## Initialize a DMA controller at boot, when no channel is in use.
+  result = openDma(id)
+  regWrite(result.base + DmaIntTcClear, 0xFF'u32)
+  regWrite(result.base + DmaIntErrClear, 0xFF'u32)
 
 # =============================================================================
 # Channel operations
@@ -254,6 +278,47 @@ proc channelActive*(dma: Dma, ch: DmaChannel): bool =
 proc channelEnabled*(dma: Dma, ch: DmaChannel): bool =
   (regRead(dma.base + DmaEnabledChns) and (1'u32 shl ch.uint32)) != 0
 
+var reservedChannels: array[DmaId, uint32]
+
+template withChannelLock(body: untyped) =
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    withInterruptsDisabled: body
+  else:
+    body
+
+proc hasFreeChannels*(dma: Dma; required: int): bool =
+  ## The scheduler uses this to wait for capacity without preparing a transfer.
+  if required <= 0: return required == 0
+  let count = if dma.id == dma1: 4 else: 8
+  let unavailable = reservedChannels[dma.id] or regRead(dma.base + DmaEnabledChns)
+  var available = 0
+  for i in 0 ..< count:
+    if (unavailable and (1'u32 shl i)) == 0:
+      inc available
+      if available >= required: return true
+
+proc reserveChannel*(dma: Dma, requested = -1): int =
+  ## Claim a free channel. Drivers programming raw channels should reserve
+  ## them for their lifetime. Assign each managed controller to one core.
+  let count = if dma.id == dma1: 4 else: 8
+  if requested < -1 or requested >= count: return -1
+  let allowed = if requested == -1: (1'u32 shl count) - 1 else: 1'u32 shl requested
+  result = -1
+  withChannelLock:
+    let unavailable = reservedChannels[dma.id] or regRead(dma.base + DmaEnabledChns)
+    let candidates = allowed and not unavailable
+    for i in 0 ..< count:
+      let bit = 1'u32 shl i
+      if (candidates and bit) != 0:
+        reservedChannels[dma.id] = reservedChannels[dma.id] or bit
+        result = i
+        break
+
+proc releaseChannel*(dma: Dma, ch: DmaChannel) =
+  ## Give back a channel after it has stopped and its status has been cleared.
+  withChannelLock:
+    reservedChannels[dma.id] = reservedChannels[dma.id] and not (1'u32 shl ch.uint32)
+
 proc channelSrcAddr*(dma: Dma, ch: DmaChannel): uint32 =
   ## The address the channel reads next. With an incrementing source this is
   ## the position in the buffer (in a circular list, the ring's read
@@ -272,6 +337,10 @@ proc tcInterruptPending*(dma: Dma, ch: DmaChannel): bool =
 
 proc errInterruptPending*(dma: Dma, ch: DmaChannel): bool =
   (regRead(dma.base + DmaIntErrStatus) and (1'u32 shl ch.uint32)) != 0
+
+proc rawErrInterruptPending*(dma: Dma, ch: DmaChannel): bool =
+  ## Read raw status when polling a channel with interrupts masked.
+  (regRead(dma.base + DmaRawIntErr) and (1'u32 shl ch.uint32)) != 0
 
 proc clearTcInterrupt*(dma: Dma, ch: DmaChannel) =
   regWrite(dma.base + DmaIntTcClear, 1'u32 shl ch.uint32)

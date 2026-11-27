@@ -1,6 +1,15 @@
 ## WebAssembly core types
 ## Covers: value types, function types, module structure, instruction IR
 
+when defined(wasmSharedCoreTypes) and not defined(wasmFunctionReferences):
+  {.error: "wasmSharedCoreTypes requires wasmFunctionReferences".}
+
+when defined(wasmFunctionReferences):
+  const WasmNoFuncHeapTag* = uint32.high
+
+  proc validFunctionHeapTag*(tag: uint32, typeCount: int): bool {.inline.} =
+    tag == WasmNoFuncHeapTag or tag.uint64 <= typeCount.uint64
+
 type
   ValType* = enum
     vtI32 = 0x7F
@@ -18,11 +27,44 @@ type
   FuncType* = object
     params*: seq[ValType]
     results*: seq[ValType]
+    definition*: CoreFunctionDefinition
+    when defined(wasmFunctionReferences):
+      references*: ref CoreSignatureReferences
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
+
+  CoreSignatureReferences* = object
+    params*, results*: seq[CoreReferenceType]
+
+  CoreReferenceType* = object
+    ## Zero is the lane's abstract heap type. A concrete member without a
+    ## group denotes a reference bound by its enclosing recursion group.
+    member*: uint32
+    group*: CoreFunctionGroup
+    nonNull*: bool
+    when defined(wasmSharedCoreTypes):
+      sharedAbstract*: bool
+
+  CoreFunctionDefinition* = ref object
+    group*: CoreFunctionGroup
+    member*: uint16
+
+  CoreFunctionGroup* = ref object
+    members*: seq[CoreFunctionMember]
+
+  CoreFunctionMember* = object
+    signature*: FuncType  # flat parameters and results, without a definition
+    nonFinal*: bool
+    depth*: uint8
+    localSuper*: int32    # earlier member of this group, or -1
+    outerSuper*: CoreFunctionDefinition
 
   Limits* = object
     min*: uint32
     max*: uint32
     hasMax*: bool
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   MemType* = object
     limits*: Limits
@@ -30,10 +72,16 @@ type
   TableType* = object
     elemType*: ValType
     limits*: Limits
+    when defined(wasmFunctionReferences):
+      elementReference*: CoreReferenceType
 
   GlobalType* = object
     valType*: ValType
     mut*: Mutability
+    when defined(wasmFunctionReferences):
+      reference*: CoreReferenceType
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   # Block types for control instructions
   BlockTypeKind* = enum
@@ -100,6 +148,7 @@ type
     opReturn = 0x0F
     opCall = 0x10
     opCallIndirect = 0x11
+    opCallRef = 0x14
 
     # Parametric
     opDrop = 0x1A
@@ -302,6 +351,7 @@ type
     opRefNull = 0xD0
     opRefIsNull = 0xD1
     opRefFunc = 0xD2
+    opRefAsNonNull = 0xD4
 
     # Multi-byte prefix instructions (represented as high values)
     opI32TruncSatF32S = 0x100  # 0xFC 0
@@ -502,9 +552,29 @@ type
     opF64x2Mul          = 0x341  # 0xFD 242 f64x2.mul
     opF64x2Div          = 0x342  # 0xFD 243 f64x2.div
 
+    # 0xFE 0x4F..0x57. imm1 = global index, pad = ordering byte.
+    opGlobalAtomicGet     = 0x44F
+    opGlobalAtomicSet     = 0x450
+    opGlobalAtomicAdd     = 0x451
+    opGlobalAtomicSub     = 0x452
+    opGlobalAtomicAnd     = 0x453
+    opGlobalAtomicOr      = 0x454
+    opGlobalAtomicXor     = 0x455
+    opGlobalAtomicXchg    = 0x456
+    opGlobalAtomicCmpXchg = 0x457
+
+    # 0xFE linear-memory atomics. For memory accesses pad = memory index,
+    # imm1 = offset, and imm2 = wire sub-opcode plus memarg alignment in bits 8+.
+    opMemoryAtomic       = 0x458
+    opAtomicFence        = 0x459
+    opMemoryAtomicNotify = 0x45A
+    opMemoryAtomicWait32 = 0x45B
+    opMemoryAtomicWait64 = 0x45C
+
     # ---- Tail call proposal ----
     opReturnCall = 0x12         # return_call funcIdx
     opReturnCallIndirect = 0x13 # return_call_indirect typeIdx tableIdx
+    opReturnCallRef = 0x15      # return_call_ref typeIdx
 
     # ---- Exception handling proposal ----
     opTryTable = 0x1F    # try_table blocktype catch*
@@ -538,7 +608,7 @@ type
   # For br_table, imm1 = index into external labels table.
   Instr* = object
     op*: Opcode          # 2 bytes
-    pad*: uint16         # 2 bytes (available for flags)
+    pad*: uint16         # 2 bytes: memarg memory index or opcode-specific flags
     imm1*: uint32        # 4 bytes: local/global/label/func idx, memarg offset, block endOffset, i32/f32 const
     imm2*: uint32        # 4 bytes: memarg align, block elseOffset, table idx, type idx
                          # For i64/f64: imm1 = low 32 bits, imm2 = high 32 bits
@@ -589,6 +659,10 @@ type
     offset*: Expr           # for active
     elemType*: ValType
     init*: seq[Expr]        # init expressions for each element
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
+    when defined(wasmFunctionReferences):
+      elementReference*: CoreReferenceType
 
   # Data segment
   DataMode* = enum
@@ -600,11 +674,17 @@ type
     memIdx*: uint32        # for active
     offset*: Expr           # for active
     data*: seq[byte]
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   # Function body
   LocalDecl* = object
     count*: uint32
     valType*: ValType
+    when defined(wasmFunctionReferences):
+      functionType*: uint32  # Nullable heap type index plus one, nofunc, or zero.
+    when defined(wasmSharedCoreTypes):
+      sharedReference*: bool
 
   FuncBody* = object
     locals*: seq[LocalDecl]
@@ -620,6 +700,9 @@ type
     imports*: seq[Import]
     funcTypeIdxs*: seq[uint32]  # type indices for functions (not including imports)
     tables*: seq[TableType]
+    when defined(wasmFunctionReferences):
+      ## Explicit initializers in definition order, with indices excluding imports.
+      tableInitializers*: seq[tuple[index: uint32, init: Expr]]
     memories*: seq[MemType]
     globals*: seq[GlobalDef]
     exports*: seq[Export]
@@ -630,6 +713,37 @@ type
     dataCount*: int64           # optional u32 count; -1 if section absent
     customSections*: seq[tuple[name: string, data: seq[byte]]]
     tagDefs*: seq[WasmTagDef]   # local exception tags (section 13)
+
+func validMemoryLimits*(value: Limits): bool =
+  when defined(wasmSharedCoreTypes):
+    if value.shared and not value.hasMax: return false
+  value.min <= 65536 and
+    (not value.hasMax or (value.min <= value.max and value.max <= 65536))
+
+func validGlobalAtomicOrdering*(op: Opcode, ordering: uint16): bool =
+  ## Shared-everything stores matching RMW read/write orderings in two nibbles.
+  case op
+  of opGlobalAtomicGet, opGlobalAtomicSet: ordering in [0'u16, 0x01]
+  of opGlobalAtomicAdd .. opGlobalAtomicCmpXchg: ordering in [0'u16, 0x11]
+  else: false
+
+type
+  MemoryAtomicKind* = enum
+    maInvalid, maLoad, maStore, maAdd, maSub, maAnd, maOr, maXor, maExchange, maCompareExchange
+  MemoryAtomicSpec* = object
+    kind*: MemoryAtomicKind
+    alignment*: uint8
+    lane*: ValType
+
+func memoryAtomicSpec*(sub: uint32): MemoryAtomicSpec =
+  ## The threads encoding repeats the same seven lane/width variants for
+  ## each operation, beginning with the full-width i32 and i64 forms.
+  if sub notin 0x10'u32 .. 0x4e'u32: return
+  const alignments = [2'u8, 3, 0, 1, 0, 1, 2]
+  let index = (sub - 0x10).int
+  let variant = index mod alignments.len
+  MemoryAtomicSpec(kind: MemoryAtomicKind(maLoad.ord + index div alignments.len),
+    alignment: alignments[variant], lane: (if variant in {0, 2, 3}: vtI32 else: vtI64))
 
 func tagTypeIndex*(module: WasmModule, index: uint32): int64 =
   ## The tag index space starts with imports and continues with local tags.
@@ -694,6 +808,217 @@ proc wasmNullFuncRef*(): WasmValue =
 
 proc wasmNullExternRef*(): WasmValue =
   WasmValue(kind: wvkExternRef, externRef: -1)
+
+proc isSharedCoreFunction*(signature: FuncType): bool {.inline.} =
+  when defined(wasmSharedCoreTypes): signature.shared
+  else: false
+
+proc sameCoreLanes(left, right: FuncType): bool {.inline.} =
+  left.isSharedCoreFunction() == right.isSharedCoreFunction() and
+    left.params == right.params and left.results == right.results
+
+when defined(wasmFunctionReferences):
+  proc referenceAt*(refs: openArray[CoreReferenceType], index: int): CoreReferenceType {.inline.} =
+    if index < refs.len: refs[index] else: CoreReferenceType()
+
+  proc resolveReference*(value: CoreReferenceType, group: CoreFunctionGroup): CoreReferenceType =
+    result = value
+    if value.member != 0 and value.member != WasmNoFuncHeapTag and value.group == nil:
+      result.group = group
+
+  proc coreParamReference*(signature: FuncType, index: int): CoreReferenceType =
+    if signature.references != nil:
+      result = signature.references.params.referenceAt(index).resolveReference(
+        if signature.definition != nil: signature.definition.group else: nil)
+
+  proc coreResultReference*(signature: FuncType, index: int): CoreReferenceType =
+    if signature.references != nil:
+      result = signature.references.results.referenceAt(index).resolveReference(
+        if signature.definition != nil: signature.definition.group else: nil)
+
+  proc coreFunctionReference*(signature: FuncType, nonNull = false): CoreReferenceType =
+    result.nonNull = nonNull
+    if signature.definition != nil:
+      result.member = signature.definition.member.uint32 + 1
+      result.group = signature.definition.group
+    else:
+      when defined(wasmSharedCoreTypes): result.sharedAbstract = signature.shared
+
+when defined(wasmSharedCoreTypes):
+  proc isSharedCoreReference*(value: CoreReferenceType): bool =
+    if value.group == nil: value.sharedAbstract
+    else: value.group.members[value.member.int - 1].signature.shared
+
+  proc hasValidGlobalSharing*(value: GlobalType): bool =
+    not value.shared or value.valType notin {vtFuncRef, vtExternRef} or
+      value.reference.isSharedCoreReference()
+
+  proc isSharedCoreHeapTag*(types: openArray[FuncType], tag: uint32,
+                            sharedAbstract: bool): bool =
+    if tag in [0'u32, WasmNoFuncHeapTag]: sharedAbstract
+    else: types[tag.int - 1].shared
+
+  proc hasSharedCoreLanes*(signature: FuncType): bool =
+    if not signature.shared: return true
+    for i, lane in signature.params:
+      if lane in {vtFuncRef, vtExternRef} and not signature.coreParamReference(i).isSharedCoreReference():
+        return false
+    for i, lane in signature.results:
+      if lane in {vtFuncRef, vtExternRef} and not signature.coreResultReference(i).isSharedCoreReference():
+        return false
+    true
+
+proc sameFunctionGroup(left, right: CoreFunctionGroup): bool =
+  if left == right: return true
+  # Forward references are relative to the current group. Only earlier
+  # groups can appear as pointers, so compare each external pair once.
+  type GroupPair = tuple[left, right: CoreFunctionGroup]
+  var first = (left: left, right: right)
+  var pending: seq[GroupPair]
+  var next = 0
+  while true:
+    let (a, b) = first
+    if a.members.len != b.members.len: return false
+    template compareExternal(leftGroup, rightGroup: CoreFunctionGroup) =
+      if leftGroup != rightGroup:
+        if leftGroup == nil or rightGroup == nil: return false
+        let pair = (left: leftGroup, right: rightGroup)
+        if pair notin pending: pending.add(pair)
+    for i in 0 ..< a.members.len:
+      let x {.cursor.} = a.members[i]
+      let y {.cursor.} = b.members[i]
+      if x.nonFinal != y.nonFinal or x.localSuper != y.localSuper or
+          not x.signature.sameCoreLanes(y.signature):
+        return false
+      when defined(wasmFunctionReferences):
+        if x.signature.references != nil or y.signature.references != nil:
+          let leftRefs {.cursor.} = x.signature.references
+          let rightRefs {.cursor.} = y.signature.references
+          template compareLanes(part: untyped) =
+            for lane in 0 ..< x.signature.part.len:
+              let have = if leftRefs == nil: CoreReferenceType() else: leftRefs.part.referenceAt(lane)
+              let need = if rightRefs == nil: CoreReferenceType() else: rightRefs.part.referenceAt(lane)
+              if have.member != need.member or have.nonNull != need.nonNull: return false
+              when defined(wasmSharedCoreTypes):
+                if have.sharedAbstract != need.sharedAbstract: return false
+              compareExternal(have.group, need.group)
+          compareLanes(params)
+          compareLanes(results)
+      if x.outerSuper == y.outerSuper: continue
+      if x.outerSuper == nil or y.outerSuper == nil or
+          x.outerSuper.member != y.outerSuper.member:
+        return false
+      compareExternal(x.outerSuper.group, y.outerSuper.group)
+    if next == pending.len: return true
+    first = pending[next]
+    inc next
+
+when defined(wasmFunctionReferences):
+  proc sameCoreReference*(left, right: CoreReferenceType): bool =
+    when defined(wasmSharedCoreTypes):
+      if left.sharedAbstract != right.sharedAbstract: return false
+    left.member == right.member and left.nonNull == right.nonNull and
+      (left.group == right.group or (left.group != nil and right.group != nil and
+       sameFunctionGroup(left.group, right.group)))
+
+proc sameCoreSignature*(left, right: FuncType): bool =
+  if not left.sameCoreLanes(right): return false
+  when defined(wasmFunctionReferences):
+    if left.references != nil or right.references != nil:
+      for i in 0 ..< left.params.len:
+        if not sameCoreReference(left.coreParamReference(i), right.coreParamReference(i)): return false
+      for i in 0 ..< left.results.len:
+        if not sameCoreReference(left.coreResultReference(i), right.coreResultReference(i)): return false
+  true
+
+proc groupMemberMatches(group: CoreFunctionGroup, member: int,
+                        expected: CoreFunctionGroup, expectedMember: int): bool =
+  var group = group
+  var member = member
+  while true:
+    if member == expectedMember and sameFunctionGroup(group, expected): return true
+    let current {.cursor.} = group.members[member]
+    if current.localSuper >= 0:
+      member = current.localSuper.int
+    elif current.outerSuper != nil:
+      member = current.outerSuper.member.int
+      group = current.outerSuper.group
+    else:
+      return false
+
+when defined(wasmFunctionReferences):
+  proc matchesCoreReference*(actual, expected: CoreReferenceType): bool =
+    when defined(wasmSharedCoreTypes):
+      if actual.isSharedCoreReference() != expected.isSharedCoreReference(): return false
+    if expected.nonNull and not actual.nonNull: return false
+    if expected.member == 0 or actual.member == WasmNoFuncHeapTag: return true
+    if actual.group == nil or expected.group == nil: return false
+    groupMemberMatches(actual.group, actual.member.int - 1,
+      expected.group, expected.member.int - 1)
+
+  proc matchesCoreSignature*(actual, expected: FuncType): bool =
+    if not actual.sameCoreLanes(expected): return false
+    for i in 0 ..< actual.params.len:
+      if not matchesCoreReference(expected.coreParamReference(i), actual.coreParamReference(i)): return false
+    for i in 0 ..< actual.results.len:
+      if not matchesCoreReference(actual.coreResultReference(i), expected.coreResultReference(i)): return false
+    true
+
+  proc isImplicitFunction(definition: CoreFunctionDefinition): bool =
+    if definition == nil: return true
+    let group {.cursor.} = definition.group
+    group.members.len == 1 and not group.members[0].nonFinal and group.members[0].depth == 0
+
+proc importGlobalTypeMatch*(actual, required: GlobalType): bool =
+  if actual.valType != required.valType or actual.mut != required.mut: return false
+  when defined(wasmSharedCoreTypes):
+    if actual.shared != required.shared: return false
+  when defined(wasmFunctionReferences):
+    if actual.valType in {vtFuncRef, vtExternRef}:
+      if actual.mut == mutConst:
+        return matchesCoreReference(actual.reference, required.reference)
+      return sameCoreReference(actual.reference, required.reference)
+  true
+
+proc isPlainCoreFunction*(signature: FuncType): bool =
+  when defined(wasmFunctionReferences):
+    not signature.isSharedCoreFunction() and signature.definition.isImplicitFunction()
+  else: signature.definition == nil
+
+proc `==`*(left, right: FuncType): bool =
+  if not left.sameCoreLanes(right): return false
+  let a = left.definition
+  let b = right.definition
+  if a == b: return left.sameCoreSignature(right)
+  when defined(wasmFunctionReferences):
+    if a == nil or b == nil:
+      return a.isImplicitFunction() and b.isImplicitFunction() and left.sameCoreSignature(right)
+  a != nil and b != nil and a.member == b.member and sameFunctionGroup(a.group, b.group)
+
+proc matchesCoreFunctionType*(actual, expected: FuncType): bool =
+  when not defined(wasmFunctionReferences):
+    if not actual.sameCoreLanes(expected): return false
+  let need = expected.definition
+  let have = actual.definition
+  if have == need: return actual.sameCoreSignature(expected)
+  # Implicit scalar types are final singleton groups without a supertype.
+  when defined(wasmFunctionReferences):
+    if have == nil or need == nil:
+      return have.isImplicitFunction() and need.isImplicitFunction() and actual.sameCoreSignature(expected)
+  if have == nil or need == nil: return false
+  groupMemberMatches(have.group, have.member.int, need.group, need.member.int)
+
+when defined(wasmFunctionReferences):
+  proc matchesFunctionReference*(actual: FuncType, expected: CoreReferenceType): bool =
+    when defined(wasmSharedCoreTypes):
+      if actual.shared != expected.isSharedCoreReference(): return false
+    if expected.member == 0: return true
+    if expected.group == nil: return false
+    if actual.definition != nil:
+      return matchesCoreReference(actual.coreFunctionReference(nonNull = true), expected)
+    let group {.cursor.} = expected.group
+    group.members.len == 1 and not group.members[0].nonFinal and
+      group.members[0].depth == 0 and actual.sameCoreSignature(group.members[0].signature)
 
 proc toValueKind*(vt: ValType): WasmValueKind =
   case vt

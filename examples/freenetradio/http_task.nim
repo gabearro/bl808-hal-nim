@@ -13,6 +13,8 @@
 import bl808/kernel/cps
 import bl808/kernel/log
 import ./httpd, ./tcpconn, ./netstate, ./timebase, ./diag
+when defined(bl808m0) and defined(radioProfiler):
+  import bl808/kernel/profiler
 
 const
   HttpPort = 80'u16
@@ -48,6 +50,8 @@ proc service(s: var Slot) =
 
 proc httpPoll(): uint64 =
   ## Serve what can be served now; returns when to come back, in ms.
+  when defined(bl808m0) and defined(radioProfiler):
+    expireProfile()
   if listener == nil:
     # Like upstream, the server starts once the network is configured.
     if not configUp(): return IdlePollMs

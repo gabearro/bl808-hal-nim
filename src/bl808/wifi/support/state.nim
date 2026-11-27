@@ -16,6 +16,9 @@ var apRegistered: bool
 var osMutexDepth: uint32
 var osMutexSavedIrq: uint32
 var osTaskNotifications: uint32
+var wifiSchedulerWorkHook: proc() {.cdecl.}
+when defined(radioDiag):
+  var wifiCpsNestedWaitPolls, wifiCpsSleepPolls, wifiCpsLegacyPollCalls: uint32
 var osTimerHead: ptr SimpleTimer
 var connectDone = -1'i32
 var disconnectDone: int32

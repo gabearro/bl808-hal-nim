@@ -4,7 +4,11 @@
 ## anything but the heap, and a loop to run in. Firmware only.
 
 import bl808/kernel/cps
-import ./mp3dec, ./i2s_ring, ./i2s_out, ./player, ./diag
+import ./mp3dec, ./i2s_ring, ./i2s_out, ./player, ./diag, ./timebase
+import ./mp3_d0_client
+when defined(bl808m0) and defined(radioProfiler):
+  import bl808/kernel/profiler
+  import ./status
 
 type
   Audio = object
@@ -17,9 +21,22 @@ var audio: ptr Audio
 
 proc decodeFrame(ctx: pointer; mp3: openArray[byte]; pcm: var openArray[int16];
                  info: var FrameInfo): tuple[consumed: int, status: DecodeStatus] {.nimcall.} =
-  cast[ptr Mp3Decoder](ctx)[].decode(mp3, pcm, info)
+  when defined(bl808m0) and defined(radioProfiler):
+    let span = beginProfileSpan()
+  var decodedRemotely = false
+  when radioD0Mp3Image.len != 0:
+    if workerEnabled:
+      result = decodeOnD0(mp3, pcm, info)
+      decodedRemotely = workerEnabled
+  if not decodedRemotely:
+    result = cast[ptr Mp3Decoder](ctx)[].decode(mp3, pcm, info)
+  when defined(bl808m0) and defined(radioProfiler):
+    endProfileSpan(span, prDecode, work = (result.status == dsDecoded).uint32)
 
 proc spectrumOf(ctx: pointer; energy: var array[SpectrumBands, float32]): uint32 {.nimcall.} =
+  when radioD0Mp3Image.len != 0:
+    if workerEnabled:
+      return workerSpectrum(energy)
   cast[ptr Mp3Decoder](ctx)[].takeSpectrum(energy)
 
 proc dacReadPos(): int {.nimcall.} = i2s_out.readPos()
@@ -44,16 +61,57 @@ proc audioStep(): StepResult =
     result = audio.player.step()
     inc burst
 
+when DiagEnabled:
+  proc recordAudioSleepOvershoot(startUs, budgetUs: uint64) =
+    let elapsed = nowUs() - startUs
+    let overshoot = if elapsed > budgetUs: elapsed - budgetUs else: 0'u64
+    let value = uint32(min(overshoot, high(uint32).uint64))
+    stats.audioSleepOvershootMaxUs = max(stats.audioSleepOvershootMaxUs, value)
+    if value > 15_000'u32: inc stats.audioSleepOver15ms
+
+template armAudioWait(deadline: untyped): untyped =
+  # Keep optional types behind a template. CPS infers lifted local types
+  # even in branches that the compiler later removes.
+  when defined(bl808m0) and defined(radioProfiler):
+    if recordingProfile() and status.player.phase == phPlaying:
+      beginProfileWait(deadline.uint32)
+    else:
+      ProfileWait()
+  else:
+    default(tuple[])
+
+template finishAudioWait(wait: untyped; yielded: static bool) =
+  when defined(bl808m0) and defined(radioProfiler):
+    endProfileWait(wait, yielded)
+
 proc audioTask(): CpsVoidFuture {.cps.} =
   while true:
     var next: StepResult
     timed(slAudio): next = audioStep()
-    if next == srIdle:
-      await sleepMs(20)
-    elif next == srWait:
-      await sleepMs(10)
+    when radioD0Mp3Image.len != 0:
+      if next == srDecodePending:
+        await decodeReady
+        continue
+    if next != srYield:
+      let waitMs = if next == srIdle: 20'u64 else: 10'u64
+      when DiagEnabled:
+        let waitStart = nowUs()
+      let due = readTick() + msToTicks(waitMs)
+      let wait = armAudioWait(due)
+      await sleepUntil(due)
+      finishAudioWait(wait, false)
+      when DiagEnabled:
+        recordAudioSleepOvershoot(waitStart, waitMs * 1000)
     else:
+      when DiagEnabled:
+        let waitStart = nowUs()
+      let wait = armAudioWait(readTick())
       await yieldNow()
+      finishAudioWait(wait, true)
+      when DiagEnabled:
+        let value = uint32(min(nowUs() - waitStart, high(uint32).uint64))
+        stats.audioYieldWaitMaxUs = max(stats.audioYieldWaitMaxUs, value)
+        if value > 15_000'u32: inc stats.audioYieldWaitOver15ms
 
 proc audioStart*() =
   ## Start the DAC clocking out silence at 44.1 kHz and the task that feeds
@@ -61,11 +119,15 @@ proc audioStart*() =
   ## `spectrum` and `diag` are set up.
   audio = createShared(Audio)
   initDecoder(audio.decoder)
+  var dec = DecoderOps(ctx: addr audio.decoder, decode: decodeFrame, takeSpectrum: spectrumOf)
+  when radioD0Mp3Image.len != 0:
+    startMp3Worker()
+    dec.decodeUs = workerDecodeUs
   i2sOutInit(InitialSampleRate)
   initPlayer(audio.player, ringBuffer(),
              cast[ptr UncheckedArray[byte]](addr audio.window[0]),
              cast[ptr UncheckedArray[int16]](addr audio.pcm[0]),
-             DecoderOps(ctx: addr audio.decoder, decode: decodeFrame, takeSpectrum: spectrumOf),
+             dec,
              OutputOps(readPos: dacReadPos, commit: dacCommit,
                        setSampleRate: dacSetSampleRate, actualRate: dacActualRate))
   discard audioTask()

@@ -28,6 +28,18 @@ var
 
 proc localTick(): uint64 {.nimcall.} = readTick()
 
+when FullSchedulerAtomicWait:
+  proc localAtomicNanoseconds(): uint64 {.nimcall.} =
+    when defined(wasmRtKernelTest): localTick() * 1000
+    else: ticksToUs(localTick()) * 1000
+
+  proc atomicDurationTicks(ns: uint64): uint64 {.nimcall.} =
+    let us = ns div 1000 + (if ns mod 1000 == 0: 0'u64 else: 1'u64)
+    when defined(wasmRtKernelTest): us
+    else:
+      let rate = max(clockGetTickRate(), 1'u64)
+      min(us, uint64.high div rate) * rate
+
 proc pollWasmRtKernel(now: uint64): uint64 =
   discard now
   if not attached: return 0
@@ -56,6 +68,8 @@ proc attachWasmRtKernel*(bestEffortMaxSliceTicks = 0'u64,
   fallbackSliceTicks = bestEffortMaxSliceTicks
   sliceFuel = fuelPerSlice
   attached = true
+  when FullSchedulerAtomicWait:
+    setWasmSchedulerAtomicClock(localAtomicNanoseconds, atomicDurationTicks)
   setWasmRtKernelWakeHook(rearmWasmRtKernel)
   true
 

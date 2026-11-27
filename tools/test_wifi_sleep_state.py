@@ -339,13 +339,16 @@ def test_backend_drain_yields_on_failed_wake(tmp_path: Path, mode: str) -> None:
 var
   ipcPollIrqCount, polls: int
   pendingWake, hostPollEnabled: bool
+  wakeAfterPoll = true
+  wifiSchedulerWorkHook: proc() {.cdecl.}
 proc wifi_pm_wake_pending(): bool = pendingWake
 proc bl808WifiBackendHostIpcStatus(): uint32 = 0
 proc ke_evt_field_get(): uint32 = 1
 proc bl_irq_handler() = doAssert false
 proc wifi_main_poll_once() =
   inc polls
-  pendingWake = true
+  if wakeAfterPoll: pendingWake = true
+proc noOpWorkHook() {.cdecl.} = discard
 proc wifiHwRaw(): pointer = nil
 proc loadPtr(p: pointer; offset: int): pointer = nil
 proc bl_main_event_handle(event: int; arg: pointer) = doAssert false
@@ -354,4 +357,11 @@ vendorDrainScheduledWork()
 doAssert polls == 1 and pendingWake
 vendorDrainScheduledWork()
 doAssert polls == 1
+pendingWake = false
+polls = 0
+wakeAfterPoll = false
+wifiSchedulerWorkHook = noOpWorkHook
+wifi_main_poll_once()  # vendorPollOnce's first firmware step
+vendorDrainScheduledWork()
+doAssert polls == 1  # The host handoff does not dispatch a second step.
 ''')

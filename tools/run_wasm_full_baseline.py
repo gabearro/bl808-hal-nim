@@ -12,6 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build" / "wasm-full-baseline"
 SOURCE = ROOT / "examples" / "wasm_full_baseline_test.nim"
 QEMU_SOURCE = ROOT / "tools" / "wasm_full_qemu.nim"
+FUNCTION_REFERENCE_FLAGS = ["-d:wasmFunctionReferences", "-d:wasmFunctionReferencesProbe"]
+REFERENCE_PROFILES = {
+    "": [],
+    "function-references": FUNCTION_REFERENCE_FLAGS,
+    "shared-core-types": [*FUNCTION_REFERENCE_FLAGS, "-d:wasmSharedCoreTypes"],
+    "shared-memory": [*FUNCTION_REFERENCE_FLAGS, "-d:wasmSharedCoreTypes",
+                      "-d:wasmSharedMemoryProbe", "-d:wasmChunkedMemory",
+                      "-d:WasmMemoryChunkBytesConfig=512"],
+    "atomic-wait": [*FUNCTION_REFERENCE_FLAGS, "-d:wasmSharedCoreTypes",
+                    "-d:wasmAtomicWait", "-d:wasmAtomicWaitProbe",
+                    "-d:wasmChunkedMemory", "-d:WasmMemoryChunkBytesConfig=512"],
+}
 
 CORES = {
     "m0": ("riscv32", "rv32imafc_zicsr", "ilp32f", "rv32,m=true,a=true,f=true,c=true,zicsr=true"),
@@ -76,10 +88,138 @@ def check_full_store_memory_quota() -> None:
     print("full WASM store memory quota: chunk factory and grow limit PASS")
 
 
-def check_firmware(core: str) -> None:
-    cache = OUT / f"firmware-{core}-cache"
-    elf = OUT / f"firmware-{core}.elf"
+def check_function_reference_spec(profile: str) -> None:
+    shared = profile == "shared-core-types"
+    directory = OUT / profile
+    directory.mkdir(parents=True, exist_ok=True)
+    corpus = "tools/wasm_shared_core_types.wast" if shared else "tools/wasm_function_references.wast"
+    oracle_flags = ["--features=shared-everything-threads"] if shared else []
+    run(["wasm-tools", "wast", "--ignore-error-messages", *oracle_flags, corpus])
+    manifest = directory / "cases.json"
+    run(["wasm-tools", "json-from-wast", corpus, "-o", str(manifest),
+         "--wasm-dir", str(directory)])
+    arguments = [str(manifest)]
+    if shared:
+        isolation = directory / "isolation.json"
+        run(["wasm-tools", "json-from-wast", "tools/wasm_shared_core_isolation.wast",
+             "-o", str(isolation), "--wasm-dir", str(directory)])
+        arguments.append(str(isolation))
+        tables = "tools/wasm_shared_tables.wast"
+        table_manifest = directory / "tables.json"
+        run(["wasm-tools", "wast", "--ignore-error-messages", *oracle_flags, tables])
+        run(["wasm-tools", "json-from-wast", tables, "-o", str(table_manifest),
+             "--wasm-dir", str(directory)])
+        arguments.append(str(table_manifest))
+        elements = directory / "elements.wasm"
+        run(["wasm-tools", "parse", "tools/wasm_shared_elements.wat", "-o", str(elements)])
+        arguments.append(str(elements))
+        atomics = "tools/wasm_global_atomics.wast"
+        atomic_manifest = directory / "atomics.json"
+        run(["wasm-tools", "wast", "--ignore-error-messages", *oracle_flags, atomics])
+        run(["wasm-tools", "json-from-wast", atomics, "-o", str(atomic_manifest),
+             "--wasm-dir", str(directory)])
+        arguments.append(str(atomic_manifest))
+        # wasm-tools emits one ordering nibble for GC RMW operations. Apply
+        # the pinned draft's matching read and write nibbles to the LP fixture.
+        atomic_guest = (directory / "atomics.0.wasm").read_bytes()
+        seqcst_add = bytes([0xFE, 0x51, 0x00, 0x00])
+        assert atomic_guest.count(seqcst_add) == 1
+        draft_atomics = directory / "atomics-acqrel.wasm"
+        draft_atomics.write_bytes(
+            atomic_guest.replace(seqcst_add, bytes([0xFE, 0x51, 0x11, 0x00])))
+        arguments.append(str(draft_atomics))
+        shared_memory = "tools/wasm_shared_memory.wast"
+        memory_manifest = directory / "memories.json"
+        run(["wasm-tools", "wast", "--ignore-error-messages", *oracle_flags, shared_memory])
+        run(["wasm-tools", "json-from-wast", shared_memory, "-o", str(memory_manifest),
+             "--wasm-dir", str(directory)])
+        arguments.append(str(memory_manifest))
+        source = directory / "shared-data.wasm"
+        run(["wasm-tools", "strip", "--all", "tools/wasm_shared_data_segments.wat",
+             "-o", str(source)])
+        shared_data = directory / "shared-data-draft.wasm"
+        # wasm-tools does not emit the draft's bit 3 in data segment flags.
+        data = source.read_bytes()
+        section = bytes.fromhex("0b0c020023000b012a0103010000")
+        assert data.endswith(section)
+        shared_data.write_bytes(data[:-len(section)] +
+                                bytes.fromhex("0b0c020823000b012a0903010000"))
+        arguments.extend([str(source), str(shared_data)])
+        linear_atomics = "tools/wasm_linear_atomics.wast"
+        linear_manifest = directory / "linear-atomics.json"
+        run(["wasm-tools", "wast", "--ignore-error-messages", *oracle_flags, linear_atomics])
+        run(["wasm-tools", "json-from-wast", linear_atomics, "-o", str(linear_manifest),
+             "--wasm-dir", str(directory)])
+        arguments.append(str(linear_manifest))
+    for enabled, build in ((True, "host"), (False, "disabled")):
+        flags = ["-d:wasmFunctionReferences"] if enabled or shared else []
+        if enabled and shared:
+            flags.extend(["-d:wasmSharedCoreTypes", "-d:wasmChunkedMemory",
+                          "-d:WasmMemoryChunkBytesConfig=512"])
+        if enabled and not shared:
+            flags.append("-d:wasmStreamMigration")
+        output = run(["nim", "c", "-r", "--skipUserCfg", "--skipParentCfg",
+                      "--skipProjCfg", f"--path:{ROOT / 'src'}", "--checks:on", "--assertions:on",
+                      *flags,
+                      f"--nimcache:{directory / (build + '-cache')}",
+                      f"--out:{directory / build}", "tools/test_wasm_function_references.nim",
+                      *arguments])
+        marker = f"WASM {profile.replace('-', ' ')}" + ("" if enabled else " feature gate") + " PASS"
+        assert marker in output, output
+        print(output.splitlines()[-1])
+    if shared:
+        paged_guest = directory / "paged-memory.wasm"
+        run(["wat2wasm", "tools/wasm_chunked_memory.wat", "-o", str(paged_guest)])
+        output = run(["nim", "c", "-r", "--skipUserCfg", "--skipParentCfg",
+                      "--skipProjCfg", f"--path:{ROOT / 'src'}", "--checks:on", "--assertions:on",
+                      "-d:wasmFunctionReferences", "-d:wasmSharedCoreTypes",
+                      "-d:wasmChunkedMemory", "-d:WasmMemoryChunkBytesConfig=512",
+                      f"--nimcache:{directory / 'fault-cache'}",
+                      f"--out:{directory / 'fault-test'}",
+                      "tools/test_wasm_chunked_vm_suspend.nim", str(paged_guest),
+                      str(directory / "linear-atomics.1.wasm")])
+        marker = "WASM linear-memory atomic fault retry PASS"
+        assert marker in output, output
+        print(output.splitlines()[-1])
+
+
+def check_atomic_wait() -> None:
+    directory = OUT / "atomic-wait"
+    directory.mkdir(parents=True, exist_ok=True)
+    corpus = "tools/wasm_atomic_wait.wast"
+    manifest = directory / "cases.json"
+    run(["wasm-tools", "wast", "--ignore-error-messages",
+         "--features=shared-everything-threads", corpus])
+    run(["wasm-tools", "json-from-wast", corpus, "-o", str(manifest),
+         "--wasm-dir", str(directory)])
+    component = "tools/wasm_component_atomic_wait.wat"
+    component_bytes = directory / "component.wasm"
+    run(["wasm-tools", "validate", "--features=cm-threading,shared-everything-threads", component])
+    run(["wasm-tools", "strip", "--all", component, "-o", str(component_bytes)])
+    output = run(["nim", "c", "-r", "--skipUserCfg", "--skipParentCfg",
+                  "--skipProjCfg", f"--path:{ROOT / 'src'}", "--checks:on", "--assertions:on",
+                  "-d:wasmFunctionReferences", "-d:wasmSharedCoreTypes", "-d:wasmAtomicWait",
+                  "-d:wasmComponentAsyncCallbacks", "-d:wasmComponentStackful",
+                  "-d:wasmComponentThreads", "-d:bl808WasmFullScheduler",
+                  "-d:bl808WasmRtPolicy", "-d:wasmRtKernelTest",
+                  "-d:wasmChunkedMemory", "-d:WasmMemoryChunkBytesConfig=512",
+                  f"--nimcache:{directory / 'host-cache'}",
+                  f"--out:{directory / 'host'}", "tools/test_wasm_atomic_wait.nim",
+                  str(manifest), str(component_bytes)])
+    for marker in ("WASM paged atomic wait PASS", "WASM atomic wait PASS"):
+        assert marker in output, output
+        print(next(line for line in output.splitlines() if line.startswith(marker)))
+
+
+def check_firmware(core: str, *, reference_profile: str = "") -> None:
+    suffix = f"-{reference_profile}" if reference_profile else ""
+    cache = OUT / f"firmware-{core}{suffix}-cache"
+    elf = OUT / f"firmware-{core}{suffix}.elf"
+    lp_wait = core == "lp" and reference_profile == "atomic-wait"
     run(["nim", "c", f"-d:bl808{core}", "-d:bl808kernel", "-d:bl808WasmFull",
+         *REFERENCE_PROFILES[reference_profile],
+         *(["-d:WasmLpNativeStackBytes=4608",
+            "--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608"] if lp_wait else []),
          f"--nimcache:{cache}", f"--out:{elf}", str(SOURCE)])
     objects = {p.name for p in cache.glob("*.o")}
     assert "@pcps@swasm@sruntime.nim.c.o" in objects, core
@@ -89,18 +229,20 @@ def check_firmware(core: str) -> None:
         r"^(\.[a-z]+)\s+(\d+)\s+\d+", sections, re.M)}
     if core == "lp":
         assert sizes[".data"] + sizes[".bss"] + sizes[".heap"] + sizes[".stack"] <= 16384
-        assert sizes[".stack"] == 4096
-    print(f"{core} firmware: full runtime; text={sizes['.text']} "
+        assert sizes[".stack"] == (4608 if lp_wait else 4096)
+    print(f"{core} firmware{suffix}: full runtime; text={sizes['.text']} "
           f"data={sizes['.data']} bss={sizes['.bss']} "
           f"heap={sizes['.heap']} stack={sizes['.stack']}")
 
 
-def check_d0_xip() -> None:
+def check_d0_xip(*, reference_profile: str = "") -> None:
     """Build-only check of the optional D0 flash mapping; no Ox64 access."""
-    elf = OUT / "firmware-d0-xip.elf"
-    image = OUT / "firmware-d0-xip.bin"
-    cache = OUT / "firmware-d0-xip-cache"
+    suffix = f"-{reference_profile}" if reference_profile else ""
+    elf = OUT / f"firmware-d0-xip{suffix}.elf"
+    image = OUT / f"firmware-d0-xip{suffix}.bin"
+    cache = OUT / f"firmware-d0-xip{suffix}-cache"
     run(["nim", "c", "-d:bl808d0", "-d:bl808kernel", "-d:bl808WasmFull",
+         *REFERENCE_PROFILES[reference_profile],
          "-d:bl808D0Xip", f"--nimcache:{cache}",
          f"--out:{elf}", str(SOURCE)])
     objects = {p.name for p in cache.glob("*.o")}
@@ -119,7 +261,7 @@ def check_d0_xip() -> None:
     payload = image.read_bytes()
     assert len(payload) < 1024 * 1024
     assert payload[:4] == (0x30047073).to_bytes(4, "little")
-    print(f"d0 XIP build: entry=0xD8100000, DRAM data, {len(payload)} image bytes; bench pending")
+    print(f"d0 XIP build{suffix}: entry=0xD8100000, DRAM data, {len(payload)} image bytes; bench pending")
 
 
 def check_scheduler_firmware(core: str) -> None:
@@ -152,8 +294,11 @@ def qemu_build(core: str, cpu: str, march: str, abi: str,
                rt_resident: bool = False, migration: bool = False,
                psram_frames: bool = False, mutable_migration: bool = False,
                paged_migration: bool = False, staged_migration: bool = False,
-               stream_migration: bool = False, soft_steal: bool = False) -> Path:
+               stream_migration: bool = False, soft_steal: bool = False,
+               reference_profile: str = "") -> Path:
     linker = "tools/wasm_full_qemu.ld" if core == "lp" else "tools/wasm_full_qemu_large.ld"
+    lp_stack_4608 = core == "lp" and (
+        mutable_migration or staged_migration or soft_steal or reference_profile == "atomic-wait")
     suffix = ("-bench" if benchmark else "-manager" if manager else
               "-scheduler" if scheduler else "-mutable-migration" if mutable_migration else
               "-stream-migration" if stream_migration else
@@ -165,13 +310,14 @@ def qemu_build(core: str, cpu: str, march: str, abi: str,
               "-steal-client" if steal_client else
               "-paged-migration" if paged_migration else
               "-pager-client" if pager_client else
-              "-pager" if pager else "")
+              "-pager" if pager else f"-{reference_profile}" if reference_profile else "")
     elf = OUT / f"qemu-{core}{suffix}.elf"
     run(["nim", "c", "-d:release", "--skipUserCfg", "--skipParentCfg", "--skipProjCfg",
          f"--path:{ROOT / 'src'}", "--os:any", f"--cpu:{cpu}", "--cc:gcc",
          "--gcc.exe:riscv64-unknown-elf-gcc", "--gcc.linkerexe:riscv64-unknown-elf-gcc",
          "--mm:arc", "-d:useMalloc", "-d:nimNoLibc", "-d:noSignalHandler",
          f"-d:bl808{core}", "-d:bl808WasmFull",
+         *REFERENCE_PROFILES[reference_profile],
          *(["-d:wasmFullThroughputBench"] if benchmark else []),
          *(["-d:wasmFullManagerQemu"] if manager else []),
          *(["-d:wasmRtResidentQemu", "-d:bl808WasmFullScheduler",
@@ -190,8 +336,7 @@ def qemu_build(core: str, cpu: str, march: str, abi: str,
             "-d:WasmMemoryChunkBytesConfig=512"] if mutable_migration else []),
          *(["-d:wasmStagedMigrationQemu", "-d:wasmChunkedMemory",
             "-d:WasmMemoryChunkBytesConfig=512"] if staged_migration else []),
-         *(["-d:WasmLpNativeStackBytes=4608"]
-           if (mutable_migration or staged_migration or soft_steal) and core == "lp" else []),
+         *(["-d:WasmLpNativeStackBytes=4608"] if lp_stack_4608 else []),
          *(["-d:wasmStealClientQemu", "-d:wasmStealHostTest",
             "-d:bl808WasmFullScheduler", "-d:WasmSchedulerMaxTasks=1"]
            if steal_client or soft_steal else []),
@@ -215,7 +360,7 @@ def qemu_build(core: str, cpu: str, march: str, abi: str,
          f"--passL:-march={march} -mabi={abi} -mcmodel=medany -nostdlib -nostartfiles -static -Wl,--gc-sections -T {linker} "
          + ("-Wl,--defsym=__qemu_lp_stack_override=6144 " if pager_client and core == "lp" else
             "-Wl,--defsym=__qemu_lp_stack_override=4608 "
-            if (mutable_migration or staged_migration or soft_steal) and core == "lp" else
+            if lp_stack_4608 else
             "-Wl,--defsym=__qemu_lp_stack_override=5632 " if rt_resident and core == "lp" else "") + "-lgcc",
          f"--nimcache:{OUT / f'qemu-{core}{suffix}-cache'}", f"--out:{elf}", str(QEMU_SOURCE)])
     return elf
@@ -232,18 +377,22 @@ def check_qemu_memory(core: str, elf: Path, peak: int, stack: int) -> None:
         assert writable <= 16384, (core, writable)
 
 
-def check_qemu(core: str, cpu: str, march: str, abi: str, model: str) -> None:
-    elf = qemu_build(core, cpu, march, abi)
+def check_qemu(core: str, cpu: str, march: str, abi: str, model: str, *,
+               reference_profile: str = "") -> None:
+    elf = qemu_build(core, cpu, march, abi, reference_profile=reference_profile)
     executable = "qemu-system-riscv64" if core == "d0" else "qemu-system-riscv32"
     output = run([executable, "-machine", "virt", "-cpu", model, "-m", "32M",
                   "-bios", "none", "-nographic", "-no-reboot", "-kernel", str(elf)], 30)
     marker = f"[PASS] {core.upper()} " + ("RV64" if core == "d0" else "RV32E" if core == "lp" else "RV32")
+    if reference_profile:
+        marker += " " + reference_profile.replace("-", " ")
     if marker not in output or "[FAIL]" in output:
         raise AssertionError(f"{core} QEMU guest failed:\n{output}")
     peak = int(re.search(r"heap peak bytes=0x\n([0-9a-f]+)", output).group(1), 16)
     stack = int(re.search(r"native stack used bytes=0x\n([0-9a-f]+)", output).group(1), 16)
     check_qemu_memory(core, elf, peak, stack)
-    print(f"{core} QEMU: i32/f64/indirect PASS; heap peak={peak}, stack used={stack}")
+    corpus = reference_profile.replace("-", " ") if reference_profile else "i32/f64/indirect"
+    print(f"{core} QEMU: {corpus} PASS; heap peak={peak}, stack used={stack}")
 
 
 def check_bench(core: str, cpu: str, march: str, abi: str, model: str) -> None:
@@ -405,6 +554,12 @@ def main() -> None:
                         help="also measure QEMU cycle counts for 128 invokes per guest function")
     parser.add_argument("--manager-qemu", action="store_true",
                         help="also run the CRC-checked full store adapter in each core's QEMU image")
+    parser.add_argument("--function-references", action="store_true",
+                        help="also check typed function references on the host, QEMU and native builds")
+    parser.add_argument("--shared-core-types", action="store_true",
+                        help="check shared types, tables, globals, memory and global atomics")
+    parser.add_argument("--atomic-wait", action="store_true",
+                        help="check core atomic waits, Component guest threads and timed wakeups")
     parser.add_argument("--scheduler-qemu", action="store_true",
                         help="also run the opt-in full VM task table in each core's QEMU image")
     parser.add_argument("--migration-qemu", action="store_true",
@@ -438,6 +593,18 @@ def main() -> None:
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     check_guest_bytes()
+    reference_profiles = []
+    if args.function_references:
+        reference_profiles.append("function-references")
+    if args.shared_core_types:
+        reference_profiles.append("shared-core-types")
+    for profile in reference_profiles:
+        check_function_reference_spec(profile)
+    if args.shared_core_types:
+        reference_profiles.append("shared-memory")
+    if args.atomic_wait:
+        check_atomic_wait()
+        reference_profiles.append("atomic-wait")
     if args.migration_qemu:
         run(["wat2wasm", "tools/wasm_migration_small.wat", "-o",
              str(OUT / "migration.wasm")])
@@ -480,6 +647,9 @@ def main() -> None:
     for core, (cpu, march, abi, model) in CORES.items():
         check_firmware(core)
         check_qemu(core, cpu, march, abi, model)
+        for profile in reference_profiles:
+            check_firmware(core, reference_profile=profile)
+            check_qemu(core, cpu, march, abi, model, reference_profile=profile)
         if args.bench:
             check_bench(core, cpu, march, abi, model)
         if args.manager_qemu:
@@ -500,6 +670,8 @@ def main() -> None:
             check_scheduler_firmware(core)
     if args.d0_xip:
         check_d0_xip()
+        for profile in reference_profiles:
+            check_d0_xip(reference_profile=profile)
     if args.lp_pager_qemu:
         check_pager_qemu("lp")
     if args.lp_pager_client_qemu:

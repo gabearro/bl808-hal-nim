@@ -196,7 +196,7 @@ func spiPrescaler*(sourceHz, maxHz: int): int =
 # ---- Hardware (firmware only) -------------------------------------------------
 
 when defined(bl808m0):
-  import bl808/[gpio, glb, spi]
+  import bl808/[dmablock, gpio, glb, spi, spidma]
   import bl808/kernel/[runtime, asyncspi]
   import ./board
 
@@ -209,7 +209,9 @@ when defined(bl808m0):
   type
     Oled* = object
       aspi: AsyncSpi
-      frame: CpsFuture[SpiError]    ## the frame being sent, if any
+      dma: SpiDmaTransfer
+      dmaStatus: DmaBlockStatus
+      frame: CpsFuture[SpiError]    ## Deferred DMA frame when channels are busy
 
   proc oledOpen*(): Oled =
     ## Pins and SPI0. CS, D/C and RES idle high; the panel is not touched.
@@ -225,7 +227,7 @@ when defined(bl808m0):
     setSpiClock(true, spiClkXclk)
 
     # The SSD1322 samples on the rising edge with the clock idle low. Frames
-    # go out from the SPI0 interrupt (`asyncspi`); commands are sent blocking.
+    # and blocking commands use the same SPI DMA engine.
     result.aspi = initAsyncSpi(spi0, SpiConfig(
       mode: spiMode0, frameSize: frame8bit, role: spiMaster,
       prescaler: Prescaler.uint32, deglitch: false))
@@ -259,30 +261,37 @@ when defined(bl808m0):
       o.command(cmd, c.argsPtr(first), count)
 
   proc flushStart*(o: var Oled; buf: ptr array[BufLen, byte]) =
-    ## Begin sending the whole framebuffer (8 KB, about 12 ms). The
-    ## bytes go out from the SPI interrupt, 16 or more at a time, so other
-    ## tasks keep running. Poll `flushDone`, then call `flushEnd`; or
-    ## `flushAbort` to give up.
+    ## Send the whole framebuffer (8 KiB, about 12 ms). Keep the buffer
+    ## intact until `flushEnd` or `flushAbort`.
     o.send windowCommands()
     gpioClear(OledCsPin.uint32)
     gpioClear(OledDcPin.uint32)
     discard o.aspi.spi.send([CmdWriteRam])
     gpioSet(OledDcPin.uint32)
-    o.frame = o.aspi.sendPtr(cast[ptr UncheckedArray[byte]](buf), BufLen)
+    let data = cast[ptr UncheckedArray[byte]](buf)
+    if o.dma.start(o.aspi.spi, data, nil, BufLen):
+      o.dmaStatus = dmaBlockRunning
+    else:
+      o.frame = o.aspi.sendPtr(data, BufLen)
 
-  proc flushDone*(o: Oled): bool =
+  proc flushDone*(o: var Oled): bool =
     ## The whole frame has left the chip.
+    if o.dmaStatus == dmaBlockRunning:
+      o.dmaStatus = o.dma.poll()
+    if o.dmaStatus == dmaBlockDone: return true
     o.frame != nil and o.frame.finished and not o.frame.hasError and
       o.frame.read() == spiOk
 
   proc flushEnd*(o: var Oled) =
     ## After `flushDone`: deselect the panel.
     o.frame = nil
+    o.dmaStatus = dmaBlockIdle
     o.aspi.spi.clearFifos()       # the bytes clocked in while sending
     gpioSet(OledCsPin.uint32)
 
   proc flushAbort*(o: var Oled) =
     ## Give up on a frame that is stuck. Nothing of it remains: the next
     ## `flushStart` begins a fresh transfer, however often this happens.
+    o.dma.cancel()
     o.aspi.cancel()
     o.flushEnd()

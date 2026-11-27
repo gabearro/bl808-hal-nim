@@ -300,5 +300,12 @@ proc usbDevSetClassHandler*(handler: ClassRequestHandler) =
 proc usbDevSetFifoOutHandler*(handler: proc()) =
   dev.fifoOutHandler = handler
 
+var usbStateProvider: proc(): UsbDevState {.nimcall.}
+
+proc usbDevSetStateProvider*(reader: proc(): UsbDevState {.nimcall.}) =
+  ## A class using the controller's VDMA transport owns enumeration state.
+  usbStateProvider = reader
+
 proc usbDevGetState*(): UsbDevState =
-  dev.state
+  if usbStateProvider != nil: usbStateProvider()
+  else: dev.state

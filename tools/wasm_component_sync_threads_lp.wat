@@ -1,0 +1,25 @@
+(component
+  (core type $entry (func (param i32)))
+  (core module $tables (table (export "t") 1 funcref))
+  (core instance $tables (instantiate $tables))
+  (core func $new (canon thread.new-indirect $entry (core table $tables "t")))
+  (core func $later (canon thread.resume-later))
+  (core func $yield (canon thread.yield))
+  (core module $m
+    (import "" "t" (table 1 funcref))
+    (import "" "n" (func $new (param i32 i32) (result i32)))
+    (import "" "l" (func $later (param i32)))
+    (import "" "y" (func $yield (result i32)))
+    (global $result (mut i32) (i32.const 0))
+    (func $worker (param i32) (global.set $result (local.get 0)))
+    (elem (i32.const 0) $worker)
+    (func (export "run") (result i32)
+      (call $later (call $new (i32.const 0) (i32.const 42)))
+      (loop $again
+        (drop (call $yield))
+        (br_if $again (i32.eqz (global.get $result))))
+      (global.get $result)))
+  (core instance $m (instantiate $m (with "" (instance
+    (export "t" (table $tables "t")) (export "n" (func $new))
+    (export "l" (func $later)) (export "y" (func $yield))))))
+  (func (export "run") (result u32) (canon lift (core func $m "run"))))

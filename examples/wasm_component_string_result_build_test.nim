@@ -14,6 +14,16 @@ elif defined(wasmComponentNestedValueFirmware):
     {.passL: "-Wl,--defsym=__bl808_d0_stack_bytes=12288".}
 elif defined(wasmComponentNestedListFirmware):
   import ../tools/wasm_component_nested_list_fixture
+elif defined(wasmComponentMapFirmware):
+  import ../tools/wasm_component_map_fixture
+elif defined(wasmComponentFixedListFirmware):
+  when not defined(wasmComponentFixedLists):
+    {.error: "fixed-length list firmware requires -d:wasmComponentFixedLists".}
+  import ../tools/wasm_component_fixed_list_fixture
+elif defined(wasmComponentContextFirmware):
+  when not defined(wasmComponentContext):
+    {.error: "canonical context firmware requires -d:wasmComponentContext".}
+  import ../tools/wasm_component_context_fixture
 when defined(bl808lp):
   import bl808/wasm_lp_softfloat
 when defined(bl808m0) or defined(bl808d0):
@@ -27,6 +37,20 @@ elif defined(wasmComponentNestedListFirmware):
   staticRead("../build/wasm-component/nested_list.stripped.wasm")
 elif defined(wasmComponentRecordFirmware):
   staticRead("../build/wasm-component/record.component.wasm")
+elif defined(wasmComponentMapFirmware):
+  staticRead("../build/wasm-component/upstream/map.stripped.wasm")
+elif defined(wasmComponentFixedListFirmware):
+  when defined(wasmComponentFixedListIndirectFirmware):
+    staticRead("../build/wasm-component/upstream/fixed_list_indirect.stripped.wasm")
+  else:
+    staticRead("../build/wasm-component/upstream/fixed_list.stripped.wasm")
+elif defined(wasmComponentContextFirmware):
+  when defined(wasmComponentContextPostReturnFirmware):
+    staticRead("../build/wasm-component/upstream/context-post-return.stripped.wasm")
+  elif defined(bl808lp):
+    staticRead("../build/wasm-component/upstream/context-lp.stripped.wasm")
+  else:
+    staticRead("../build/wasm-component/upstream/context.stripped.wasm")
 else:
   staticRead("../build/wasm-component/string_result.component.wasm")
 const StatusPrefix = when defined(wasmComponentResourceBundleFirmware):
@@ -37,6 +61,14 @@ elif defined(wasmComponentNestedListFirmware):
   0x574E4C00'u32
 elif defined(wasmComponentRecordFirmware):
   0x57524300'u32
+elif defined(wasmComponentMapFirmware):
+  0x574D5000'u32
+elif defined(wasmComponentFixedListFirmware):
+  when defined(wasmComponentFixedListIndirectFirmware): 0x57464900'u32
+  else: 0x57464C00'u32
+elif defined(wasmComponentContextFirmware):
+  when defined(wasmComponentContextPostReturnFirmware): 0x57435000'u32
+  else: 0x57435400'u32
 else:
   0x57435200'u32
 var
@@ -83,6 +115,21 @@ proc main() {.exportc, cdecl, noreturn.} =
       elif defined(wasmComponentNestedListFirmware):
         regWrite(StatusAddr,
           if checkNestedList(instance): StatusPrefix else: StatusPrefix or 2'u32)
+      elif defined(wasmComponentMapFirmware):
+        regWrite(StatusAddr,
+          if checkMapRoundtrip(instance): StatusPrefix else: StatusPrefix or 2'u32)
+      elif defined(wasmComponentFixedListFirmware):
+        let passed = when defined(wasmComponentFixedListIndirectFirmware):
+          checkFixedListIndirect(instance)
+        else:
+          checkFixedListDirect(instance)
+        regWrite(StatusAddr, if passed: StatusPrefix else: StatusPrefix or 2'u32)
+      elif defined(wasmComponentContextFirmware):
+        let passed = when defined(wasmComponentContextPostReturnFirmware):
+          checkContextPostReturn(instance)
+        else:
+          checkContext(instance)
+        regWrite(StatusAddr, if passed: StatusPrefix else: StatusPrefix or 2'u32)
       elif defined(wasmComponentRecordFirmware):
         let sum = instance.invoke("sum-pair", [componentRecord([
           componentValue(cpU32, 19), componentValue(cpU32, 23)])])

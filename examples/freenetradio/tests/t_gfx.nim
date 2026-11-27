@@ -257,6 +257,37 @@ block: # linesAndRectangles
   fb.fillRect(5, 5, 3, -1, 7)
   doAssert lit() == 6 * 4
 
+block: # packedWritesMatchPixelWrites
+  const Mask = [0xFFFF'u16, 0xA51F, 0x0000, 0x0001]
+  var background, reference: array[BufLen, byte]
+  for i in 0 ..< BufLen: background[i] = (i mod 251).uint8
+  var slow = initFrameBuf(addr reference)
+  for (cx, cy, cw, ch) in [(0, 0, Width, Height), (3, 2, 15, 3),
+                           (4, 1, 13, 5), (251, 60, 5, 4), (0, 0, 0, 0)]:
+    fb.setClip(cx, cy, cw, ch)
+    slow.setClip(cx, cy, cw, ch)
+    for x in [-5, 0, 1, 2, 3, 247, 254, 255]:
+      for y in [-2, 1, 2, 61, 63]:
+        for invert in [false, true]:
+          store = background
+          reference = background
+          fb.drawMask(x, y, 16, Mask, 0xA7, invert)
+          for row, bits in Mask:
+            for col in 0 ..< 16:
+              if (bits and (0x8000'u16 shr col)) != 0:
+                if invert: slow.invertPixel(x + col, y + row)
+                else: slow.setPixel(x + col, y + row, 0xA7)
+          doAssert store == reference
+        for w in [1, 2, 15, 16]:
+          store = background
+          reference = background
+          fb.fillRect(x, y, w, 4, 0xA7)
+          for yy in y ..< y + 4:
+            for xx in x ..< x + w:
+              slow.setPixel(xx, yy, 0xA7)
+          doAssert store == reference
+  fb.resetClip()
+
 block: # circles (e-g primitives/circle/points.rs)
   const Circles = [
     @["#"],

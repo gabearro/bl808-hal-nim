@@ -144,10 +144,28 @@ proc wifi_nimfw_service_tx*(count: uint32) {.exportc, cdecl.} =
   ## the TX trigger and the frame confirmation event, as one step.
   if not wifiStepEnter(): return
   defer: wifiStepLeave()
-  discard wifi_nimfw_service_sta_postponed(count)
+  when defined(bl808m0):
+    if not txlResetting():
+      let work = takePostponedTxWork(regRead(ClicMtimeBase))
+      if work != postponedTxNone:
+        discard serviceStaPostponed(count, reconcile = work == postponedTxReconcile)
+  else:
+    discard wifi_nimfw_service_sta_postponed(count)
   for _ in 0'u32 ..< count:
     txl_transmit_trigger()
     txl_frame_evt()
+
+when defined(radioDiag):
+  var wifiMainPhaseMaxUs: array[4, uint32]
+
+  proc wifiMainRecordPhase(slot: int; startTick: uint64) {.inline.} =
+    let elapsed = uint32(min(ticksToUs(readTick() - startTick),
+                             high(uint32).uint64))
+    wifiMainPhaseMaxUs[slot] = max(wifiMainPhaseMaxUs[slot], elapsed)
+
+  proc wifi_fw_main_phase_snapshot*(snapshot: ptr array[4, uint32])
+      {.exportc, cdecl.} =
+    snapshot[] = wifiMainPhaseMaxUs
 
 proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## Run one WiFi firmware service iteration.
@@ -158,14 +176,34 @@ proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## form and let the scheduler decide when to sleep.
   if not wifiStepEnter(): return false
   defer: wifiStepLeave()
+  when defined(bl808m0) and defined(radioProfiler):
+    let span = beginProfileSpan()
+    var dispatched = false
+    defer: endProfileSpan(span, prWifiFirmware, work = dispatched.uint32)
+  when defined(radioDiag):
+    let ctrlStart = readTick()
   wifiUpdateMacPlCtrl()
+  when defined(radioDiag):
+    wifiMainRecordPhase(0, ctrlStart)
+    let sleepStart = readTick()
   bl_sleep_schedule()
+  when defined(radioDiag):
+    wifiMainRecordPhase(1, sleepStart)
   if napScheduleState == BlNapWaking: return false
 
+  when defined(radioDiag):
+    let waitStart = readTick()
   result = wifiWaitForWorkIfIdle(blockWhenIdle, wifiMainHasPendingWork())
+  when defined(radioDiag):
+    wifiMainRecordPhase(2, waitStart)
+    let dispatchStart = readTick()
 
   if wifiDrainScheduledWork():
     result = true
+    when defined(bl808m0) and defined(radioProfiler):
+      dispatched = true
+  when defined(radioDiag):
+    wifiMainRecordPhase(3, dispatchStart)
 
 proc wifiMainServiceNonblocking(): bool =
   wifiMainServiceStep()
@@ -181,6 +219,25 @@ proc wifi_main_poll_once*() {.exportc, cdecl.} =
 
 proc wifi_pm_wake_pending*(): bool {.exportc, cdecl.} =
   napScheduleState == BlNapWaking
+
+proc wifi_nimfw_work_pending*(): bool {.exportc, cdecl.} =
+  let saved = irqSave()
+  result = wifiMainHasPendingWork()
+  irqRestore(saved)
+
+proc wifi_nimfw_next_timer_delay_us*(): int32 {.exportc, cdecl.} =
+  ## Firmware timers use the MAC clock and have their own IRQ. The scheduler
+  ## uses their next deadline as an additional guard against a missed wake.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  result = high(int32)
+  let now = macTimeNow()
+  let kernelHead = cast[ptr KeTimerEntry](keTimerQueue.first)
+  if kernelHead != nil:
+    result = max(0'i32, cast[int32](kernelHead.time - now))
+  if mm_timer_list.first != nil:
+    result = min(result, max(0'i32,
+      cast[int32](mmTimerAt(mm_timer_list.first).expiry - now)))
 
 proc wifiMainLog(sourceLine: cint; message: cstring) {.noinline.} =
   let logFn = cast[proc(level: uint32; tag, file: cstring; line: cint;

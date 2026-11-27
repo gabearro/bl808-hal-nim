@@ -8,6 +8,10 @@ import ./types
 import ./binary_order
 import ./utf8_names
 import ./simd_encoding
+when defined(wasmFunctionReferences):
+  from ./binary import WasmDecodeError, viewBinaryReader, readFunctionHeapType,
+    readCoreFunctionGroup, remaining, readTableReference, readTableType,
+    readTableInitializerPrefix, readGlobalType, readMemType
 
 type
   FlashWasmError* = object of CatchableError
@@ -38,6 +42,8 @@ type
     offsetExpr*: FlashExprRange
     dataOffset*: uint32
     dataLen*: uint32
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   FlashWasmModule* = object
     image*: WasmImageView
@@ -144,6 +150,17 @@ proc readValType(r: var FlashReader): ValType =
   of 0x6F: vtExternRef
   else: flashError("unknown WASM value type")
 
+when defined(wasmFunctionReferences):
+  proc readFunctionHeapType(r: var FlashReader): tuple[lane: ValType, index: uint32, shared: bool] =
+    let length = r.remaining()
+    if length == 0: flashError("missing reference heap type")
+    var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+    try:
+      result = reader.readFunctionHeapType()
+    except WasmDecodeError as error:
+      flashError(error.msg)
+    r.pos += length - reader.remaining()
+
 proc skipBlockType(r: var FlashReader) =
   let b = r.readByte()
   if b == 0x40'u8:
@@ -192,6 +209,9 @@ proc skipExprRange(r: var FlashReader): FlashExprRange =
     of 0x11, 0x13:
       discard r.readU32()
       discard r.readU32()
+    of 0x14, 0x15:
+      when defined(wasmFunctionReferences): discard r.readU32()
+      else: flashError("typed function references are disabled")
     of 0x0e:
       let count = r.readCount()
       for _ in 0..count: discard r.readU32()
@@ -206,7 +226,11 @@ proc skipExprRange(r: var FlashReader): FlashExprRange =
     of 0x43: r.skip(4)
     of 0x44: r.skip(8)
     of 0xd0:
-      if r.readValType() notin {vtFuncRef, vtExternRef}: flashError("invalid reference type")
+      when defined(wasmFunctionReferences): discard r.readFunctionHeapType()
+      else:
+        if r.readValType() notin {vtFuncRef, vtExternRef}: flashError("invalid reference type")
+    of 0xd4:
+      when not defined(wasmFunctionReferences): flashError("typed function references are disabled")
     of 0xfc:
       case r.readU32()
       of 0..7: discard
@@ -249,23 +273,62 @@ proc readLimits(r: var FlashReader): Limits =
     result.max = r.readU32()
 
 proc readMemType(r: var FlashReader): MemType =
-  MemType(limits: r.readLimits())
+  when defined(wasmSharedCoreTypes):
+    if r.remaining() == 0: flashError("missing memory type")
+    var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+    try:
+      result = reader.readMemType()
+    except WasmDecodeError as error:
+      flashError(error.msg)
+    r.pos = r.limit - reader.remaining()
+  else:
+    MemType(limits: r.readLimits())
 
-proc readTableType(r: var FlashReader): TableType =
-  TableType(elemType: r.readValType(), limits: r.readLimits())
+proc readTableType(r: var FlashReader, types: openArray[FuncType],
+                   hasInitializer: ptr bool = nil): TableType =
+  when defined(wasmFunctionReferences):
+    if r.remaining() == 0: flashError("missing table type")
+    var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+    try:
+      if hasInitializer != nil:
+        hasInitializer[] = reader.readTableInitializerPrefix()
+      result = reader.readTableType(types)
+    except WasmDecodeError as error:
+      flashError(error.msg)
+    r.pos = r.limit - reader.remaining()
+  else:
+    TableType(elemType: r.readValType(), limits: r.readLimits())
 
-proc readGlobalType(r: var FlashReader): GlobalType =
-  result.valType = r.readValType()
-  case r.readByte()
-  of 0: result.mut = mutConst
-  of 1: result.mut = mutVar
-  else: flashError("invalid WASM global mutability")
+proc readGlobalType(r: var FlashReader, types: openArray[FuncType]): GlobalType =
+  when defined(wasmFunctionReferences):
+    if r.remaining() == 0: flashError("missing global type")
+    var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+    try:
+      result = reader.readGlobalType(types)
+    except WasmDecodeError as error:
+      flashError(error.msg)
+    r.pos = r.limit - reader.remaining()
+  else:
+    result.valType = r.readValType()
+    case r.readByte()
+    of 0: result.mut = mutConst
+    of 1: result.mut = mutVar
+    else: flashError("invalid WASM global mutability")
 
 proc parseTypeSection(r: var FlashReader, m: var FlashWasmModule) =
   let count = r.readCount()
   m.types = newSeqOfCap[FuncType](count)
   for _ in 0 ..< count:
-    m.types.add(r.readFuncType())
+    when defined(wasmFunctionReferences):
+      if r.remaining() == 0: flashError("missing core function type")
+      var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+      try:
+        m.types.add(reader.readCoreFunctionGroup(m.types))
+      except WasmDecodeError as error:
+        flashError(error.msg)
+      r.pos = r.limit - reader.remaining()
+    else:
+      m.types.add(r.readFuncType())
 
 proc parseImportSection(r: var FlashReader, m: var FlashWasmModule) =
   let count = r.readCount()
@@ -279,13 +342,13 @@ proc parseImportSection(r: var FlashReader, m: var FlashWasmModule) =
                            funcTypeIdx: r.readU32()))
     of 0x01:
       m.imports.add(Import(module: moduleName, name: name, kind: ikTable,
-                           tableType: r.readTableType()))
+                           tableType: r.readTableType(m.types)))
     of 0x02:
       m.imports.add(Import(module: moduleName, name: name, kind: ikMemory,
                            memType: r.readMemType()))
     of 0x03:
       m.imports.add(Import(module: moduleName, name: name, kind: ikGlobal,
-                           globalType: r.readGlobalType()))
+                           globalType: r.readGlobalType(m.types)))
     else:
       flashError("unknown WASM import kind")
 
@@ -299,7 +362,12 @@ proc parseTableSection(r: var FlashReader, m: var FlashWasmModule) =
   let count = r.readCount()
   m.tables = newSeqOfCap[TableType](count)
   for _ in 0 ..< count:
-    m.tables.add(r.readTableType())
+    when defined(wasmFunctionReferences):
+      var hasInitializer: bool
+      m.tables.add(r.readTableType(m.types, addr hasInitializer))
+      if hasInitializer: discard r.skipExprRange()
+    else:
+      m.tables.add(r.readTableType(m.types))
 
 proc parseMemorySection(r: var FlashReader, m: var FlashWasmModule) =
   let count = r.readCount()
@@ -322,16 +390,20 @@ proc parseExportSection(r: var FlashReader, m: var FlashWasmModule) =
     e.idx = r.readU32()
     m.exports.add(e)
 
-proc skipGlobalSection(r: var FlashReader) =
+proc skipGlobalSection(r: var FlashReader, types: openArray[FuncType]) =
   let count = r.readCount()
   for _ in 0 ..< count:
-    discard r.readGlobalType()
+    discard r.readGlobalType(types)
     discard r.skipExprRange()
 
-proc skipElementSection(r: var FlashReader) =
+proc skipElementSection(r: var FlashReader, types: openArray[FuncType]) =
   let count = r.readCount()
   for _ in 0 ..< count:
     let flags = r.readU32()
+    when defined(wasmSharedCoreTypes):
+      if flags > 15: flashError("invalid WASM element flags")
+    else:
+      if flags > 7: flashError("invalid WASM element flags")
     let isPassiveOrDeclarative = (flags and 0x01) != 0
     let hasTableIdxOrElemKind = (flags and 0x02) != 0
     let usesExpressions = (flags and 0x04) != 0
@@ -343,7 +415,15 @@ proc skipElementSection(r: var FlashReader) =
 
     if isPassiveOrDeclarative or hasTableIdxOrElemKind:
       if usesExpressions:
-        discard r.readValType()
+        when defined(wasmFunctionReferences):
+          if r.remaining() == 0: flashError("missing element reference type")
+          var reader = viewBinaryReader(r.image.bytes.toOpenArray(r.pos, r.limit - 1))
+          try:
+            discard reader.readTableReference(types)
+          except WasmDecodeError as error:
+            flashError(error.msg)
+          r.pos = r.limit - reader.remaining()
+        else: discard r.readValType()
       else:
         let elemKind = r.readByte()
         if elemKind != 0x00'u8:
@@ -371,7 +451,20 @@ proc parseCodeSection(r: var FlashReader, m: var FlashWasmModule) =
     let localDeclCount = r.readCount()
     body.locals = newSeqOfCap[LocalDecl](localDeclCount)
     for _ in 0 ..< localDeclCount:
-      body.locals.add(LocalDecl(count: r.readU32(), valType: r.readValType()))
+      var declaration = LocalDecl(count: r.readU32())
+      when defined(wasmFunctionReferences):
+        let prefix = r.readByte()
+        if prefix in [0x63'u8, 0x73'u8, 0x65'u8]:
+          if prefix != 0x63: dec r.pos
+          let heapType = r.readFunctionHeapType()
+          declaration.valType = heapType.lane
+          declaration.functionType = heapType.index
+          when defined(wasmSharedCoreTypes): declaration.sharedReference = heapType.shared
+        else:
+          dec r.pos
+          declaration.valType = r.readValType()
+      else: declaration.valType = r.readValType()
+      body.locals.add(declaration)
     body.codeOffset = uint32(r.pos)
     r.pos = bodyEnd
     body.codeLen = uint32(bodyEnd) - body.codeOffset
@@ -382,7 +475,13 @@ proc parseDataSection(r: var FlashReader, m: var FlashWasmModule) =
   m.datas = newSeqOfCap[FlashDataSegment](count)
   for _ in 0 ..< count:
     var seg: FlashDataSegment
-    case r.readU32()
+    let rawFlags = r.readU32()
+    when defined(wasmSharedCoreTypes):
+      seg.shared = (rawFlags and 8) != 0
+      let flags = rawFlags and not 8'u32
+    else:
+      let flags = rawFlags
+    case flags
     of 0:
       seg.mode = dataActive
       seg.memIdx = 0
@@ -455,13 +554,13 @@ proc parseFlashWasmModule*(image: WasmImageView): FlashWasmModule =
     of 5:
       parseMemorySection(sr, result)
     of 6:
-      skipGlobalSection(sr)
+      skipGlobalSection(sr, result.types)
     of 7:
       parseExportSection(sr, result)
     of 8:
       result.startFunc = int64(sr.readU32())
     of 9:
-      skipElementSection(sr)
+      skipElementSection(sr, result.types)
     of 10:
       parseCodeSection(sr, result)
     of 11:

@@ -44,16 +44,14 @@
 #define SPI_INT_STATUS_MASK   0x3F
 
 /* FIFO_CONFIG0 bits */
-#define SPI_FIFO_DMA_RX_EN    BIT(0)
-#define SPI_FIFO_DMA_TX_EN    BIT(1)
+#define SPI_FIFO_DMA_TX_EN    BIT(0)
+#define SPI_FIFO_DMA_RX_EN    BIT(1)
 #define SPI_FIFO_TX_CLR       BIT(2)
 #define SPI_FIFO_RX_CLR       BIT(3)
 #define SPI_FIFO_TX_OVERFLOW  BIT(4)
 #define SPI_FIFO_TX_UNDERFLOW BIT(5)
 #define SPI_FIFO_RX_OVERFLOW  BIT(6)
 #define SPI_FIFO_RX_UNDERFLOW BIT(7)
-#define SPI_FIFO_STATUS_MASK  (SPI_FIFO_TX_OVERFLOW | SPI_FIFO_TX_UNDERFLOW | \
-                               SPI_FIFO_RX_OVERFLOW | SPI_FIFO_RX_UNDERFLOW)
 
 static bool bl808_spi_clock_active(const BL808SPIState *s)
 {
@@ -415,7 +413,7 @@ static void bl808_spi_write(void *opaque, hwaddr offset, uint64_t value,
         s->sto_value = (uint32_t)value;
         break;
     case SPI_FIFO_CONFIG0:
-        s->fifo_config0 &= ~SPI_FIFO_STATUS_MASK;
+        s->fifo_config0 &= ~(SPI_FIFO_DMA_RX_EN | SPI_FIFO_DMA_TX_EN);
         s->fifo_config0 |= (uint32_t)value &
                            (SPI_FIFO_DMA_RX_EN | SPI_FIFO_DMA_TX_EN);
         if (value & SPI_FIFO_TX_CLR) {

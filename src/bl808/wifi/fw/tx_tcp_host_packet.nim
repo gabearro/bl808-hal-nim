@@ -6,13 +6,18 @@ proc txlObserveTcpHostPacket(desc: ptr HostTxDescView): TcpPathPacket =
   const
     ethernetLength = 14'u
     ipv4Offset = 4'u + 48'u + ethernetLength
-  let pool = cast[uint](addr ipcSharedEnv[0]) + SharedTxbufOff
   let ip = desc.bufferPtrs[0].uint
   let length = desc.bufferLens[0].uint
-  let slotOffset = ip - pool
-  if slotOffset div SharedTxbufSize >= txRateSampleTag.len.uint or
-      slotOffset mod SharedTxbufSize != ipv4Offset or
-      length != desc.seqPassthrough.uint or length > SharedTxbufSize - ipv4Offset:
+  when defined(bl808WifiSplitTxSlots):
+    if not hostIpc.ipcHostTxPacketInPool(addr ipcSharedEnv[0], cast[pointer](ip - ipv4Offset)):
+      return
+  else:
+    let pool = cast[uint](addr ipcSharedEnv[0]) + SharedTxbufOff
+    let slotOffset = ip - pool
+    if slotOffset div SharedTxbufSize >= txRateSampleTag.len.uint or
+        slotOffset mod SharedTxbufSize != ipv4Offset:
+      return
+  if length != desc.seqPassthrough.uint or length > SharedTxbufSize - ipv4Offset:
     return
   let packet = observeTcpPath(cast[pointer](ip - ethernetLength),
     length + ethernetLength, length + ethernetLength)

@@ -80,6 +80,21 @@ proc main() =
   doAssert failure.newOwned(failureType, 99, failed) == crOk
   doAssert failure.dropOwned(failed) == crDestructorFailed
   doAssert failure.newOwned(failureType, 100, failed) == crLocked
+  when defined(wasmComponentAsyncCallbacks):
+    var mixed: ComponentResourceTable
+    doAssert mixed.initResourceTable(2, reuseFreed = true) == crOk
+    var kind, control, owned, borrowCandidate: uint32
+    doAssert mixed.registerResourceType(1, crrI32, nil, nil, kind) == crOk
+    doAssert mixed.newAsyncHandle(control) and control == 1
+    doAssert mixed.newOwned(kind, 42, owned) == crOk and owned == 2
+    doAssert not mixed.hasResourceCapacity(1)
+    var controlRep: uint64
+    doAssert mixed.representation(control, kind, controlRep) == crInvalidHandle
+    doAssert mixed.borrow(control, 1, borrowCandidate) == crInvalidHandle
+    doAssert not mixed.dropAsyncHandle(owned)
+    doAssert mixed.dropAsyncHandle(control) and mixed.hasResourceCapacity(1)
+    doAssert mixed.newOwned(kind, 9, owned) == crOk and owned == control
+    doAssert mixed.closeResourceTable() == crOk
   echo "component resources:ok"
 
 main()

@@ -3,7 +3,9 @@
 ## DBI at 0x3001B000 — SPI-like display interface for LCD panels.
 ## Supports Type B (8080/6800 parallel) and Type C (SPI) interfaces.
 
-import mmio, memmap
+import dma, dmafifo, mmio, memmap
+when defined(bl808d0):
+  import dmablock
 
 # =============================================================================
 # DBI register offsets (verified against the BL808 RM and hardware)
@@ -124,14 +126,65 @@ proc dbiWriteData16*(dbi: Dbi, data: uint16) =
   ## Write a 16-bit data value to the display command data register.
   regWrite(DbiWdata, data.uint32)
 
-proc dbiWritePixels*(dbi: Dbi, pixels: openArray[uint16]) =
-  ## Write pixel data (RGB565) to the display via FIFO.
-  regSet(DbiConfig, 1'u32 shl DbiContinuousEn)
-  regSet(DbiConfig, 1'u32 shl DbiEn)
-  for px in pixels:
-    regWrite(DbiFifoWdata, px.uint32)
-  regClear(DbiConfig, 1'u32 shl DbiEn)
-  regClear(DbiConfig, 1'u32 shl DbiContinuousEn)
+const DbiDmaTx* = DmaFifoEndpoint(
+  controller: dma2, request: dmaMmDbiTx.uint32, address: DbiFifoWdata,
+  enableRegister: DbiFifoCfg0, enableMask: 1, width: width32,
+  direction: dmaFifoWrite)
+
+type DbiError* = enum dbiOk, dbiDmaError, dbiTimeout
+
+proc dbiWritePixels*(dbi: Dbi; pixels: openArray[uint16]): DbiError {.discardable.} =
+  ## Transfer RGB565 pixel data through the D0 DMA controller.
+  if pixels.len == 0: return dbiOk
+  when not defined(bl808d0):
+    return dbiDmaError
+  else:
+    let config = regRead(DbiConfig)
+    let enable = 1'u32 shl DbiEn
+    if pixels.len > DbiPixCountMask.int + 1 or (config and enable) != 0:
+      return dbiDmaError
+
+    let pixelsAddress = unsafeAddr pixels[0]
+    let bytes = pixels.len * sizeof(uint16)
+    var staging: seq[uint32]
+    var source = cast[pointer](pixelsAddress)
+    var dmaBytes = bytes
+    if ((cast[uint](source) or bytes.uint) and 3) != 0 or
+        not dmaBufferInRam(cast[uint](source), bytes):
+      staging.setLen((pixels.len + 1) div 2)
+      copyMem(addr staging[0], pixelsAddress, bytes)
+      source = addr staging[0]
+      dmaBytes = staging.len * sizeof(uint32)
+
+    const
+      FifoFormat = 7'u32 shl 29
+      EndClear = 1'u32 shl 16
+    var transfer: DmaFifoTransfer
+    if not transfer.prepare(DbiDmaTx, source, dmaBytes): return dbiDmaError
+    regModify(DbiFifoCfg0, FifoFormat, FifoFormat or (1'u32 shl 2))
+    regModify(DbiPixCnt, DbiPixCountMask, (pixels.len - 1).uint32)
+    regSet(DbiIntSts, EndClear)
+    if not transfer.start():
+      transfer.release()
+      return dbiDmaError
+    regWrite(DbiConfig, config or enable or (1'u32 shl DbiDatTp) or
+      (1'u32 shl DbiDatEn) or (1'u32 shl DbiDatWr))
+    var budget = pixels.len.uint64 * 100_000
+    result = dbiTimeout
+    while budget != 0:
+      let state = transfer.status()
+      if state in {dmaBlockError, dmaBlockIdle}:
+        result = dbiDmaError
+        break
+      if state == dmaBlockDone and (regRead(DbiIntSts) and 1) != 0:
+        result = dbiOk
+        break
+      dec budget
+    regWrite(DbiConfig, config)
+    transfer.release(result == dbiOk)
+    # An odd pixel count can leave its padded half-word in the FIFO.
+    regSet(DbiFifoCfg0, 1'u32 shl 2)
+    regSet(DbiIntSts, EndClear)
 
 proc dbiSetWindow*(dbi: Dbi, x0, y0, x1, y1: uint16) =
   ## Set the display window for pixel writes (typical LCD command sequence).

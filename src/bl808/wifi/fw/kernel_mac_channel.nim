@@ -362,11 +362,15 @@ proc ke_evt_field_get*(): uint32 {.exportc: "nimfw_ke_evt_field_get", cdecl.} =
 proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   ## Set event bit(s) in the kernel event field (interrupt-safe).
   let savedIrqState = irqSave()
-  let updatedEventField = keEnvEventField()[] or evtBit
+  let oldEventField = keEnvEventField()[]
+  let updatedEventField = oldEventField or evtBit
   keEnvEventField()[] = updatedEventField
   if (evtBit and 0x98000000'u32) != 0:
     nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, updatedEventField)
   irqRestore(savedIrqState)
+  when defined(bl808m0):
+    if updatedEventField != oldEventField:
+      bl808_wifi_backend_signal_work()
 
 proc ke_evt_clear*(evtBit: uint32) {.exportc, cdecl, noinline.} =
   ## Clear event bit(s) in the kernel event field (interrupt-safe).
@@ -388,6 +392,15 @@ proc eventIndex32(x: uint32): uint32 {.inline.} =
   {.emit: [clzResult, " = __builtin_clz(", eventField, ");"].}
   return clzResult.uint32
 
+when defined(radioDiag):
+  var wifiEventMaxUs, wifiEventMaxIndex: uint32
+  var wifiMessageMaxUs, wifiMessageMaxId, wifiMessageMaxDest: uint32
+
+  proc wifi_fw_event_timing_snapshot*(snapshot: ptr array[5, uint32])
+      {.exportc, cdecl.} =
+    snapshot[] = [wifiEventMaxIndex, wifiEventMaxUs,
+                  wifiMessageMaxId, wifiMessageMaxDest, wifiMessageMaxUs]
+
 proc keDispatchEvent(pendingEventField: uint32) =
   if pendingEventField == 0: return
   let eventIndex = eventIndex32(pendingEventField)
@@ -400,7 +413,15 @@ proc keDispatchEvent(pendingEventField: uint32) =
     assert_err("ke_event.c", "ke_event.c", 236)
     return
   let eventHandler = cast[proc(param: pointer) {.cdecl.}](handler)
+  when defined(radioDiag):
+    let eventStart = readTick()
   eventHandler(keEvtHandlers[eventIndex].param)
+  when defined(radioDiag):
+    let elapsed = uint32(min(ticksToUs(readTick() - eventStart),
+                             high(uint32).uint64))
+    if elapsed > wifiEventMaxUs:
+      wifiEventMaxUs = elapsed
+      wifiEventMaxIndex = eventIndex
 
 proc ke_evt_schedule*() {.exportc, cdecl.} =
   ## Vendor dispatch picks the highest posted bit through the handler table.
@@ -1055,7 +1076,16 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     if not rxMgtMessageCurrent(node) or not chanUpdateAdmit(param):
       ke_msg_free(node)
       break ktsBody
+    when defined(radioDiag):
+      let messageStart = readTick()
     let rawHandlerResult = handler(param)
+    when defined(radioDiag):
+      let elapsed = uint32(min(ticksToUs(readTick() - messageStart),
+                               high(uint32).uint64))
+      if elapsed > wifiMessageMaxUs:
+        wifiMessageMaxUs = elapsed
+        wifiMessageMaxId = msgId.uint32
+        wifiMessageMaxDest = destTask.uint32
     when defined(bl808HeapGuardMsgs):
       # Heap-corruption bisector: walk the TLSF heap after EVERY dispatched
       # message; the FIRST message whose handler leaves the heap inconsistent
@@ -2953,6 +2983,18 @@ proc mmStaAddCurrent(vifIdx: uint8; vifEpoch: uint32;
     return false
   staInfoForIdx(staIdx).instNbr == vifIdx
 
+when defined(radioDiag):
+  var wifiStaAddPhaseMaxUs: array[4, uint32]
+
+  proc wifiStaAddRecordPhase(slot: int; startTick: uint64) {.inline.} =
+    let elapsed = uint32(min(ticksToUs(readTick() - startTick),
+                             high(uint32).uint64))
+    wifiStaAddPhaseMaxUs[slot] = max(wifiStaAddPhaseMaxUs[slot], elapsed)
+
+  proc wifi_fw_sta_add_phase_snapshot*(snapshot: ptr array[4, uint32])
+      {.exportc, cdecl.} =
+    snapshot[] = wifiStaAddPhaseMaxUs
+
 proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
   ## Snapshot requests and keys before callouts; publish outputs only on success.
   if param == nil or staIdxOut == nil or hwStaIdxOut == nil:
@@ -2983,14 +3025,22 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   for i in 0 ..< stationEpochs.len:
     stationEpochs[i] = staDeleteEpoch(i.uint8)
   var keys: MmStaKeyPlan
+  when defined(radioDiag):
+    let prepareStart = readTick()
   if not mmPrepareStaKeys(vif, request.quickConn, keys):
     return 1
+  when defined(radioDiag):
+    wifiStaAddRecordPhase(0, prepareStart)
 
   inc nimFwDbgPreauthStaAddEntry
   nimFwDbgPreauthStaAddMeta = instNbr.uint32 or (vif.staIdx.uint32 shl 8) or
     (vif.vifType.uint32 shl 16) or (vifSecurity(vif).connected.uint32 shl 24)
   var staIdx = 0xFF'u8
+  when defined(radioDiag):
+    let registerStart = readTick()
   let status = sta_mgmt_register(addr request, addr staIdx)
+  when defined(radioDiag):
+    wifiStaAddRecordPhase(1, registerStart)
   if status != 0:
     nimFwDbgPreauthStaAddResult = status.uint32 or 0x80000000'u32
     return status
@@ -3009,7 +3059,11 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   if not current():
     return abortOwned()
 
+  when defined(radioDiag):
+    let addressStart = readTick()
   let hwIdx = mm_sec_machwaddr_wr(staIdx, cast[pointer](instNbr.uint), 0)
+  when defined(radioDiag):
+    wifiStaAddRecordPhase(2, addressStart)
   if hwIdx == 0xFF:
     # The write may have timed out after submission. Keep this slot retired
     # until its hardware address is confirmed clear, so a late write cannot
@@ -3017,6 +3071,8 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
     return abortOwned()
   if not current():
     return abortOwned()
+  when defined(radioDiag):
+    let keysStart = readTick()
   case keys.mode
   of 1:
     if keys.callback != nil:
@@ -3038,6 +3094,8 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
     vifSecurity(vif).staKeySlots[3] = keyIndex
   else:
     discard
+  when defined(radioDiag):
+    wifiStaAddRecordPhase(3, keysStart)
   if not current():
     return abortOwned()
   if vif.vifType == VIF_TYPE_STA:
@@ -5488,6 +5546,9 @@ proc chan_ctxt_link*(vifIdx: uint8, ctxtIdx: uint8) {.exportc, cdecl.} =
     chan_ctxt_trigger(cast[pointer](ctxt))
   # Update TX power for new channel (blob: chan_update_tx_power at 0xfc)
   chan_update_tx_power(cast[pointer](ctxt))
+  when defined(bl808m0):
+    if vif.chanCtxt == env.currentCtxt and vif.chanCtxt != nil:
+      postponedTxChannelReady()
 
 proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
   ## Unlink channel context from VIF (110 instrs in blob).
@@ -6259,6 +6320,7 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
         vif_mgmt_send_postponed_frame(vif3)
       vif3 = vif.next
     mm_active()
+    when defined(bl808m0): postponedTxChannelReady()
 
 proc chanConnlessDelayEvent() =
   ## Caller holds the IRQ lock through the pending-to-active transition.

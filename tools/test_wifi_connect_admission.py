@@ -343,7 +343,8 @@ proc wifiBackendPoll(count: uint32) =
     discard wifiDrainScheduledWork()
 proc wifiNimFirmwareServiceTx(count: uint32) = discard
 proc wifiCompletePendingEvents() = discard
-''' + procedure(pump.read_text(), "wifiServicePump")
+''' + procedure(pump.read_text(), "wifiServiceWanted") + \
+        procedure(pump.read_text(), "wifiServicePump")
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan"])

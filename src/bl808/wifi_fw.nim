@@ -40,6 +40,13 @@ import mmio, memmap
 import radio_phy
 import wifi/fw_constants
 import wifi/fw_messages
+import wifi/rx_ring_config
+when defined(bl808WifiSplitTxSlots):
+  import wifi/ipc_host as hostIpc
+when defined(radioDiag):
+  import kernel/clock
+when defined(bl808m0) and defined(radioProfiler):
+  import kernel/profiler
 from std/volatile import volatileStore, volatileLoad
 when defined(bl808WifiDiagTcpFallbackAb) or defined(bl808WifiDiagTcpDmaTiming):
   import wifi/tcp_path_trace
@@ -62,12 +69,16 @@ proc c_memcpy(dst, src: pointer, n: csize_t): pointer
   {.importc: "memcpy", header: "<string.h>".}
 proc bl808WpaStaConnectResult(callback, params: pointer): cint
   {.importc: "bl808_wpa_sta_connect_result", cdecl.}
+when defined(bl808m0):
+  proc bl808_wifi_backend_signal_work() {.importc, cdecl.}
 
 
 include wifi/fw/register_constants
 include wifi/fw/layout_types
 include wifi/fw/global_state
 include wifi/fw/runtime_helpers
+when defined(bl808m0):
+  include wifi/fw/postponed_tx_work
 include wifi/fw/op
 when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
   include wifi/fw/tx_policy_trace

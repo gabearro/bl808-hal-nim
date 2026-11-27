@@ -4004,6 +4004,58 @@
       "timeout": 25
     },
     {
+      "name": "m0_usb_cdc_vdma_test",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_usb_cdc_vdma_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 Native USB CDC VDMA Test ===",
+        "[PASS] USB CDC VDMA RX verified and echo queued",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_dma_test",
+      "input_after": "UART DMA RX ready",
+      "input": "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_dma_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808DmaBench": "1"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 DMA Test ===",
+        "[PASS] Linked M2M data verified",
+        "[PASS] Cancelled bulk SPI transfer",
+        "[PASS] One-byte SPI transfer waits for DMA channels",
+        "[PASS] Linked SPI DMA readback",
+        "[PASS] UART DMA RX payload verified",
+        "[PASS] Linked UART DMA payload tail",
+        "[PASS] One-byte I2C releases DMA on an absent slave",
+        "[PASS] GPADC DMA captured 64 samples",
+        "=== Test Complete ==="
+      ],
+      "timeout": 20
+    },
+    {
       "name": "m0_hal_comms_test",
       "tiers": [
         "full"
@@ -7633,6 +7685,30 @@
       "timeout": 120
     },
     {
+      "name": "d0_profile_observer",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_profile_observer.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_profile_workload.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "BL808_D0_PROFILE_READY"
+      ],
+      "timeout": 45
+    },
+    {
       "name": "d0_sdh_domain_probe",
       "tiers": [
         "manual"
@@ -7786,11 +7862,15 @@
       "required": [
         "=== BL808 SD Bus/Multiblock Test ===",
         "[PASS] mounted existing filesystem without format",
-        "[PASS] multiblock read matches single-block",
+        "[PASS] CMD17 ADMA read matches known data",
+        "[PASS] CMD18 ADMA read matches known data",
+        "[PASS] 1-bit ADMA read across the bounce buffer boundary",
+        "[PASS] Default-speed FatFs write/read through ADMA",
         "[PASS] 4-bit bus enabled",
-        "[PASS] 4-bit multiblock read matches single-block",
+        "[PASS] 4-bit CMD18 ADMA read matches known data",
         "[PASS] high-speed mode enabled",
-        "[PASS] high-speed multiblock read matches single-block",
+        "[PASS] high-speed CMD18 ADMA read matches known data",
+        "[PASS] high-speed ADMA read across the bounce buffer boundary",
         "[PASS] FatFs writes still work after bus-mode changes",
         "=== Test Complete ==="
       ],

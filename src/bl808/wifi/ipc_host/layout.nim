@@ -7,7 +7,7 @@ const
   IpcEmb2AppUnmaskClear = IpcRegBase + 0x10'u
   IpcEmb2AppStatus = IpcRegBase + 0x1c'u
 
-  NxTxDescCnt = 4'u32
+  NxTxDescCnt = 4'u32 # Fixed number of legacy wrappers and buffers in the IPC ABI.
   IpcTxQueueCnt = 4
 
   IpcIrqA2eMsg = 1'u32 shl 1
@@ -20,7 +20,7 @@ const
   IpcIrqE2aTbttSec = 1'u32 shl 5
   IpcIrqE2aRadar = 1'u32 shl 6
   IpcIrqE2aTxCfmPos = 7
-  IpcIrqE2aTxCfm = ((1'u32 shl NxTxDescCnt) - 1'u32) shl IpcIrqE2aTxCfmPos
+  IpcIrqE2aTxCfm = ((1'u32 shl IpcTxQueueCnt) - 1'u32) shl IpcIrqE2aTxCfmPos
   IpcIrqE2aAll = IpcIrqE2aTxCfm or IpcIrqE2aRxDesc or IpcIrqE2aMsgAck or
                  (1'u32 shl 1) or IpcIrqE2aDbg or IpcIrqE2aTbttPrim or
                  IpcIrqE2aTbttSec or IpcIrqE2aRadar
@@ -59,3 +59,14 @@ const
 
   TxdescHostHostIdOff = 4'u
   TxdescHostReadyOff = 8'u
+
+when defined(bl808WifiSplitTxSlots):
+  const
+    WifiTxHostSlotCount* {.intdefine.} = 4
+    WifiTxDmaRecordCount* {.intdefine.} = 8
+    WifiTxPacketBufferCount* {.intdefine.} = WifiTxHostSlotCount + WifiTxDmaRecordCount
+
+  static:
+    doAssert WifiTxHostSlotCount in 1 .. WifiTxDmaRecordCount
+    doAssert WifiTxDmaRecordCount in 2 .. 32
+    doAssert WifiTxPacketBufferCount >= max(NxTxDescCnt.int, WifiTxDmaRecordCount)

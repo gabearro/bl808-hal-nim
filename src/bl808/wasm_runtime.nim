@@ -34,6 +34,7 @@ type
     supportsF32*: bool
     supportsF64*: bool
     supportsImports*: bool
+    supportsAtomicWait*: bool
     verifiedIsaExtensions*: uint32
     executionBackends*: uint32
     hostInterfaceMask*: uint32
@@ -108,6 +109,7 @@ proc wasmRuntimeCapabilities*(): WasmRuntimeCapabilities =
     result.supportsF32 = true
     result.supportsF64 = true
     result.supportsImports = true
+    result.supportsAtomicWait = defined(wasmSharedCoreTypes) and defined(wasmAtomicWait)
 
 proc wasmRuntimeCapabilityWord*(caps: WasmRuntimeCapabilities): uint32 =
   ## Compact shared-memory signature for hardware smoke tests.
@@ -119,6 +121,7 @@ proc wasmRuntimeCapabilityWord*(caps: WasmRuntimeCapabilities): uint32 =
   if caps.supportsF32: result = result or (1'u32 shl 4)
   if caps.supportsF64: result = result or (1'u32 shl 5)
   if caps.supportsImports: result = result or (1'u32 shl 6)
+  if caps.supportsAtomicWait: result = result or (1'u32 shl 7)
 
 proc wasmRuntimeCapabilityWord*(): uint32 =
   wasmRuntimeCapabilityWord(wasmRuntimeCapabilities())

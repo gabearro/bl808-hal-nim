@@ -1,0 +1,6 @@
+package ox64:stream-fixture;
+
+world stream-bounce {
+    export bounce: func(value: stream) -> stream;
+    export tagged-bounce: func(value: tuple<stream, u32>) -> tuple<stream, u32>;
+}

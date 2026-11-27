@@ -82,6 +82,8 @@ def build_firmware(test: dict[str, Any], work_dir: Path) -> dict[str, Path]:
             "c",
             f"-d:{core}",
             "-d:bl808kernel",
+            *(f"-d:{define}" for define in item.get("defines", [])),
+            f"--nimcache:{work_dir / 'nimcache' / test['name'] / build_id}",
             f"--out:{out_path}",
             source,
         ]

@@ -5,6 +5,8 @@
 ## and `/screen/stream` routes depend on `-d:radioDiag`.
 
 import ./timebase
+when defined(bl808m0) and defined(radioProfiler):
+  import bl808/kernel/profiler
 
 const DiagEnabled* = defined(radioDiag)
 
@@ -20,8 +22,15 @@ var sliceMaxUs*: array[TaskSlice, uint32]
 var sliceTotalUs*: array[TaskSlice, uint64]
   ## Time spent in each slice since the last read (diag builds).
 
+when defined(bl808m0) and defined(radioProfiler):
+  const ProfileRegions: array[TaskSlice, ProfileRegion] = [
+    prAudio, prDraw, prFlushStart, prFlushEnd, prStream, prHttp, prControls,
+    prNtp, prNetwork]
+
 template timed*(slice: TaskSlice; body: untyped) =
   ## Run `body`, and in diag builds remember the longest it has taken.
+  when defined(bl808m0) and defined(radioProfiler):
+    let profileSpan = beginProfileSpan()
   when DiagEnabled:
     let sliceStart = nowUs()
     body
@@ -31,6 +40,9 @@ template timed*(slice: TaskSlice; body: untyped) =
       sliceMaxUs[slice] = uint32(min(sliceUs, high(uint32).uint64))
   else:
     body
+  when defined(bl808m0) and defined(radioProfiler):
+    endProfileSpan(profileSpan, ProfileRegions[slice],
+      trace = slice in {slAudio, slDraw})
 
 type
   Diag* = object
@@ -47,6 +59,8 @@ type
     audioLoops*: uint32
     minQueued*: uint32         ## DAC queue low-water, frames; reset to high(uint32) when read
     maxLoopGapUs*: uint32      ## reset when read
+    audioYieldWaitMaxUs*, audioSleepOvershootMaxUs*: uint32
+    audioYieldWaitOver15ms*, audioSleepOver15ms*: uint32
     decodeErrors*: array[4, uint32]  ## no frame, reservoir, corrupt, other
     underrunInfo*: array[4, uint32]  ## ms since play, kind (1 DMA overtook / 2 starved), buffered, queued
     i2sUnderruns*: uint32

@@ -41,10 +41,10 @@ struct BL808I2CState {
     uint32_t prd_data;
     uint32_t fifo_config0;
 
-    uint8_t tx_fifo[BL808_I2C_FIFO_DEPTH];
+    uint32_t tx_fifo[BL808_I2C_FIFO_DEPTH];
     int tx_head;
     int tx_count;
-    uint8_t rx_fifo[BL808_I2C_FIFO_DEPTH];
+    uint32_t rx_fifo[BL808_I2C_FIFO_DEPTH];
     int rx_head;
     int rx_count;
 

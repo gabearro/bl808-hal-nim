@@ -1,8 +1,8 @@
 ## M0 SD bus-mode and multiblock validation.
 ##
-## Mounts the existing card without formatting, verifies CMD18 multiblock reads
-## against single-sector reads, negotiates 4-bit DAT mode, negotiates SD
-## high-speed mode, and verifies normal filesystem writes still work.
+## Mounts the existing card without formatting and checks CMD17 and CMD18
+## against known file contents. Exercises 1-bit, 4-bit, and SD high-speed modes
+## and verifies that normal filesystem writes still work.
 
 import bl808/startup
 import bl808/core
@@ -16,8 +16,13 @@ const
   ConsoleBaud {.intdefine.} = 230_400'u32
   ConsoleClkHz {.intdefine.} = 40_000_000'u32
   HighSpeedClockDiv {.intdefine.} = 16'u32
+  ScratchPath = "sd_bus_perf.bin"
+  TestSectors = 9
+  WordsPerSector = 128
 
 var console: Uart
+var testRead: array[TestSectors * WordsPerSector, uint32]
+var testData: array[TestSectors * WordsPerSector, uint32]
 
 proc line(s: string) =
   discard console.sendLine(s)
@@ -66,37 +71,48 @@ proc fail(label: string, value: uint32 = 0) =
   while true:
     wfi()
 
-proc sameWords(a: openArray[uint32], b: openArray[uint32]): bool =
-  if a.len != b.len:
-    return false
-  for i in 0 ..< a.len:
-    if a[i] != b[i]:
-      return false
-  true
+proc prepareReadFixture(fs: var SdFs): uint32 =
+  ## Resolve the physical sectors of the existing test's scratch file.
+  discard fs.remove(ScratchPath)
+  var f: Fil
+  let openErr = fs.open(f, ScratchPath, faWrite or faCreateAlways)
+  if openErr != frOk:
+    fail("opened ADMA read fixture", openErr.ord.uint32)
+  for i in 0 ..< testData.len:
+    testData[i] = 0x9E3779B9'u32 * (i + 1).uint32
+  let bytes = cast[ptr UncheckedArray[uint8]](addr testData[0])
+  for sector in 0 ..< TestSectors:
+    let offset = sector * 512
+    if fs.write(f, bytes.toOpenArray(offset, offset + 511)) != 512:
+      fail("wrote known ADMA read fixture sector", sector.uint32)
+  if fs.sync(f) != frOk:
+    fail("wrote known ADMA read fixture")
+  result = f.physicalSector(1)
+  if result == 0:
+    fail("resolved physical sector of ADMA read fixture")
+  for i in 1 ..< TestSectors:
+    if f.physicalSector((i * 512 + 1).uint64) != result + i.uint32:
+      fail("ADMA read fixture is contiguous", i.uint32)
+  if fs.close(f) != frOk:
+    fail("closed ADMA read fixture")
 
-proc verifyMultiblockRead(label: string) =
-  var single0: array[128, uint32]
-  var single1: array[128, uint32]
-  var multi: array[256, uint32]
-
-  var err = sdReadSector(0, cast[ptr UncheckedArray[uint32]](addr single0[0]))
-  if err != sdhOk:
-    fail(label & " single sector 0", err.ord.uint32)
-  err = sdReadSector(1, cast[ptr UncheckedArray[uint32]](addr single1[0]))
-  if err != sdhOk:
-    fail(label & " single sector 1", err.ord.uint32)
-  err = sdReadSectors(0, 2, cast[ptr UncheckedArray[uint32]](addr multi[0]))
-  if err != sdhOk:
-    fail(label & " CMD18 read", err.ord.uint32)
-
-  if not sameWords(single0, multi[0 .. 127]):
-    fail(label & " sector 0 mismatch")
-  if not sameWords(single1, multi[128 .. 255]):
-    fail(label & " sector 1 mismatch")
+proc verifyAdmaRead(sector, count: uint32; label: string) =
+  let before = sdAdmaReadOps
+  let err = sdReadSectors(sector, count, cast[ptr UncheckedArray[uint32]](addr testRead[0]))
+  if err != sdhOk or sdAdmaReadOps - before != count:
+    fail(label, err.ord.uint32)
+  for i in 0 ..< count.int * WordsPerSector:
+    if testRead[i] != testData[i]:
+      discard console.sendString("DMA word ")
+      console.sendHex32(testRead[i])
+      discard console.sendString(" expected ")
+      console.sendHex32(testData[i])
+      line("")
+      fail("ADMA read data mismatch at word", i.uint32)
   pass(label)
 
-proc verifyFatFsWrite(fs: var SdFs) =
-  let path = "sd_bus_perf.bin"
+proc verifyFatFsWrite(fs: var SdFs; label: string) =
+  let path = ScratchPath
   discard fs.remove(path)
 
   var f: Fil
@@ -131,7 +147,7 @@ proc verifyFatFsWrite(fs: var SdFs) =
     if readback[i] != data[i]:
       fail("FatFs multiblock-backed read data", i.uint32)
   discard fs.remove(path)
-  pass("FatFs writes still work after bus-mode changes")
+  pass(label)
 
 proc main() {.exportc, cdecl.} =
   systemInit()
@@ -155,22 +171,27 @@ proc main() {.exportc, cdecl.} =
     fail("mounted existing filesystem without format", mountStatus.uint32)
   pass("mounted existing filesystem without format")
 
-  verifyMultiblockRead("multiblock read matches single-block")
+  verifyFatFsWrite(fs, "Default-speed FatFs write/read through ADMA")
+  let fixture = prepareReadFixture(fs)
+  verifyAdmaRead(fixture, 1, "CMD17 ADMA read matches known data")
+  verifyAdmaRead(fixture, 2, "CMD18 ADMA read matches known data")
+  verifyAdmaRead(fixture, TestSectors, "1-bit ADMA read across the bounce buffer boundary")
 
   let busErr = sdEnable4BitBus()
   if busErr != sdhOk:
     fail("4-bit bus enabled", busErr.ord.uint32)
   pass("4-bit bus enabled")
 
-  verifyMultiblockRead("4-bit multiblock read matches single-block")
+  verifyAdmaRead(fixture, 2, "4-bit CMD18 ADMA read matches known data")
 
   let hsErr = sdEnableHighSpeed(HighSpeedClockDiv)
   if hsErr == sdhOk:
     pass("high-speed mode enabled")
-    verifyMultiblockRead("high-speed multiblock read matches single-block")
+    verifyAdmaRead(fixture, 2, "high-speed CMD18 ADMA read matches known data")
+    verifyAdmaRead(fixture, TestSectors, "high-speed ADMA read across the bounce buffer boundary")
   else:
     pass("high-speed mode safely unavailable")
-  verifyFatFsWrite(fs)
+  verifyFatFsWrite(fs, "FatFs writes still work after bus-mode changes")
 
   fs.deinit()
   line("=== Test Complete ===")

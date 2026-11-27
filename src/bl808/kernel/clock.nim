@@ -44,7 +44,9 @@ proc msToTicks*(ms: uint64): uint64 {.inline.} =
   ms * 1000'u64 * ticksPerUs
 
 proc ticksToUs*(ticks: uint64): uint64 {.inline.} =
-  if ticksPerUs > 0: ticks div ticksPerUs else: ticks
+  # BL808's 1 MHz mtime is the normal case. A 64-bit divide on M0 is a
+  # software routine, and time conversion runs in the scheduler hot path.
+  if ticksPerUs <= 1: ticks else: ticks div ticksPerUs
 
 proc ticksToMs*(ticks: uint64): uint64 {.inline.} =
   ticksToUs(ticks) div 1000'u64

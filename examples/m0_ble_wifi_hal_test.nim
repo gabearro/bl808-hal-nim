@@ -536,8 +536,7 @@ proc smokeWifi(): CpsVoidFuture {.cps.} =
   check("wifi netif", wifiGetNetif() != nil)
   when WifiBleSimultaneous:
     check("wifi still connected before ble", wifiStaAssociated())
-    wifiConfigureServiceHook(WifiBleCoexServicePeriodUs.uint32,
-                             WifiBleCoexServiceIterations.uint32)
+    wifiConfigureServiceHook(WifiBleCoexServicePeriodUs.uint32)
     discard rfReadRevision()
     check("wifi rf revision read", true)
     return

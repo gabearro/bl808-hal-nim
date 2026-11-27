@@ -6,6 +6,8 @@
 ## Both share identical register layouts.
 
 import mmio, memmap
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  import core, dma, dmablock
 
 # =============================================================================
 # SPI register offsets
@@ -264,53 +266,6 @@ proc busy*(spi: Spi): bool {.inline.} =
   (regRead(spi.base + SpiBusBusy) and 1) != 0
 
 # =============================================================================
-# Blocking transfer
-# =============================================================================
-proc transferByte*(spi: Spi, txByte: uint8): (uint8, SpiError) =
-  ## Full-duplex transfer of one byte. Returns received byte.
-  var timeout = 100_000'u32
-
-  # Wait for TX FIFO space
-  while spi.txFifoFree() == 0:
-    timeout.dec
-    if timeout == 0: return (0'u8, spiTimeout)
-
-  # Write TX data
-  regWrite(spi.base + SpiFifoWdata, txByte.uint32)
-
-  # Wait for RX data
-  timeout = 100_000
-  while spi.rxFifoCount() == 0:
-    timeout.dec
-    if timeout == 0: return (0'u8, spiTimeout)
-
-  let rxData = regRead(spi.base + SpiFifoRdata) and 0xFF
-  (rxData.uint8, spiOk)
-
-proc transfer*(spi: Spi, txBuf: openArray[uint8], rxBuf: var openArray[uint8]): SpiError =
-  ## Full-duplex transfer of a buffer. txBuf and rxBuf must be the same length.
-  for i in 0 ..< min(txBuf.len, rxBuf.len):
-    let (rx, err) = spi.transferByte(txBuf[i])
-    if err != spiOk: return err
-    rxBuf[i] = rx
-  spiOk
-
-proc send*(spi: Spi, txBuf: openArray[uint8]): SpiError =
-  ## Send-only SPI transfer (received data discarded).
-  for b in txBuf:
-    let (_, err) = spi.transferByte(b)
-    if err != spiOk: return err
-  spiOk
-
-proc recv*(spi: Spi, rxBuf: var openArray[uint8]): SpiError =
-  ## Receive-only SPI transfer (sends 0xFF).
-  for i in 0 ..< rxBuf.len:
-    let (rx, err) = spi.transferByte(0xFF)
-    if err != spiOk: return err
-    rxBuf[i] = rx
-  spiOk
-
-# =============================================================================
 # FIFO / DMA
 # =============================================================================
 proc clearFifos*(spi: Spi) =
@@ -334,6 +289,224 @@ proc txFifoAddr*(spi: Spi): uint {.inline.} =
 
 proc rxFifoAddr*(spi: Spi): uint {.inline.} =
   spi.base + SpiFifoRdata
+
+# =============================================================================
+# Data transfers
+# =============================================================================
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  const SpiEnableMask = (1'u32 shl SpiMasterEn) or (1'u32 shl SpiSlaveEn)
+
+  type SpiDmaTransfer* = object
+    spi: Spi
+    tx, rx: DmaBlock
+    rxBuffer: DmaReceiveBuffer
+    txStaging, rxStaging: seq[byte]
+    rxData: ptr UncheckedArray[byte]
+    frames, stride: int
+    dummyTx: uint32
+    running: bool
+
+  proc start*(transfer: var SpiDmaTransfer; spi: Spi;
+              tx, rx: ptr UncheckedArray[byte]; len: int): bool =
+    ## Start an SPI DMA transaction. The caller owns CS and keeps the buffers
+    ## alive until completion or cancellation. False leaves the bus idle.
+    when defined(bl808m0) or defined(bl808lp):
+      const
+        SpiBase = Spi0Base
+        TxRequest = dmaPeriphSpi0Tx.uint32
+        RxRequest = dmaPeriphSpi0Rx.uint32
+    elif defined(bl808d0):
+      const
+        SpiBase = Spi1Base
+        TxRequest = dmaMmSpi1Tx.uint32
+        RxRequest = dmaMmSpi1Rx.uint32
+    if transfer.running or spi.baseAddr() != SpiBase or len <= 0 or
+        (tx == nil and rx == nil) or
+        (rx != nil and not dmaBufferInRam(cast[uint](rx), len)):
+      return false
+    let base = spi.baseAddr()
+    if (regRead(base + SpiConfigReg) and SpiEnableMask) == 0 or
+        (regRead(base + SpiFifoConfig0) and
+          ((1'u32 shl SpiFifoDmaTxEn) or (1'u32 shl SpiFifoDmaRxEn))) != 0:
+      return false
+
+    let width = case spi.frameSize
+      of frame8bit: width8
+      of frame16bit: width16
+      of frame24bit, frame32bit: width32
+    let stride = 1 shl ord(width)
+    if len > high(int) div stride or len.uint64 > high(uint32).uint64: return false
+
+    transfer.dummyTx = 0xFF
+    var txAddress = cast[uint](addr transfer.dummyTx)
+    if tx != nil:
+      txAddress = cast[uint](tx)
+      if stride != 1 or not dmaBufferInRam(txAddress, len):
+        transfer.txStaging.setLen(len * stride)
+        for i in 0 ..< len:
+          transfer.txStaging[i * stride] = tx[i]
+        txAddress = cast[uint](addr transfer.txStaging[0])
+
+    let controller = openCoreDma()
+    let txConfig = DmaTransferConfig(
+      srcAddr: txAddress.uint32, dstAddr: spi.txFifoAddr().uint32,
+      transferSize: len.uint32, srcWidth: width, dstWidth: width,
+      srcIncrement: tx != nil, flow: flowM2P_Dma, dstPeriph: TxRequest)
+    if not transfer.tx.prepare(controller, txConfig): return false
+
+    if rx != nil:
+      let dest = cast[uint](rx)
+      let source = cast[uint](tx)
+      let overlaps = tx != nil and dest < source + len.uint and source < dest + len.uint
+      if stride == 1:
+        transfer.rxBuffer.prepare(rx, len, stage = overlaps)
+      else:
+        transfer.rxStaging.setLen(len * stride)
+        transfer.rxBuffer.prepare(addr transfer.rxStaging[0], len * stride)
+      let rxConfig = DmaTransferConfig(
+        srcAddr: spi.rxFifoAddr().uint32, dstAddr: transfer.rxBuffer.address.uint32,
+        transferSize: len.uint32, srcWidth: width, dstWidth: width,
+        dstIncrement: true, flow: flowP2M_Dma, srcPeriph: RxRequest)
+      if not transfer.rx.prepare(controller, rxConfig):
+        transfer.rxBuffer.finish(false)
+        transfer.tx.release()
+        return false
+
+    transfer.spi = spi
+    transfer.rxData = rx
+    transfer.stride = stride
+    transfer.frames = len
+    transfer.running = true
+    dcacheCleanRange(txAddress, (if tx == nil: stride else: len * stride).uint)
+
+    spi.clearFifos()
+    spi.setFifoThresholds(0, 0)
+    if rx != nil:
+      spi.enableDmaRx()
+      transfer.rx.start()
+    spi.enableDmaTx()
+    transfer.tx.start()
+    true
+
+  proc release(transfer: var SpiDmaTransfer; success: bool) =
+    let spi = transfer.spi
+    let base = spi.baseAddr()
+    regClear(base + SpiFifoConfig0, (1'u32 shl SpiFifoDmaTxEn) or (1'u32 shl SpiFifoDmaRxEn))
+    transfer.tx.release()
+    transfer.rx.release()
+    if success:
+      spi.clearFifos()
+    else:
+      let enabled = regRead(base + SpiConfigReg) and SpiEnableMask
+      regClear(base + SpiConfigReg, SpiEnableMask)
+      spi.clearFifos()
+      regSet(base + SpiConfigReg, enabled)
+    transfer.rxBuffer.finish(success)
+    if success and transfer.rxData != nil and transfer.stride != 1:
+      for i in 0 ..< transfer.frames:
+        transfer.rxData[i] = transfer.rxStaging[i * transfer.stride]
+    transfer.rxData = nil
+    transfer.running = false
+
+  proc poll*(transfer: var SpiDmaTransfer): DmaBlockStatus =
+    ## Completion includes the last byte on the wire, beyond DMA completion.
+    if not transfer.running: return dmaBlockIdle
+    let tx = transfer.tx.status()
+    let rx = transfer.rx.status()
+    if tx == dmaBlockError or rx == dmaBlockError:
+      transfer.release(false)
+      return dmaBlockError
+    if tx == dmaBlockRunning or rx == dmaBlockRunning or
+        transfer.spi.txFifoCount() != 0 or transfer.spi.busy():
+      return dmaBlockRunning
+    transfer.release(true)
+    dmaBlockDone
+
+  proc cancel*(transfer: var SpiDmaTransfer) =
+    if transfer.running:
+      transfer.release(false)
+
+  proc blockingTransfer(spi: Spi; tx, rx: ptr UncheckedArray[byte]; len: int): SpiError =
+    if len == 0: return spiOk
+    var transfer: SpiDmaTransfer
+    if not transfer.start(spi, tx, rx, len): return spiFifoError
+    # Keep the per-frame wait budget of the blocking byte interface.
+    var remaining = 100_000'u64 * len.uint64
+    while remaining > 0:
+      case transfer.poll()
+      of dmaBlockDone: return spiOk
+      of dmaBlockIdle, dmaBlockError: return spiFifoError
+      of dmaBlockRunning: dec remaining
+    transfer.cancel()
+    spiTimeout
+
+  proc transferByte*(spi: Spi; txByte: uint8): (uint8, SpiError) =
+    ## Full-duplex transfer of one byte.
+    var rx: byte
+    let err = spi.blockingTransfer(cast[ptr UncheckedArray[byte]](unsafeAddr txByte),
+                                   cast[ptr UncheckedArray[byte]](addr rx), 1)
+    (rx, err)
+
+  proc transfer*(spi: Spi; txBuf: openArray[uint8]; rxBuf: var openArray[uint8]): SpiError =
+    ## Full-duplex transfer of a buffer.
+    let len = min(txBuf.len, rxBuf.len)
+    if len == 0: return spiOk
+    spi.blockingTransfer(cast[ptr UncheckedArray[byte]](unsafeAddr txBuf[0]),
+                         cast[ptr UncheckedArray[byte]](addr rxBuf[0]), len)
+
+  proc send*(spi: Spi; txBuf: openArray[uint8]): SpiError =
+    ## Send the buffer, discarding input.
+    if txBuf.len == 0: return spiOk
+    spi.blockingTransfer(cast[ptr UncheckedArray[byte]](unsafeAddr txBuf[0]), nil, txBuf.len)
+
+  proc recv*(spi: Spi; rxBuf: var openArray[uint8]): SpiError =
+    ## Receive while sending 0xFF on each frame.
+    if rxBuf.len == 0: return spiOk
+    spi.blockingTransfer(nil, cast[ptr UncheckedArray[byte]](addr rxBuf[0]), rxBuf.len)
+else:
+  proc transferByte*(spi: Spi, txByte: uint8): (uint8, SpiError) =
+    ## Full-duplex transfer of one byte. Returns received byte.
+    var timeout = 100_000'u32
+
+    # Wait for TX FIFO space
+    while spi.txFifoFree() == 0:
+      timeout.dec
+      if timeout == 0: return (0'u8, spiTimeout)
+
+    # Write TX data
+    regWrite(spi.base + SpiFifoWdata, txByte.uint32)
+
+    # Wait for RX data
+    timeout = 100_000
+    while spi.rxFifoCount() == 0:
+      timeout.dec
+      if timeout == 0: return (0'u8, spiTimeout)
+
+    let rxData = regRead(spi.base + SpiFifoRdata) and 0xFF
+    (rxData.uint8, spiOk)
+
+  proc transfer*(spi: Spi, txBuf: openArray[uint8], rxBuf: var openArray[uint8]): SpiError =
+    ## Full-duplex transfer of a buffer. txBuf and rxBuf must be the same length.
+    for i in 0 ..< min(txBuf.len, rxBuf.len):
+      let (rx, err) = spi.transferByte(txBuf[i])
+      if err != spiOk: return err
+      rxBuf[i] = rx
+    spiOk
+
+  proc send*(spi: Spi, txBuf: openArray[uint8]): SpiError =
+    ## Send-only SPI transfer (received data discarded).
+    for b in txBuf:
+      let (_, err) = spi.transferByte(b)
+      if err != spiOk: return err
+    spiOk
+
+  proc recv*(spi: Spi, rxBuf: var openArray[uint8]): SpiError =
+    ## Receive-only SPI transfer (sends 0xFF).
+    for i in 0 ..< rxBuf.len:
+      let (rx, err) = spi.transferByte(0xFF)
+      if err != spiOk: return err
+      rxBuf[i] = rx
+    spiOk
 
 # =============================================================================
 # Interrupt support

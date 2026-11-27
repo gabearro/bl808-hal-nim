@@ -334,7 +334,8 @@ proc listen(url: string; limitMs: uint64): Heard =
       audioDueUs = nowUs() + (case radio.player.step()
         of srYield: 0'u64
         of srWait: 10_000'u64
-        of srIdle: 20_000'u64)
+        of srIdle: 20_000'u64
+        of srDecodePending: raise newException(AssertionDefect, "unexpected remote decode"))
     if st.phase != result.phases[^1]: result.phases.add st.phase
     if $st.title != result.titles[^1]: result.titles.add $st.title
     if $st.message != result.messages[^1]: result.messages.add $st.message

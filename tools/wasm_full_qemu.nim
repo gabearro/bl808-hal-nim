@@ -4,6 +4,9 @@
 import std/volatile
 import bl808/[wasm_full_baseline, wasm_runtime]
 import bl808/kernel/alloc
+
+when defined(wasmFunctionReferencesProbe):
+  import wasm_function_references_fixture
 proc line(s: string)
 when defined(wasmD0JitQemu):
   when not defined(bl808d0) or not defined(riscv64):
@@ -202,6 +205,30 @@ when defined(wasmComponentTagLinkQemu):
         instance.invoke("run-b", [componentValue(cpU32, 42)])[0].bits == 77
     closeComponent(instance)
 
+when defined(wasmComponentCoreFunctionTypesQemu):
+  import cps/wasm/component
+  const
+    TypedCoreImport = when defined(bl808lp):
+      staticRead("../build/wasm-component/upstream/typed-core-import-lp.wasm")
+    else:
+      staticRead("../build/wasm-component/upstream/typed-core-import.wasm")
+    TypedCoreIndirect = staticRead("../build/wasm-component/upstream/typed-core-indirect.wasm")
+
+  proc checkCoreFunctionTypes(fixture: openArray[byte], indirect = false): bool =
+    let plan = decodeComponent(fixture)
+    let instance = instantiateComponent(plan)
+    defer: closeComponent(instance)
+    let values = instance.invoke("run", [])
+    if values.len != 1 or values[0].kind != cpU32 or values[0].bits != 42: return false
+    if not indirect: return true
+    let tail = instance.invoke("tail", [])
+    if tail.len != 1 or tail[0].kind != cpU32 or tail[0].bits != 42: return false
+    try:
+      discard instance.invoke("bad", [])
+    except ComponentError:
+      return true
+    false
+
 when defined(wasmComponentGeneratedCoreQemu):
   import cps/wasm/component
   const GeneratedCoreFixture = staticRead("../build/wasm-component/generated_core_host.wasm")
@@ -272,6 +299,10 @@ when defined(wasmComponentOuterCaptureQemu):
       let plan = decodeComponent(cast[seq[byte]](CaptureFixture))
       runOuterCapture(plan, CapturedEngineA, CapturedWorkerA, 42) and
         runOuterCapture(plan, CapturedEngineB, CapturedWorkerB, 85)
+
+when defined(wasmComponentErrorContextQemu):
+  import wasm_component_error_context_fixture
+  const ErrorContextFixture = staticRead("../build/wasm-component/upstream/error-context-lp.wasm")
 
 when defined(wasmComponentNestedInstanceQemu):
   import cps/wasm/component
@@ -368,6 +399,10 @@ when defined(wasmComponentInterfaceQemu):
     line("named interface invoke")
     checkNamedArithmetic(instance)
 
+when defined(wasmComponentNameAttributesQemu):
+  import wasm_component_named_fixture
+  const NameAttributesFixture = staticRead("../build/wasm-component/name_attributes.wasm")
+
 when defined(wasmComponentResourceQemu):
   import cps/wasm/component
   import wasm_component_resource_fixture
@@ -383,6 +418,218 @@ when defined(wasmComponentResourceQemu):
     let instance = instantiateComponent(plan)
     line("component resource invoke")
     checkGeneratedResource(instance, generatedInterface = not defined(bl808lp))
+
+when defined(wasmComponentResourceVisibilityQemu):
+  import cps/wasm/component
+  when defined(bl808lp):
+    const ResourceRelay = staticRead("../build/wasm-component/upstream/resource-relay-lp.wasm")
+  else:
+    const ResourceRelay = staticRead("../build/wasm-component/upstream/resource-relay.wasm")
+
+  proc runResourceRelay(): bool =
+    line("resource relay decode")
+    let plan = decodeComponent(cast[seq[byte]](ResourceRelay))
+    line("resource relay instantiate")
+    let instance = instantiateComponent(plan)
+    line("resource relay invoke")
+    for expected in [42'u64, 84'u64]:
+      when defined(bl808lp):
+        let owner = instance.invoke("make", [componentValue(cpU32, 42)])
+        if owner.len != 1 or owner[0].kind != cpOwnedResource: return false
+        if instance.invokeInterface("api", "consume", owner).len != 0: return false
+        try:
+          discard borrowComponentResource(owner[0])
+          return false
+        except ComponentError as error:
+          if error.msg != "invalid component owned value": return false
+      else:
+        let value = instance.invoke("run", [])
+        if value.len != 1 or value[0].kind != cpU32 or value[0].bits != expected:
+          return false
+    true
+
+when defined(wasmComponentResourceAscriptionQemu):
+  import cps/wasm/component
+  import wasm_component_resource_ascription_fixture
+  const AscribedResource = when defined(bl808lp):
+    staticRead("../build/wasm-component/upstream/resource-ascription-lp.wasm")
+  else:
+    staticRead("../build/wasm-component/upstream/resource-ascription.wasm")
+
+  proc runResourceAscription(): bool =
+    line("resource ascription decode")
+    let plan = decodeComponent(cast[seq[byte]](AscribedResource))
+    line("resource ascription instantiate")
+    let instance = instantiateComponent(plan)
+    line("resource ascription invoke")
+    checkResourceAscription(instance)
+
+when defined(wasmComponentCallbackQemu):
+  import cps/wasm/component
+  import wasm_component_callback_fixture
+  const CallbackFixture = staticRead("../build/wasm-component/upstream/callback_turns.stripped.wasm")
+
+  proc runCallbackTurns(): bool =
+    let plan = decodeComponent(cast[seq[byte]](CallbackFixture))
+    checkCallbackTurns(instantiateComponent(plan))
+
+when defined(wasmComponentSubtasksQemu):
+  import cps/wasm/component
+  import wasm_component_callback_fixture
+  when defined(wasmComponentAsyncBorrowsQemu):
+    proc checkAsyncBorrows(instance: ComponentInstance): bool =
+      when defined(wasmComponentAsyncBorrowsForeignQemu):
+        let call = instance.beginCallback("run", [])
+        if call.pollCallback() != ccsComplete: return false
+        call.takeCallbackResult()[0].bits == 42 and not instance.pollComponentTasks()
+      elif defined(bl808lp):
+        checkLocalAsyncBorrow(instance)
+      else:
+        for mode in [0'u64, 4, 5, 6, 7, 8, 9, 10]:
+          let call = instance.beginCallback("run", [componentValue(cpU32, mode)])
+          for step in 0..<12:
+            discard call.pollCallback()
+            if call.callbackResultReady(): break
+          if not call.callbackResultReady() or call.takeCallbackResult()[0].bits != 42:
+            return false
+        not instance.pollComponentTasks()
+  when defined(wasmComponentCancellationQemu):
+    proc checkCancellation(instance: ComponentInstance): bool =
+      const lastMode = when defined(bl808lp): 1 else: 4
+      for mode in 0..lastMode:
+        let call = instance.beginCallback("run", [componentValue(cpU32, mode.uint64)])
+        for step in 0..3:
+          discard call.pollCallback()
+          if call.callbackResultReady(): break
+        if not call.callbackResultReady() or call.takeCallbackResult().len != 0: return false
+      not instance.pollComponentTasks()
+  when defined(wasmComponentGuestThreadsQemu):
+    proc runGuestThreadFixtures(): bool =
+      when defined(wasmComponentThreadSpawnQemu):
+        const module = staticRead("../build/wasm-component/thread-spawn/probe.wasm")
+        const parallelism = staticRead("../build/wasm-component/thread-spawn/parallelism.wasm")
+        checkThreadSpawnFixtures(module, parallelism)
+      else:
+        const asyncModule = staticRead("../build/wasm-component/upstream/guest-threads-lp.stripped.wasm")
+        const syncModule = staticRead("../build/wasm-component/upstream/sync-threads-lp.stripped.wasm")
+        checkGuestThreadFixtures(asyncModule, syncModule)
+  elif defined(bl808lp):
+    const SubtaskFixture = when defined(wasmComponentHostEndpointQemu):
+      staticRead("../build/wasm-component/upstream/host-endpoint.stripped.wasm")
+    elif defined(wasmComponentStreamQemu):
+      staticRead("../build/wasm-component/upstream/stream-lp.stripped.wasm")
+    elif defined(wasmComponentFutureWaitQemu):
+      staticRead("../build/wasm-component/upstream/future-wait-lp.stripped.wasm")
+    elif defined(wasmComponentFutureTransferQemu):
+      staticRead("../build/wasm-component/upstream/future-transfer-lp.stripped.wasm")
+    elif defined(wasmComponentAsyncBorrowsForeignQemu):
+      staticRead("../build/wasm-component/upstream/async-borrows-lp.stripped.wasm")
+    elif defined(wasmComponentAsyncBorrowsQemu):
+      staticRead("../build/wasm-component/upstream/async-borrows-local-lp.stripped.wasm")
+    elif defined(wasmComponentSyncLowerQemu):
+      staticRead("../build/wasm-component/upstream/async-sync-lower-lp.stripped.wasm")
+    elif defined(wasmComponentStackfulQemu):
+      staticRead("../build/wasm-component/upstream/async-stackful-lp.stripped.wasm")
+    elif defined(wasmComponentCancellationQemu):
+      staticRead("../build/wasm-component/upstream/async-subtask-cancellation-lp.stripped.wasm")
+    elif defined(wasmComponentSubtasksDiagnosticQemu):
+      staticRead("../build/wasm-component/upstream/async-subtasks-lp.stripped.wasm")
+    else:
+      staticRead("../build/wasm-component/upstream/async-local-lp.stripped.wasm")
+    proc runSubtasks(): bool =
+      line("async subtasks decode")
+      let instance = block:
+        let plan = decodeComponent(cast[seq[byte]](SubtaskFixture))
+        line("async subtasks instantiate")
+        instantiateComponent(plan)
+      line("async subtasks execute")
+      when defined(wasmComponentHostEndpointQemu):
+        checkHostUnitStream(instance)
+      elif defined(wasmComponentStreamQemu):
+        checkUnitStream(instance)
+      elif defined(wasmComponentFutureWaitQemu):
+        checkFutureWait(instance)
+      elif defined(wasmComponentFutureTransferQemu):
+        let reader = instance.invoke("make", [])[0]
+        let values = instance.invoke("consume", [reader])
+        if values.len != 1 or values[0].bits != 42: return false
+        instance.closeComponent()
+        true
+      elif defined(wasmComponentAsyncBorrowsQemu):
+        checkAsyncBorrows(instance)
+      elif defined(wasmComponentSyncLowerQemu):
+        checkSyncLower(instance, ["run"], [componentValue(cpU32, 41)])
+      elif defined(wasmComponentStackfulQemu):
+        checkStackfulTurns(instance)
+      elif defined(wasmComponentCancellationQemu):
+        checkCancellation(instance)
+      elif defined(wasmComponentSubtasksDiagnosticQemu):
+        checkAsyncSubtasks(instance, full = false)
+      else:
+        checkLocalAsyncSubtask(instance)
+  else:
+    import cps/wasm/[linear_memory, types]
+    const SubtaskFixture = when defined(wasmComponentHostEndpointQemu):
+      staticRead("../build/wasm-component/upstream/host-endpoint.stripped.wasm")
+    elif defined(wasmComponentStreamQemu):
+      staticRead("../build/wasm-component/upstream/stream-partial.stripped.wasm")
+    elif defined(wasmComponentFutureWaitQemu):
+      staticRead("../build/wasm-component/upstream/future-wait.stripped.wasm")
+    elif defined(wasmComponentFutureTransferQemu):
+      staticRead("../build/wasm-component/upstream/future-transfer.stripped.wasm")
+    elif defined(wasmComponentAsyncBorrowsQemu):
+      staticRead("../build/wasm-component/upstream/async-borrows.stripped.wasm")
+    elif defined(wasmComponentSyncLowerQemu):
+      staticRead("../build/wasm-component/upstream/async-sync-lower.stripped.wasm")
+    elif defined(wasmComponentStackfulQemu):
+      staticRead("../build/wasm-component/upstream/async-stackful.stripped.wasm")
+    elif defined(wasmComponentCancellationQemu):
+      staticRead("../build/wasm-component/upstream/async-subtask-cancellation.stripped.wasm")
+    else:
+      staticRead("../build/wasm-component/upstream/async-subtasks.stripped.wasm")
+    proc subtaskMemory(context: pointer, memType: MemType): ref LinearMemory =
+      if memType.limits.min != 1: return nil
+      new(result)
+      if result[].initLinearMemory(LinearMemoryConfig(initialPages: 1,
+          maxPages: 1, admissionPages: 1, maxCommittedChunks: 1, residentChunks: 1)) != lmOk:
+        return nil
+    proc runSubtasks(): bool =
+      let plan = decodeComponent(cast[seq[byte]](SubtaskFixture))
+      let instance = instantiateComponent(plan, [], subtaskMemory, nil)
+      when defined(wasmComponentHostEndpointQemu):
+        checkHostUnitStream(instance)
+      elif defined(wasmComponentStreamQemu):
+        for name in ["writer-buffer-pending", "drop-folds-into-partial-progress"]:
+          let values = instance.invoke(name, [])
+          if values.len != 1 or values[0].bits != 42: return false
+        instance.closeComponent()
+        true
+      elif defined(wasmComponentFutureWaitQemu):
+        checkFutureWait(instance)
+      elif defined(wasmComponentFutureTransferQemu):
+        for direction in [0'u64, 1'u64]:
+          let result = instance.invoke("check", [componentValue(cpU32, direction)])
+          if result.len != 1 or result[0].bits != 42: return false
+        instance.closeComponent()
+        true
+      elif defined(wasmComponentAsyncBorrowsQemu):
+        checkAsyncBorrows(instance)
+      elif defined(wasmComponentSyncLowerQemu):
+        checkSyncLower(instance, ["flat", "indirect", "priority"])
+      elif defined(wasmComponentStackfulQemu):
+        for (name, answer) in [("run", 42'u64), ("cancel", 4'u64), ("run", 42'u64)]:
+          let call = instance.beginCallback(name, [])
+          if call.pollCallback() != ccsCoreWaiting: return false
+          for step in 0..<8:
+            discard call.pollCallback()
+            if call.callbackResultReady(): break
+          if not call.callbackResultReady() or call.takeCallbackResult()[0].bits != answer:
+            return false
+        not instance.pollComponentTasks()
+      elif defined(wasmComponentCancellationQemu):
+        checkCancellation(instance)
+      else:
+        checkAsyncSubtasks(instance)
 
 when defined(wasmComponentQemu):
   import cps/wasm/component
@@ -425,6 +672,8 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
      defined(wasmComponentNestedValueQemu) or defined(wasmComponentResourceBundleQemu) or
      defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu) or
      defined(wasmComponentStringQemu) or defined(wasmComponentStringResultQemu) or
+     defined(wasmComponentMultiMemoryQemu) or defined(wasmComponentMapQemu) or
+     defined(wasmComponentFixedListQemu) or defined(wasmComponentContextQemu) or
      defined(wasmComponentBytesQemu) or defined(wasmComponentWordsQemu) or
      defined(wasmComponentQwordsQemu) or
      defined(wasmComponentOptionStringQemu) or
@@ -435,8 +684,11 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
      defined(wasmComponentTupleQemu) or defined(wasmComponentFlagsQemu) or
      defined(wasmComponentCharQemu):
   import cps/wasm/[component, linear_memory, types]
-  when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu):
-    const ComponentStringFixture = when defined(wasmComponentCrossPostReturnQemu):
+  when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu) or
+      defined(wasmComponentMultiMemoryQemu):
+    const ComponentStringFixture = when defined(wasmComponentMultiMemoryQemu):
+        staticRead("../build/wasm-component/upstream/multi-memory.wasm")
+      elif defined(wasmComponentCrossPostReturnQemu):
         staticRead("../build/wasm-component/cross_post_trap.wasm")
       else: staticRead("../build/wasm-component/resource_bundle_linked.wasm")
     var peerChunk: array[WasmMemoryChunkBytes.int, byte]
@@ -468,6 +720,21 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
       const ComponentStringFixture = staticRead("../build/wasm-component/core_graph_lp.component.wasm")
     else:
       const ComponentStringFixture = staticRead("../build/wasm-component/core_graph.component.wasm")
+  elif defined(wasmComponentMapQemu):
+    import wasm_component_map_fixture
+    const ComponentStringFixture = staticRead("../build/wasm-component/upstream/map.stripped.wasm")
+  elif defined(wasmComponentFixedListQemu):
+    import wasm_component_fixed_list_fixture
+    const ComponentStringFixture = staticRead("../build/wasm-component/upstream/fixed_list.stripped.wasm")
+    const FixedListIndirectFixture = staticRead("../build/wasm-component/upstream/fixed_list_indirect.stripped.wasm")
+  elif defined(wasmComponentContextQemu):
+    import wasm_component_context_fixture
+    const ComponentStringFixture = when defined(bl808lp):
+      staticRead("../build/wasm-component/upstream/context-lp.stripped.wasm")
+    else:
+      staticRead("../build/wasm-component/upstream/context.stripped.wasm")
+    when defined(bl808lp):
+      const ContextPostReturnFixture = staticRead("../build/wasm-component/upstream/context-post-return.stripped.wasm")
   elif defined(wasmComponentStringResultQemu):
     const ComponentStringFixture = staticRead("../build/wasm-component/string_result.component.wasm")
   elif defined(wasmComponentBytesQemu):
@@ -506,7 +773,8 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
   proc componentStringMemory(ctx: pointer, memType: MemType): ref LinearMemory =
     discard ctx
     if memType.limits.min != 1: return nil
-    when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu):
+    when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu) or
+        defined(wasmComponentMultiMemoryQemu):
       inc memoryCount
       if memoryCount == 2: return peerMemory
       if memoryCount != 1: return nil
@@ -545,7 +813,8 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
         greeting[0].fields[0].kind == cpString and
         greeting[0].fields[0].text == "Ox64"
 
-  proc runComponentString(): bool =
+  proc runComponentString(fixture: static[string] = ComponentStringFixture,
+                          secondaryFixture: static[bool] = false): bool =
     new(stringMemory)
     let cfg = LinearMemoryConfig(initialPages: 1, maxPages: 1,
       admissionPages: 1, maxCommittedChunks: ComponentTestChunks, residentChunks: ComponentTestChunks)
@@ -553,7 +822,8 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
         cast[ptr UncheckedArray[byte]](addr stringChunk[0]),
         stringChunk.len.uint32) != lmOk:
       return false
-    when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu):
+    when defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu) or
+        defined(wasmComponentMultiMemoryQemu):
       new(peerMemory)
       if peerMemory[].initLinearMemoryIn(cfg,
           cast[ptr UncheckedArray[byte]](addr peerChunk[0]),
@@ -566,7 +836,7 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
         block:
           when defined(wasmComponentIndirectQemu):
             line("indirect component decode")
-          let plan = decodeComponent(cast[seq[byte]](ComponentStringFixture))
+          let plan = decodeComponent(cast[seq[byte]](fixture))
           when defined(wasmComponentIndirectQemu):
             line("indirect component instantiate")
           when defined(wasmComponentFlatQemu):
@@ -577,7 +847,21 @@ when defined(wasmComponentCoreGraphQemu) or defined(wasmComponentIndirectQemu) o
             instantiateComponent(plan, [indirectArgumentsBinding(plan)], componentStringMemory, nil)
           else:
             instantiateComponent(plan, [], componentStringMemory, nil)
-    when defined(wasmComponentCrossPostReturnQemu):
+    when defined(wasmComponentMapQemu):
+      checkMapRoundtrip(instance)
+    elif defined(wasmComponentFixedListQemu):
+      defer: closeComponent(instance)
+      when secondaryFixture: checkFixedListIndirect(instance)
+      else: checkFixedListDirect(instance)
+    elif defined(wasmComponentContextQemu):
+      defer: closeComponent(instance)
+      when secondaryFixture: checkContextPostReturn(instance)
+      else: checkContext(instance)
+    elif defined(wasmComponentMultiMemoryQemu):
+      let greeting = instance.invoke("run", [])
+      memoryCount == 2 and greeting.len == 1 and
+        greeting[0].kind == cpString and greeting[0].text == "Ox64"
+    elif defined(wasmComponentCrossPostReturnQemu):
       try:
         discard instance.invoke("run", [])
         return false
@@ -818,7 +1102,8 @@ when defined(wasmStealClientQemu):
       result.complete()
 
   proc qemuStealPrepare(job: WasmStealJob,
-                        admission: FullWasmAdmission): WasmSchedulerResult =
+                        admission: FullWasmAdmission, memoryFactory: FullMemoryFactory,
+                        memoryFactoryContext: pointer): WasmSchedulerResult =
     var name = ""
     for c in job.exportName:
       if c == '\0': break
@@ -830,6 +1115,7 @@ when defined(wasmStealClientQemu):
       stealImage.len.uint32, name, [job.args[0], job.args[1]],
       maxTotalFuel = job.maxFuel, slotLabel = job.slot.int32,
       maxMemoryPages = job.maxMemoryPages, requireNoStart = true,
+      memoryFactory = memoryFactory, memoryFactoryContext = memoryFactoryContext,
       admission = admission, allowPortableMigration = false, retainTrappedTask = true)
 
 when defined(wasmLpPagerQemu) or defined(wasmD0PagerClientQemu):
@@ -1107,6 +1393,28 @@ when defined(wasmFullThroughputBench):
 
 proc wasmQemuMain() {.exportc, cdecl.} =
   let caps = wasmRuntimeCapabilities()
+  when defined(wasmFunctionReferencesProbe):
+    when defined(wasmAtomicWaitProbe):
+      if not caps.supportsAtomicWait:
+        line("[FAIL] atomic wait capability")
+        finish(false)
+    if not caps.fullInterpreter or not runFunctionReferenceProbe() or not heapCheck():
+      line("[FAIL] function reference probe")
+      finish(false)
+    line("heap peak bytes=0x")
+    hex32(heapStats().highWaterBytes.uint32)
+    putChar('\n')
+    line("native stack used bytes=0x")
+    hex32(stackUsed())
+    putChar('\n')
+    const corpus = when defined(wasmAtomicWaitProbe): " atomic wait"
+      elif defined(wasmSharedMemoryProbe): " shared memory"
+      elif defined(wasmSharedCoreTypes): " shared core types"
+      else: " function references"
+    when defined(bl808lp): line("[PASS] LP RV32E" & corpus)
+    elif defined(bl808d0): line("[PASS] D0 RV64" & corpus)
+    else: line("[PASS] M0 RV32" & corpus)
+    finish(true)
   when defined(wasmMigrationQemu):
     when defined(wasmStagedMigrationQemu):
       const moduleBytes = WasmDenseModule
@@ -1204,6 +1512,8 @@ proc wasmQemuMain() {.exportc, cdecl.} =
        defined(wasmComponentNestedValueQemu) or defined(wasmComponentResourceBundleQemu) or
        defined(wasmComponentLinkedResourceBundleQemu) or defined(wasmComponentCrossPostReturnQemu) or
        defined(wasmComponentStringQemu) or defined(wasmComponentStringResultQemu) or
+       defined(wasmComponentMultiMemoryQemu) or defined(wasmComponentMapQemu) or
+       defined(wasmComponentFixedListQemu) or defined(wasmComponentContextQemu) or
        defined(wasmComponentBytesQemu) or defined(wasmComponentWordsQemu) or
        defined(wasmComponentQwordsQemu) or
        defined(wasmComponentOptionStringQemu) or
@@ -1213,7 +1523,11 @@ proc wasmQemuMain() {.exportc, cdecl.} =
        defined(wasmComponentEnumQemu) or defined(wasmComponentResultQemu) or
        defined(wasmComponentTupleQemu) or defined(wasmComponentFlagsQemu) or
        defined(wasmComponentCharQemu):
-    let passed = runComponentString()
+    let passed = runComponentString() and (when defined(wasmComponentFixedListQemu):
+      runComponentString(FixedListIndirectFixture, secondaryFixture = true)
+    elif defined(wasmComponentContextQemu) and defined(bl808lp):
+      runComponentString(ContextPostReturnFixture, secondaryFixture = true)
+    else: true)
     line("component heap peak bytes=0x")
     hex32(heapStats().highWaterBytes.uint32)
     putChar('\n')
@@ -1221,7 +1535,23 @@ proc wasmQemuMain() {.exportc, cdecl.} =
     hex32(stackUsed())
     putChar('\n')
     if passed and heapCheck():
-      when defined(wasmComponentCrossPostReturnQemu):
+      when defined(wasmComponentMapQemu):
+        when defined(bl808lp): line("[PASS] LP RV32E component map")
+        elif defined(bl808d0): line("[PASS] D0 RV64 component map")
+        else: line("[PASS] M0 RV32 component map")
+      elif defined(wasmComponentFixedListQemu):
+        when defined(bl808lp): line("[PASS] LP RV32E component fixed-list")
+        elif defined(bl808d0): line("[PASS] D0 RV64 component fixed-list")
+        else: line("[PASS] M0 RV32 component fixed-list")
+      elif defined(wasmComponentContextQemu):
+        when defined(bl808lp): line("[PASS] LP RV32E component context")
+        elif defined(bl808d0): line("[PASS] D0 RV64 component context")
+        else: line("[PASS] M0 RV32 component context")
+      elif defined(wasmComponentMultiMemoryQemu):
+        when defined(bl808lp): line("[PASS] LP RV32E component multi-memory")
+        elif defined(bl808d0): line("[PASS] D0 RV64 component multi-memory")
+        else: line("[PASS] M0 RV32 component multi-memory")
+      elif defined(wasmComponentCrossPostReturnQemu):
         when defined(bl808lp): line("[PASS] LP RV32E component cross-post-return")
         elif defined(bl808d0): line("[PASS] D0 RV64 component cross-post-return")
         else: line("[PASS] M0 RV32 component cross-post-return")
@@ -1322,8 +1652,15 @@ proc wasmQemuMain() {.exportc, cdecl.} =
        defined(wasmComponentInstanceEqualityQemu) or defined(wasmComponentContractCaptureQemu) or
        defined(wasmComponentLexicalResourceValueQemu) or defined(wasmComponentLocalLowerQemu) or
        defined(wasmComponentGeneratedCoreQemu) or defined(wasmComponentTagLinkQemu) or
-       defined(wasmComponentHostDefinitionQemu) or defined(wasmComponentTypedImportQemu):
-    when defined(wasmComponentNestedInstanceQemu):
+       defined(wasmComponentHostDefinitionQemu) or defined(wasmComponentTypedImportQemu) or
+       defined(wasmComponentResourceVisibilityQemu) or defined(wasmComponentNameAttributesQemu) or
+       defined(wasmComponentCoreFunctionTypesQemu) or defined(wasmComponentResourceAscriptionQemu) or
+       defined(wasmComponentCallbackQemu) or defined(wasmComponentSubtasksQemu) or
+       defined(wasmComponentErrorContextQemu):
+    when defined(wasmComponentErrorContextQemu):
+      const fixtureLabel = "error-context"
+      let passed = checkErrorContextFixture(ErrorContextFixture)
+    elif defined(wasmComponentNestedInstanceQemu):
       const fixtureLabel = "nested-instance"
       let passed = runNestedInstance(NestedInstanceFixture) and
         (when defined(bl808lp): true
@@ -1359,6 +1696,10 @@ proc wasmQemuMain() {.exportc, cdecl.} =
     elif defined(wasmComponentTagLinkQemu):
       const fixtureLabel = "tag-link"
       let passed = checkTagLink()
+    elif defined(wasmComponentCoreFunctionTypesQemu):
+      const fixtureLabel = "core-function-types"
+      let passed = checkCoreFunctionTypes(cast[seq[byte]](TypedCoreImport)) and
+        checkCoreFunctionTypes(cast[seq[byte]](TypedCoreIndirect), indirect = true)
     elif defined(wasmComponentCoreModuleQemu):
       const fixtureLabel = "core-module"
       let passed = runHostCoreModule() and runLinkedCoreModule(InterfaceCoreModule) and
@@ -1377,9 +1718,53 @@ proc wasmQemuMain() {.exportc, cdecl.} =
     elif defined(wasmComponentResourceQemu):
       const fixtureLabel = "resource"
       let passed = runComponentResource()
+    elif defined(wasmComponentResourceVisibilityQemu):
+      const fixtureLabel = "resource-visibility"
+      let passed = runResourceRelay()
+    elif defined(wasmComponentResourceAscriptionQemu):
+      const fixtureLabel = "resource-ascription"
+      let passed = runResourceAscription()
+    elif defined(wasmComponentCallbackQemu):
+      const fixtureLabel = "callback-turns"
+      let passed = runCallbackTurns()
+    elif defined(wasmComponentSubtasksQemu):
+      const fixtureLabel = when defined(wasmComponentThreadSpawnQemu):
+        "thread-spawn"
+      elif defined(wasmComponentGuestThreadsQemu):
+        "guest-threads"
+      elif defined(wasmComponentHostEndpointQemu):
+        "host-endpoint"
+      elif defined(wasmComponentStreamQemu):
+        "stream-partial"
+      elif defined(wasmComponentFutureWaitQemu):
+        "future-wait"
+      elif defined(wasmComponentFutureTransferQemu):
+        "future-transfer"
+      elif defined(wasmComponentAsyncBorrowsForeignQemu):
+        "async-borrows-cross-component"
+      elif defined(wasmComponentAsyncBorrowsQemu):
+        "async-borrows"
+      elif defined(wasmComponentSyncLowerQemu):
+        "async-sync-lower"
+      elif defined(wasmComponentStackfulQemu):
+        "async-stackful"
+      elif defined(wasmComponentCancellationQemu):
+        "async-subtask-cancellation"
+      elif defined(wasmComponentSubtasksDiagnosticQemu):
+        "async-subtasks-cross-component"
+      else: "async-subtasks"
+      let passed = try:
+        when defined(wasmComponentGuestThreadsQemu): runGuestThreadFixtures()
+        else: runSubtasks()
+      except ComponentError as error:
+        line(error.msg)
+        false
     elif defined(wasmComponentInterfaceQemu):
       const fixtureLabel = "named-interface"
       let passed = runComponentInterface()
+    elif defined(wasmComponentNameAttributesQemu):
+      const fixtureLabel = "name-attributes"
+      let passed = checkNameAttributes(cast[seq[byte]](NameAttributesFixture))
     else:
       const fixtureLabel = "nested-bool"
       let passed = runComponentNested()

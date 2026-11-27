@@ -3,7 +3,7 @@
 ## IR at 0x2000A600 — supports NEC, RC5, and custom IR protocols.
 ## Uses pulse-width modulation for TX and pulse-timing capture for RX.
 
-import mmio, memmap
+import core, dma, dmablock, dmafifo, mmio, memmap
 
 # =============================================================================
 # IR register offsets
@@ -95,21 +95,41 @@ proc irTxInit*(mode: IrMode = irNec) =
   # Clear TX FIFO
   regSet(IrFifoCfg0, 1'u32 shl 2)
 
-proc irTxSend*(data: uint32, bits: uint32 = 32) =
-  ## Send IR data via FIFO.
-  regModify(IrTxCfg, IrTxDataLenMask, ((bits - 1) and 0x7F) shl IrTxDataLenShift)
-  # Write data to TX FIFO
-  regWrite(IrFifoWdata, data)
-  regSet(IrTxCfg, (1'u32 shl IrTxEn) or (1'u32 shl IrTxHeadEn))
-  # Wait for TX complete
-  var timeout = 100_000'u32
-  while (regRead(IrTxIntSts) and 1) == 0:
-    timeout.dec
-    if timeout == 0: break
-  regClear(IrTxCfg, 1'u32 shl IrTxEn)
-  regSet(IrTxIntSts, 1'u32 shl 16)  # Clear end interrupt
+const IrDmaTx* = DmaFifoEndpoint(
+  controller: (if defined(bl808lp): dma1 else: dma0),
+  request: dmaPeriphIrTx.uint32, address: IrFifoWdata,
+  enableRegister: IrFifoCfg0, enableMask: 1, width: width32,
+  direction: dmaFifoWrite)
 
-proc irTxSendNec*(address: uint8, command: uint8) =
+proc irTxSend*(data: uint32; bits: uint32 = 32): IrError {.discardable.} =
+  ## Send one word from RAM through DMA and wait for the IR transmitter.
+  if bits == 0 or bits > 32 or (regRead(IrTxCfg) and (1'u32 shl IrTxEn)) != 0:
+    return irOverflow
+  var word = data
+  var transfer: DmaFifoTransfer
+  if not transfer.prepare(IrDmaTx, addr word, sizeof(word)): return irOverflow
+  regSet(IrFifoCfg0, 1'u32 shl 2)
+  regSet(IrTxIntSts, 1'u32 shl 16)
+  regModify(IrTxCfg, IrTxDataLenMask, (bits - 1) shl IrTxDataLenShift)
+  if not transfer.start():
+    transfer.release()
+    return irOverflow
+  regSet(IrTxCfg, (1'u32 shl IrTxEn) or (1'u32 shl IrTxHeadEn))
+  result = irTimeout
+  for _ in 0 ..< 12_000:
+    let state = transfer.status()
+    if state in {dmaBlockIdle, dmaBlockError}:
+      result = irOverflow
+      break
+    if state == dmaBlockDone and (regRead(IrTxIntSts) and 1) != 0:
+      result = irOk
+      break
+    delayUs(10)
+  regClear(IrTxCfg, 1'u32 shl IrTxEn)
+  transfer.release(result == irOk)
+  regSet(IrTxIntSts, 1'u32 shl 16)
+
+proc irTxSendNec*(address: uint8; command: uint8): IrError {.discardable.} =
   ## Send a standard NEC IR command (address + command with complements).
   let necData = address.uint32 or
                 ((not address).uint32 shl 8) or

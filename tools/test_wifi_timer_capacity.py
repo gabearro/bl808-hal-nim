@@ -20,6 +20,15 @@ def source() -> str:
     code += r'''
 var now, hardwareDeadline: uint64
 var fired: seq[int]
+var interruptsDisabled: bool
+template withInterruptsDisabled(body: untyped) =
+  block:
+    let saved = interruptsDisabled
+    interruptsDisabled = true
+    try:
+      body
+    finally:
+      interruptsDisabled = saved
 const FaultReasonManual = 0
 proc readTick(): uint64 = now
 proc setDeadline(deadline: uint64) = hardwareDeadline = deadline
@@ -31,7 +40,8 @@ proc faultHalt(reason: int; tag, count, value: uint) {.noreturn.} =
 '''
     for name in ["heapLen", "allocTimerEntry", "releaseTimerEntry", "heapPush",
                  "heapRemove", "heapPop", "heapPeekDeadline", "reprogramNextDeadline",
-                 "addTimer", "addTimerMs", "addTimerUs", "cancelTimer", "fireExpiredTimers"]:
+                 "addTimer", "addTimerMs", "addTimerUs", "cancelTimer",
+                 "tryPostPriorityFromIsr", "runPriorityCallback", "fireExpiredTimers"]:
         if name == "heapRemove" and "proc heapRemove(" not in scheduler:
             continue
         text = scheduler
@@ -40,6 +50,7 @@ proc faultHalt(reason: int; tag, count, value: uint) {.noreturn.} =
         code += procedure(text, name).split("\n# =====", 1)[0] + "\n"
     code += r'''
 type WifiError = enum wifiOk, wifiFail
+type WifiScanStage = enum wifiScanUnavailable, wifiScanPending, wifiScanTimedOut
 var
   wifiScanFuture: CpsFuture[uint32]
   wifiConnectFuture, wifiStaIdleFuture, wifiDisconnectFuture: CpsFuture[WifiError]
@@ -49,6 +60,8 @@ var
 proc wifiBackendUsesEventFutures(): bool = true
 proc wifiBackendConnected(): bool = false
 proc wifiCompletePendingEvents() = discard
+proc noteWifiScan(stage: WifiScanStage; count: uint32) = discard
+proc bl808_wifi_backend_signal_work() = discard
 '''
     code += (FACADE / "service_futures_parts/completions.nim").read_text()
     code += (FACADE / "service_futures_parts/waits.nim").read_text()
@@ -156,6 +169,21 @@ self = addTimer(10, proc() =
 now = 10
 fireExpiredTimers(scheduler)
 doAssert fired == @[1] and usedCount() == 0
+''',
+    "priority_between_timers": r'''
+reset()
+proc ready(): bool = true
+proc priority() =
+  doAssert not interruptsDisabled
+  fired.add(2)
+discard addTimer(5, proc() =
+  fired.add(1)
+  withInterruptsDisabled:
+    doAssert tryPostPriorityFromIsr(priority, ready))
+discard schedule(6, 3)
+now = 6
+fireExpiredTimers(scheduler)
+doAssert fired == @[1, 2, 3] and usedCount() == 0
 ''',
     "mixed_deadlines": r'''
 for seed in 1 .. 30:

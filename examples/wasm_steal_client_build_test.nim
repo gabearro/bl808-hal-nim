@@ -11,6 +11,13 @@ import bl808/[startup, core, mmio, memmap, wasm_scheduler,
 import bl808/kernel/[alloc, clock, ipcbridge, sched]
 when defined(wasmCrossCoreStealProbe):
   import bl808/wasm_steal_broker
+when defined(wasmManagedMigrationProbe):
+  when not defined(wasmManagedMigration) or not defined(wasmCrossCoreStealProbe) or
+      defined(wasmSoftStealing):
+    {.error: "enable managed migration and the best-effort route probe".}
+  import bl808/wasm_migration_client
+  when defined(wasmManagedMigrationProbeReceiver) or defined(bl808m0):
+    import bl808/wasm_migration_server
 when defined(bl808m0):
   import bl808/wasm_steal_server
 when defined(wasmSoftStealing):
@@ -35,19 +42,36 @@ var
   passed: bool
   finalValue: int32
 
+when defined(wasmManagedMigrationProbe):
+  var migration: WasmMigrationClient
+  var migrationTarget: uint32
+  var awaitingMigratedTask: bool
+  var migrated: bool
+
 when defined(wasmCrossCoreStealProbe):
   const StatusOffered = 0x5753_4402'u32
+  when not defined(wasmManagedMigrationProbe):
+    const LocalCoreBit = when defined(bl808m0): WasmStealM0
+                         elif defined(bl808d0): WasmStealD0
+                         else: WasmStealLP
+    proc probeResource(coreBit: uint32): uint16 =
+      (coreBit shl 8).uint16
   type OfferPhase = enum
     opSubmit, opSubmitted, opRead, opReading, opAcknowledging
   var offerTarget: uint32
   var offerPhase: OfferPhase
 
   proc beginProbeOffer(): bool =
-    var job = WasmStealJob(slot: 2, argCount: 2, affinityMask: offerTarget,
+    var job = WasmStealJob(slot: 2, affinityMask: WasmStealAllCores,
       requiredBackends: 1, maxFuel: 64)
-    for i, c in "indirect": job.exportName[i] = c
-    job.args[0] = 20
-    job.args[1] = 22
+    when defined(wasmManagedMigrationProbe):
+      for i, c in "run": job.exportName[i] = c
+    else:
+      job.requiredResources = probeResource(offerTarget)
+      job.argCount = 2
+      for i, c in "indirect": job.exportName[i] = c
+      job.args[0] = 20
+      job.args[1] = 22
     client.beginWasmStealOffer(job, 1, client.ownerEpoch)
 
 proc publish(status: uint32, value = 0'i32) =
@@ -98,8 +122,24 @@ when defined(wasmCrossCoreStealProbe):
     true
 
 proc pollStealWorker() =
+  when defined(wasmManagedMigrationProbe) and defined(bl808m0):
+    pollM0WasmMigrationRelay()
   if done: return
   let now = readTick()
+  when defined(wasmManagedMigrationProbe):
+    if migration.state == wmcPending:
+      discard migration.pollWasmTaskMigration(now)
+      return
+    if migration.state != wmcIdle:
+      done = true
+      publish(if migration.state == wmcComplete: StatusPassed else: StatusFailed)
+      return
+    when defined(wasmManagedMigrationProbeReceiver):
+      discard pollWasmMigrationServer()
+      if client.state in {wscHandoffChecked, wscHandoffRetry} or
+          (awaitingMigratedTask and client.state == wscPending and
+           wasmMigrationServerTaskId() != 0 and not finishing):
+        return
   case client.state
   of wscIdle, wscNoJob:
     when defined(wasmCrossCoreStealProbe):
@@ -111,7 +151,8 @@ proc pollStealWorker() =
     if finishing:
       done = true
       publish(if passed: StatusPassed else: StatusFailed, finalValue)
-    elif now >= nextClaimTick:
+    elif (when defined(wasmManagedMigrationProbe): not awaitingMigratedTask else: true) and
+        now >= nextClaimTick:
       if not client.beginWasmSteal():
         done = true
         publish(StatusFailed)
@@ -119,6 +160,15 @@ proc pollStealWorker() =
   of wscPending:
     discard client.pollWasmSteal()
   of wscReady:
+    when defined(wasmManagedMigrationProbe):
+      if migrationTarget != 0 and not migrated:
+        let suspended = resumeWasmTask(client.taskId, 1)
+        migrated = true
+        if suspended.state != wasmTaskYielded or
+            not migration.beginWasmTaskMigration(client.taskId, now):
+          done = true
+          publish(StatusFailed)
+        return
     let task = when defined(wasmSoftStealing): getWasmTask(client.taskId)
                else: resumeWasmTask(client.taskId, 8)
     if task.status == wasmSchedNoTask or task.state in {wasmTaskExited, wasmTaskTrapped}:
@@ -135,6 +185,8 @@ proc pollStealWorker() =
     if now >= nextClaimTick:
       discard client.finishWasmSteal()
       nextClaimTick = now + RetryTicks
+  of wscHandoffChecked, wscHandoffRetry:
+    discard
   of wscFailed:
     done = true
     publish(StatusFailed)
@@ -152,7 +204,10 @@ proc main() {.exportc, cdecl, noreturn.} =
     if not initM0WasmStealServer(2_000_000'u64, bootId):
       done = true
       publish(StatusFailed)
-  if not client.initWasmStealClient(bootId, 0):
+  let probeResources = when defined(wasmCrossCoreStealProbe) and
+      not defined(wasmManagedMigrationProbe): probeResource(LocalCoreBit)
+    else: 0'u16
+  if not client.initWasmStealClient(bootId, 0, resourceMask = probeResources):
     done = true
     publish(StatusFailed)
   when defined(wasmSoftStealing):
@@ -171,6 +226,28 @@ proc main() {.exportc, cdecl, noreturn.} =
       if (offerTarget != WasmStealM0 and offerTarget != WasmStealD0 and
           offerTarget != WasmStealLP) or offerTarget == client.coreBit or
           not client.beginWasmStealSession():
+        done = true
+        publish(StatusFailed)
+  when defined(wasmManagedMigrationProbe):
+    when defined(bl808m0):
+      if not done and not initM0WasmMigrationRelay():
+        done = true
+        publish(StatusFailed)
+    migrationTarget = regRead(StatusAddr + 0x28'u)
+    awaitingMigratedTask = regRead(StatusAddr + 0x2C'u) != 0
+    if not done and migrationTarget != 0 and
+        (not migration.initWasmMigrationClient(bootId, migrationTarget, WasmStealAllCores) or
+         not migration.bindWasmMigrationSourceWorker(addr client)):
+      done = true
+      publish(StatusFailed)
+    if not done and awaitingMigratedTask:
+      when defined(wasmManagedMigrationProbeReceiver):
+        if not initWasmMigrationServer(bootId, maxSnapshotBytes = 512) or
+            not bindWasmMigrationServerWorker(addr client) or
+            not client.beginWasmStealSession():
+          done = true
+          publish(StatusFailed)
+      else:
         done = true
         publish(StatusFailed)
   setSchedulerPollHook(pollStealWorker)

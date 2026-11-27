@@ -45,8 +45,8 @@
 #define INT_MASK_SHIFT        8
 #define INT_CLEAR_SHIFT       16
 
-#define FIFO_DMA_RX_EN        BIT(0)
-#define FIFO_DMA_TX_EN        BIT(1)
+#define FIFO_DMA_TX_EN        BIT(0)
+#define FIFO_DMA_RX_EN        BIT(1)
 #define FIFO_TX_CLR           BIT(2)
 #define FIFO_RX_CLR           BIT(3)
 
@@ -104,7 +104,7 @@ static void bl808_i2c_abort_transfer(BL808I2CState *s, uint32_t status_bits)
     }
 }
 
-static void tx_fifo_push(BL808I2CState *s, uint8_t val)
+static void tx_fifo_push(BL808I2CState *s, uint32_t val)
 {
     if (s->tx_count >= BL808_I2C_FIFO_DEPTH) {
         bl808_i2c_set_int(s, INT_FIFO_ERR);
@@ -115,9 +115,9 @@ static void tx_fifo_push(BL808I2CState *s, uint8_t val)
     s->tx_count++;
 }
 
-static uint8_t tx_fifo_pop(BL808I2CState *s)
+static uint32_t tx_fifo_pop(BL808I2CState *s)
 {
-    uint8_t val;
+    uint32_t val;
 
     if (s->tx_count == 0) {
         bl808_i2c_set_int(s, INT_FIFO_ERR);
@@ -130,7 +130,7 @@ static uint8_t tx_fifo_pop(BL808I2CState *s)
     return val;
 }
 
-static void rx_fifo_push(BL808I2CState *s, uint8_t val)
+static void rx_fifo_push(BL808I2CState *s, uint32_t val)
 {
     if (s->rx_count >= BL808_I2C_FIFO_DEPTH) {
         bl808_i2c_set_int(s, INT_FIFO_ERR);
@@ -141,9 +141,9 @@ static void rx_fifo_push(BL808I2CState *s, uint8_t val)
     s->rx_count++;
 }
 
-static uint8_t rx_fifo_pop(BL808I2CState *s)
+static uint32_t rx_fifo_pop(BL808I2CState *s)
 {
-    uint8_t val;
+    uint32_t val;
 
     if (s->rx_count == 0) {
         bl808_i2c_set_int(s, INT_FIFO_ERR);
@@ -194,18 +194,26 @@ static int bl808_i2c_send_subaddr(BL808I2CState *s)
 static void bl808_i2c_fill_rx(BL808I2CState *s)
 {
     while (s->rx_count < BL808_I2C_FIFO_DEPTH && s->xfer_remaining > 0) {
-        rx_fifo_push(s, i2c_recv(s->bus));
-        s->xfer_remaining--;
+        uint32_t word = 0;
+        for (unsigned byte = 0; byte < 4 && s->xfer_remaining > 0; byte++) {
+            word |= (uint32_t)i2c_recv(s->bus) << (byte * 8);
+            s->xfer_remaining--;
+        }
+        rx_fifo_push(s, word);
     }
 }
 
 static int bl808_i2c_drain_tx(BL808I2CState *s)
 {
     while (s->tx_count > 0 && s->xfer_remaining > 0) {
-        if (i2c_send(s->bus, tx_fifo_pop(s)) < 0) {
-            return -1;
+        uint32_t word = tx_fifo_pop(s);
+        for (unsigned byte = 0; byte < 4 && s->xfer_remaining > 0; byte++) {
+            if (i2c_send(s->bus, word & 0xff) < 0) {
+                return -1;
+            }
+            word >>= 8;
+            s->xfer_remaining--;
         }
-        s->xfer_remaining--;
     }
 
     return 0;
@@ -281,7 +289,7 @@ bool bl808_i2c_dma_can_read(BL808I2CState *s, unsigned width_bytes)
 {
     if (!bl808_i2c_clock_active(s) ||
         !(s->fifo_config0 & FIFO_DMA_RX_EN) ||
-        width_bytes != 1) {
+        width_bytes != 4) {
         return false;
     }
 
@@ -292,7 +300,7 @@ bool bl808_i2c_dma_can_write(BL808I2CState *s, unsigned width_bytes)
 {
     if (!bl808_i2c_clock_active(s) ||
         !(s->fifo_config0 & FIFO_DMA_TX_EN) ||
-        width_bytes != 1) {
+        width_bytes != 4) {
         return false;
     }
 
@@ -301,9 +309,9 @@ bool bl808_i2c_dma_can_write(BL808I2CState *s, unsigned width_bytes)
 
 uint32_t bl808_i2c_dma_read(BL808I2CState *s, unsigned width_bytes)
 {
-    uint8_t val;
+    uint32_t val;
 
-    if (width_bytes != 1) {
+    if (width_bytes != 4) {
         return 0;
     }
 
@@ -318,11 +326,11 @@ uint32_t bl808_i2c_dma_read(BL808I2CState *s, unsigned width_bytes)
 void bl808_i2c_dma_write(BL808I2CState *s, uint32_t value,
                          unsigned width_bytes)
 {
-    if (width_bytes != 1) {
+    if (width_bytes != 4) {
         return;
     }
 
-    tx_fifo_push(s, (uint8_t)value);
+    tx_fifo_push(s, value);
     if (s->transfer_active && !s->xfer_is_read) {
         if (bl808_i2c_drain_tx(s) < 0) {
             bl808_i2c_abort_transfer(s, INT_NAK | INT_END);
@@ -362,15 +370,7 @@ static uint64_t bl808_i2c_read(void *opaque, hwaddr offset, unsigned size)
     case REG_FIFO_CONFIG1:
         return bl808_i2c_fifo_config1(s);
     case REG_FIFO_RDATA:
-    {
-        uint8_t val = rx_fifo_pop(s);
-
-        if (s->transfer_active && s->xfer_is_read) {
-            bl808_i2c_fill_rx(s);
-            bl808_i2c_check_complete(s);
-        }
-        return val;
-    }
+        return bl808_i2c_dma_read(s, 4);
     default:
         return 0;
     }
@@ -431,14 +431,7 @@ static void bl808_i2c_write(void *opaque, hwaddr offset, uint64_t value,
         bl808_i2c_update_irq(s);
         break;
     case REG_FIFO_WDATA:
-        tx_fifo_push(s, (uint8_t)value);
-        if (s->transfer_active && !s->xfer_is_read) {
-            if (bl808_i2c_drain_tx(s) < 0) {
-                bl808_i2c_abort_transfer(s, INT_NAK | INT_END);
-                break;
-            }
-            bl808_i2c_check_complete(s);
-        }
+        bl808_i2c_dma_write(s, value, 4);
         break;
     default:
         break;

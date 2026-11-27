@@ -38,6 +38,9 @@ var
   aosDelayedCount: int
   aosDelayedDispatching: bool
 
+proc aosEventsPending(): bool =
+  aosEventCount != 0
+
 proc aos_post_event*(`type`, code: uint16; value: culong): cint {.exportc, cdecl.} =
   let event = AosInputEvent(
     eventType: `type` and not AosEventUrgent,
@@ -54,6 +57,7 @@ proc aos_post_event*(`type`, code: uint16; value: culong): cint {.exportc, cdecl
     let tail = (aosEventHead + aosEventCount) mod AosEventQueueCapacity
     aosEventQueue[tail] = event
   inc aosEventCount
+  vendorNotifyWork()
   sizeof(AosInputEvent).cint
 
 proc aos_register_event_filter*(`type`: uint16; cb, privateData: pointer): cint
@@ -137,7 +141,18 @@ proc aos_post_delayed_action*(ms: cint; action, arg: pointer): cint {.exportc, c
   aosDelayedActions[pos] = AosDelayedAction(
     deadlineMs: deadline, delayMs: ms, action: action, arg: arg)
   inc aosDelayedCount
+  vendorNotifyWork()
   0
+
+proc aosNextDelayedDelayUs(nowUs: uint64): uint64 =
+  ## The list is ordered. A negative delay wraps in storage, so compare it
+  ## with the same signed-difference rule used by aosPollDelayedActions.
+  let saved = osEnterCritical()
+  defer: osExitCritical(saved)
+  if aosDelayedCount == 0:
+    return high(uint64)
+  let remainingMs = cast[int64](aosDelayedActions[0].deadlineMs - nowUs div 1000'u64)
+  if remainingMs <= 0: 0'u64 else: remainingMs.uint64 * 1000'u64
 
 proc aos_cancel_delayed_action*(ms: cint; action, arg: pointer) {.exportc, cdecl.} =
   let saved = osEnterCritical()

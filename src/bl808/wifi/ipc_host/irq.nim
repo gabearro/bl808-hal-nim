@@ -48,7 +48,14 @@ proc ipcHostTxCfmHandler(env: pointer; scope: ptr IpcHostDispatchScope) =
       if scope.cancelled: return
       inc nimFwDbgIpcHostTxCfmDrained
       storePtr(completion.descriptor, TxdescHostHostIdOff, nil)
-      listPushBack(loadPtr(env, EnvListFreeOff), completion.descriptor)
+      when defined(bl808WifiSplitTxSlots):
+        # A flushed frame may have skipped primary DONE. Return its credit
+        # here, and keep the DMA record through even a reentrant callback.
+        let index = ipcHostTxDmaIndex(completion.descriptor)
+        discard returnTxHostSlot(index)
+        txDmaFree = txDmaFree or (1'u32 shl index)
+      else:
+        listPushBack(loadPtr(env, EnvListFreeOff), completion.descriptor)
       inc ipcHostTxResources.releases
 
 proc ipcHostDbgHandler(env: pointer; scope: ptr IpcHostDispatchScope) =

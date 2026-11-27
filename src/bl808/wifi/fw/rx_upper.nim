@@ -1213,7 +1213,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
   ## RX software descriptor upload event.
   ## From disassembly (143 instrs): clears event bit 0x800000, pops descriptors
-  ## from the upload list. For each descriptor, checks upload count limit (41),
+  ## from the upload list. For each descriptor, checks DMA ring headroom,
   ## builds a local DMA descriptor array (up to 4 entries, each 4 bytes of buffer
   ## address + 2 bytes length at offset 32, capped at 1736 per entry), then calls
   ## tcpip_stack_input. On success, updates upload count via platform
@@ -1283,15 +1283,15 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       outside: rxReleaseUpload(uploadListNode, uploadGeneration)
       continue
     let uploadCount = lowerEnv.uploadCount
-    let uploadHeadroom = cast[int32](41'u32 - uploadCount)
-    if uploadCount > 41 or uploadHeadroom <= 2:
+    let uploadHeadroom = cast[int32](WifiRxRingSlots.uint32 - uploadCount)
+    if uploadCount > WifiRxRingSlots.uint32 or uploadHeadroom <= 2:
       let logFn = getLogFunc(204)
       if logFn != nil:
         outside:
           cast[proc(level: uint32; tag, file: cstring; line: cint;
                     format: cstring) {.cdecl, varargs.}](logFn)(
             2, nil, "rxu_cntrl.c", 2002,
-            "---->>> Drop before too late %d:%ld\r\n", 41.cint,
+            "---->>> Drop before too late %d:%ld\r\n", WifiRxRingSlots.cint,
             cast[int32](uploadCount).clong)
       if current():
         outside: rxReleaseUpload(uploadListNode, uploadGeneration)

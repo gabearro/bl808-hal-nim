@@ -13,6 +13,8 @@ proc ipc_host_init*(env, cb, sharedEnv, pthis: pointer) {.exportc, cdecl.} =
   storePtr(env, EnvListOngoingOff, ptrAt(sharedEnv, SharedListOngoingOff))
   storePtr(env, EnvListCfmOff, ptrAt(sharedEnv, SharedListCfmOff))
   storePtr(env, EnvPthisOff, pthis)
+  when defined(bl808WifiSplitTxSlots):
+    ipcHostTxDmaInit(env)
 
   let freeList = loadPtr(env, EnvListFreeOff)
   let ongoingList = loadPtr(env, EnvListOngoingOff)
@@ -20,7 +22,12 @@ proc ipc_host_init*(env, cb, sharedEnv, pthis: pointer) {.exportc, cdecl.} =
   listInit(freeList)
   listInit(ongoingList)
   listInit(cfmList)
-  for sharedTxDescIndex in 0'u ..< NxTxDescCnt.uint:
+  const hostSlots = (when defined(bl808WifiSplitTxSlots): WifiTxHostSlotCount
+                     else: NxTxDescCnt.int)
+  for sharedTxDescIndex in 0'u ..< min(hostSlots.uint, NxTxDescCnt.uint):
     listPushBack(
       freeList,
       ptrAt(sharedEnv, SharedTxdesc0Off + sharedTxDescIndex * SharedTxdescHostSize))
+  when defined(bl808WifiSplitTxSlots):
+    for credit in txHostCredits.mitems:
+      listPushBack(freeList, addr credit)

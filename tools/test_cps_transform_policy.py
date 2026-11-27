@@ -2967,7 +2967,7 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
     ]:
         assert forbidden not in rx_dma_layout
 
-    assert "for rxSwTableIndex in 0 ..< 41:" in sw_body
+    assert "for rxSwTableIndex in 0 ..< WifiRxRingSlots:" in sw_body
     assert "rxSwTableDescAt(rxSwTableIndex).firstHeaderDesc =" in sw_body
     assert "cast[pointer](rxHeaderHwDescAt(rxSwTableIndex))" in sw_body
     for expected in [
@@ -3108,7 +3108,7 @@ def test_wifi_rxl_hwdesc_dump_uses_typed_overlays():
     )[0]
 
     for expected in [
-        "for headerDescDumpIndex in 0'u32 ..< 41:",
+        "for headerDescDumpIndex in 0'u32 ..< WifiRxRingSlots.uint32:",
         "let hd = rxHeaderDumpView(rxHeaderHwDescAt(headerDescDumpIndex.int))",
         "headerDescDumpIndex.cint, cast[uint](hd).culong",
         "hd.magic",
@@ -3117,7 +3117,7 @@ def test_wifi_rxl_hwdesc_dump_uses_typed_overlays():
         "hd.ampduStatus.cuint",
         "hd.timestampLow.culong",
         "hd.rxVector1c",
-        "for payloadDescDumpIndex in 0'u32 ..< 41:",
+        "for payloadDescDumpIndex in 0'u32 ..< WifiRxRingSlots.uint32:",
         "let pd = rxPayloadHwDescAt(payloadDescDumpIndex.int)",
         "payloadDescDumpIndex.cint, cast[uint](pd).culong",
         "pd.bufferEnd + 1'u32 - pd.bufferAddr",
@@ -14099,8 +14099,8 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
         "if uploadListNode == nil:",
         "let swDesc = rxMpduHeader(uploadListNode)",
         "let uploadCount = lowerEnv.uploadCount",
-        "let uploadHeadroom = cast[int32](41'u32 - uploadCount)",
-        "if uploadCount > 41 or uploadHeadroom <= 2:",
+        "let uploadHeadroom = cast[int32](WifiRxRingSlots.uint32 - uploadCount)",
+        "if uploadCount > WifiRxRingSlots.uint32 or uploadHeadroom <= 2:",
         "rxHostForward(",
         "rxReleaseUpload(uploadListNode, uploadGeneration)",
         "var uploadPayloadHwDesc = cast[ptr RxPayloadHwDescView](swDesc.bufferChain)",
@@ -16761,10 +16761,10 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         "proc txlFrameDumpNodes", 1
     )[0]
     service_body = wifi_fw.split(
-        "proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =",
+        "proc serviceStaPostponed(limit: uint32; reconcile: bool): uint32 =",
         1,
     )[1].split(
-        "proc rfc_channel_ops*", 1
+        "proc wifi_nimfw_service_sta_postponed*", 1
     )[0]
     keepalive_body = wifi_fw.split(
         "proc wifi_nimfw_send_sta_null_frame*(): uint8 {.exportc, cdecl.} =",

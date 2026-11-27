@@ -1,185 +1,114 @@
-## Async DMA transfers for the BL808 kernel.
-##
-## ISR-driven DMA channel management using the ISR bridge.
-## Supports M2M, M2P, and P2M transfers with CpsFuture completion.
-##
-##   let ok = await dmaTransferAsync(dma0, 0, cfg)
-##   let ok = await spiDmaTransfer(spi, txBuf, rxBuf, len)
+## CPS completion for linked DMA transfers. A pending transfer can be
+## cancelled through its future, including by withTimeout.
 
-import ../dma, ../spi, ../mmio, ../irq
-import ./runtime, ./isrbridge
+import ../core, ../dma, ../dmablock, ../dmafifo, ../spi
+import ./runtime, ./sched
 
-# =============================================================================
-# Per-channel ISR bridge slots
-# =============================================================================
-
-const DmaNumChannels = 8
-
-var dmaSlots: array[DmaNumChannels, int]  # -1 = idle
-var dmaHandle: Dma  # Pre-initialized, used by ISR
-
-proc dmaIsrHandler() {.cdecl.} =
-  let d = dmaHandle
-  # Check which channels have transfer-complete
-  for ch in 0'u32 ..< DmaNumChannels.uint32:
-    if d.tcInterruptPending(ch.DmaChannel):
-      d.clearTcInterrupt(ch.DmaChannel)
-      if dmaSlots[ch] >= 0:
-        completeIsrSlot(dmaSlots[ch])
-        dmaSlots[ch] = -1
-
-# =============================================================================
-# Initialization
-# =============================================================================
-
-var dmaInitialized = false
+proc awaitDma*[T](check: proc(): DmaBlockStatus {.closure.};
+                  stop: proc(success: bool) {.closure.};
+                  success, failure: T): CpsFuture[T] =
+  ## Park the caller between status checks. Start promptly for short
+  ## transfers, and back off while a long transfer is still in progress.
+  let future = newLocalCpsFuture[T]()
+  var timer: TimerId
+  var delay = 100'u64
+  proc poll() =
+    timer = 0
+    case check()
+    of dmaBlockRunning:
+      timer = addTimerUs(delay, poll)
+      delay = min(delay * 2, 1000'u64)
+    of dmaBlockDone:
+      stop(true)
+      complete(future, success)
+    of dmaBlockError, dmaBlockIdle:
+      stop(false)
+      complete(future, failure)
+  future.addCallback proc() =
+    if timer != 0: cancelTimer(timer)
+    if future.isCancelled:
+      stop(false)
+  poll()
+  future
 
 proc dmaAsyncInit*() =
-  ## Initialize async DMA. Call once at boot after enabling the DMA0 clock
-  ## through GLB.
-  if dmaInitialized: return
-  dmaInitialized = true
+  ## Pre-enable the core's controller without disturbing existing channels.
+  discard openCoreDma()
 
-  for i in 0 ..< DmaNumChannels:
-    dmaSlots[i] = -1
+proc dmaTransferAsync*(controller: Dma; cfg: DmaTransferConfig;
+                       channel = -1): CpsFuture[bool] =
+  ## Start a linked transfer. The caller controls peripheral requests and
+  ## cache maintenance for cfg's buffers.
+  if cfg.transferSize == 0: return completedLocalFuture(true)
+  let transfer = new DmaBlock
+  if not transfer[].prepare(controller, cfg, channel):
+    return completedLocalFuture(false)
+  transfer[].start()
+  awaitDma(proc(): DmaBlockStatus = transfer[].status(),
+           proc(ok: bool) = transfer[].release(), true, false)
 
-  # Initialize DMA controller (enables it + clears interrupts)
-  dmaHandle = initDma(dma0)
-
-  # Register ISR
-  registerTrapHandler(IrqM0Dma0All, dmaIsrHandler)
-  irqEnable(IrqM0Dma0All)
-  irqSetLevel(IrqM0Dma0All, 1)
-
-  # Enable machine external interrupt
-  {.emit: """
-  unsigned long mie;
-  asm volatile("csrr %0, mie" : "=r"(mie));
-  mie |= (1UL << 11);
-  asm volatile("csrw mie, %0" :: "r"(mie));
-  """.}
-
-# =============================================================================
-# Async DMA transfer
-# =============================================================================
-
-proc dmaTransferAsync*(ch: DmaChannel,
+proc dmaTransferAsync*(ch: DmaChannel;
                        cfg: DmaTransferConfig): CpsFuture[bool] =
-  ## Start a DMA transfer and return a future that completes on TC.
-  if not dmaInitialized: dmaAsyncInit()
+  dmaTransferAsync(openCoreDma(), cfg, ch.int)
 
-  let d = dmaHandle
-  let fut = newLocalCpsFuture[bool]()
-  let voidFut = newLocalCpsVoidFuture()
-  voidFut.addCallback proc() = complete(fut, true)
+proc fifoTransferAsync*(endpoint: DmaFifoEndpoint; data: pointer;
+                        len: int): CpsFuture[bool] =
+  ## Pump len bytes through a configured peripheral FIFO. The caller owns
+  ## the peripheral and keeps the data buffer alive until completion.
+  if len == 0: return completedLocalFuture(true)
+  let transfer = new DmaFifoTransfer
+  if not transfer[].prepare(endpoint, data, len): return completedLocalFuture(false)
+  if not transfer[].start():
+    transfer[].release()
+    return completedLocalFuture(false)
+  awaitDma(proc(): DmaBlockStatus = transfer[].status(),
+           proc(ok: bool) = transfer[].release(ok), true, false)
 
-  # Re-enable CLIC
-  irqClearPending(IrqM0Dma0All)
-  irqEnable(IrqM0Dma0All)
+proc fifoTransferAsync*(endpoint: DmaFifoEndpoint;
+                        words: var openArray[uint32]): CpsFuture[bool] =
+  if words.len == 0: return completedLocalFuture(true)
+  if endpoint.width != width32: return completedLocalFuture(false)
+  fifoTransferAsync(endpoint, addr words[0], words.len * sizeof(uint32))
 
-  dmaSlots[ch.int] = registerIsrFuture(voidFut)
-  if dmaSlots[ch.int] < 0:
-    complete(fut, false)
-    return fut
-  d.configureChannel(ch, cfg)
-  d.startChannel(ch)
-  fut
+proc dmaCopyAsync*(src, dst: pointer; len: int;
+                   ch = -1): CpsFuture[bool] =
+  ## Copy between RAM buffers. Source and destination must not overlap.
+  ## Omitting ch lets the controller choose an available channel.
+  if len == 0: return completedLocalFuture(true)
+  let source = cast[uint](src)
+  let dest = cast[uint](dst)
+  if not dmaBufferInRam(source, len) or not dmaBufferInRam(dest, len) or
+      (dest < source + len.uint and source < dest + len.uint):
+    return completedLocalFuture(false)
 
-# =============================================================================
-# DMA M2M copy
-# =============================================================================
-
-proc dmaCopyAsync*(src, dst: pointer, len: int,
-                   ch: DmaChannel = 0.DmaChannel): CpsFuture[bool] =
-  ## Async memory-to-memory copy via DMA.
+  let transfer = new DmaBlock
+  let receive = new DmaReceiveBuffer
+  receive[].prepare(dst, len)
   let cfg = DmaTransferConfig(
-    srcAddr: cast[uint32](src),
-    dstAddr: cast[uint32](dst),
-    transferSize: len.uint32,
-    srcWidth: width8,
-    dstWidth: width8,
-    srcBurst: burst1,
-    dstBurst: burst1,
-    srcIncrement: true,
-    dstIncrement: true,
-    flow: flowM2M_Dma,
-    srcPeriph: 0,
-    dstPeriph: 0,
-    enableTcInt: true,
-  )
-  dmaTransferAsync(ch, cfg)
+    srcAddr: source.uint32, dstAddr: receive.address.uint32,
+    transferSize: len.uint32, srcWidth: width8, dstWidth: width8,
+    srcIncrement: true, dstIncrement: true, flow: flowM2M_Dma)
+  if not transfer[].prepare(openCoreDma(), cfg, ch):
+    receive[].finish(false)
+    return completedLocalFuture(false)
 
-# =============================================================================
-# DMA-accelerated SPI transfer
-# =============================================================================
+  dcacheCleanRange(source, len.uint)
+  transfer[].start()
+  awaitDma(proc(): DmaBlockStatus = transfer[].status(),
+    proc(ok: bool) =
+      transfer[].release()
+      receive[].finish(ok),
+    true, false)
 
-proc spiDmaTransfer*(spi: Spi, txBuf, rxBuf: ptr UncheckedArray[uint8],
-                     len: int): CpsFuture[bool] =
-  ## Full-duplex SPI transfer using DMA channels 2 (TX) and 3 (RX).
-  if not dmaInitialized: dmaAsyncInit()
-
-  let d = dmaHandle
-
-  # Enable SPI DMA mode
-  spi.enableDmaTx()
-  spi.enableDmaRx()
-
-  # Configure TX channel (M2P): memory → SPI TX FIFO
-  let txCfg = DmaTransferConfig(
-    srcAddr: cast[uint32](txBuf),
-    dstAddr: spi.txFifoAddr().uint32,
-    transferSize: len.uint32,
-    srcWidth: width8,
-    dstWidth: width8,
-    srcBurst: burst1,
-    dstBurst: burst1,
-    srcIncrement: true,
-    dstIncrement: false,  # FIFO address doesn't increment
-    flow: flowM2P_Dma,
-    srcPeriph: 0,
-    dstPeriph: dmaPeriphSpi0Tx.uint32,
-    enableTcInt: false,  # We wait on RX complete, not TX
-  )
-
-  # Configure RX channel (P2M): SPI RX FIFO → memory
-  let rxCfg = DmaTransferConfig(
-    srcAddr: spi.rxFifoAddr().uint32,
-    dstAddr: cast[uint32](rxBuf),
-    transferSize: len.uint32,
-    srcWidth: width8,
-    dstWidth: width8,
-    srcBurst: burst1,
-    dstBurst: burst1,
-    srcIncrement: false,
-    dstIncrement: true,
-    flow: flowP2M_Dma,
-    srcPeriph: dmaPeriphSpi0Rx.uint32,
-    dstPeriph: 0,
-    enableTcInt: true,  # Interrupt when all RX bytes received
-  )
-
-  # Enable SPI master
-  regSet(spi.baseAddr() + SpiConfigReg, 1'u32 shl SpiMasterEn)
-
-  # Start both channels
-  d.configureChannel(2.DmaChannel, txCfg)
-  d.configureChannel(3.DmaChannel, rxCfg)
-
-  # Register ISR slot for RX channel (ch3)
-  let fut = newLocalCpsFuture[bool]()
-  let voidFut = newLocalCpsVoidFuture()
-  voidFut.addCallback proc() =
-    # Disable SPI DMA mode after transfer
-    regClear(spi.baseAddr() + SpiFifoConfig0, (1'u32 shl SpiFifoDmaTxEn) or (1'u32 shl SpiFifoDmaRxEn))
-    complete(fut, true)
-
-  irqClearPending(IrqM0Dma0All)
-  irqEnable(IrqM0Dma0All)
-
-  dmaSlots[3] = registerIsrFuture(voidFut)
-  if dmaSlots[3] < 0:
-    complete(fut, false)
-    return fut
-  d.startChannel(2.DmaChannel)
-  d.startChannel(3.DmaChannel)
-  fut
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  proc spiDmaTransfer*(spi: Spi; txBuf, rxBuf: ptr UncheckedArray[uint8];
+                       len: int): CpsFuture[bool] =
+    ## Full-duplex SPI. Completion includes the last bit leaving the bus.
+    if len == 0: return completedLocalFuture(true)
+    let transfer = new SpiDmaTransfer
+    if not transfer[].start(spi, txBuf, rxBuf, len):
+      return completedLocalFuture(false)
+    awaitDma(proc(): DmaBlockStatus = transfer[].poll(),
+      proc(ok: bool) =
+        if not ok: transfer[].cancel(),
+      true, false)

@@ -1,0 +1,37 @@
+(component
+  (core func $return (canon task.return (result u32)))
+  (core func $new (canon waitable-set.new))
+  (core func $drop (canon waitable-set.drop))
+  (core module $m
+    (import "" "return" (func $return (param i32)))
+    (import "" "new" (func $new (result i32)))
+    (import "" "drop" (func $drop (param i32)))
+    (global $set (mut i32) (i32.const 0))
+    (func (export "two-returns") (result i32)
+      (call $return (i32.const 1)) (call $return (i32.const 2)) (i32.const 0))
+    (func (export "return-one") (result i32)
+      (call $return (i32.const 1)) (i32.const 0))
+    (func (export "bad-code") (result i32) (i32.const 3))
+    (func (export "unresolved") (result i32) (i32.const 0))
+    (func (export "wait") (result i32)
+      (global.set $set (call $new))
+      (i32.or (i32.const 2) (i32.shl (global.get $set) (i32.const 4))))
+    (func (export "drop-set") (call $drop (global.get $set)))
+    (func (export "callback") (param i32 i32 i32) (result i32) unreachable))
+  (core instance $i (instantiate $m (with "" (instance (export "return" (func $return))
+    (export "new" (func $new)) (export "drop" (func $drop))))))
+  (func (export "two-returns") async (result u32)
+    (canon lift (core func $i "two-returns") async (callback (core func $i "callback"))))
+  (func (export "wrong-type") async (result s32)
+    (canon lift (core func $i "return-one") async (callback (core func $i "callback"))))
+  (func (export "wrong-option") async (result u32)
+    (canon lift (core func $i "return-one") string-encoding=utf16
+      async (callback (core func $i "callback"))))
+  (func (export "bad-code") async
+    (canon lift (core func $i "bad-code") async (callback (core func $i "callback"))))
+  (func (export "unresolved") async
+    (canon lift (core func $i "unresolved") async (callback (core func $i "callback"))))
+  (func (export "wait") async
+    (canon lift (core func $i "wait") async (callback (core func $i "callback"))))
+  (func (export "drop-set") (canon lift (core func $i "drop-set")))
+  (func (export "sync-return") (result u32) (canon lift (core func $i "return-one"))))

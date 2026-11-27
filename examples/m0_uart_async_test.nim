@@ -1,10 +1,10 @@
-## M0 CPS kernel Phase 3 test — async UART echo via ISR bridge.
+## M0 CPS kernel Phase 3 test — async UART echo via DMA.
 ##
 ## Build: nim c -d:bl808m0 -d:bl808kernel examples/m0_uart_async_test.nim
 ## Run:   qemu-system-riscv32 -M bl808 -nographic -kernel examples/m0_uart_async_test
 ##
 ## Type characters in the QEMU console. Each character is received via
-## interrupt-driven async I/O and echoed back. A background timer task
+## DMA-backed async I/O and echoed back. A background timer task
 ## prints heartbeats every 2 seconds to demonstrate concurrent operation.
 
 import bl808/startup
@@ -23,7 +23,7 @@ const
 var console: Uart
 
 # ---------------------------------------------------------------------------
-# Async echo task — receives characters via ISR-driven UART
+# Async echo task — receives characters via DMA
 # ---------------------------------------------------------------------------
 
 proc echoTask(au: AsyncUart): CpsVoidFuture {.cps.} =
@@ -42,7 +42,7 @@ proc echoTask(au: AsyncUart): CpsVoidFuture {.cps.} =
   discard console.sendLine("[ECHO] Done — received 'q'")
 
 # ---------------------------------------------------------------------------
-# Heartbeat task — demonstrates concurrent operation with ISR-driven task
+# Heartbeat task — demonstrates concurrent operation with the UART DMA task
 # ---------------------------------------------------------------------------
 
 proc heartbeatTask(): CpsVoidFuture {.cps.} =
@@ -78,7 +78,7 @@ proc main() {.exportc, cdecl.} =
 
   discard console.sendLine("")
   discard console.sendLine("=== BL808 CPS Kernel Phase 3 Test ===")
-  discard console.sendLine("Async UART echo via ISR bridge")
+  discard console.sendLine("Async UART echo via DMA")
   discard console.sendLine("")
 
   # Init heap + scheduler

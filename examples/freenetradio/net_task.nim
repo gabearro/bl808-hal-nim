@@ -31,6 +31,9 @@ const
   BackoffStepMs = 5_000'u64         ## pause after a failed attempt ...
   BackoffMaxMs = 20_000'u64         ## ... doubling up to this
   PollMs = 10
+  # Interrupts and host notifications wake Wi-Fi immediately; this is the
+  # connected-state safety deadline when no work notification arrives.
+  RadioWifiServicePeriodUs {.intdefine.} = 5000
 
 type
   NetStage = enum
@@ -164,7 +167,7 @@ proc netStart*() =
     return
   ctl = NetCtl(stage: nsJoin)
   net = NetState()
-  wifiInstallServiceHook(periodUs = 1000'u32, iterations = 16'u32)
+  wifiInstallServiceHook(periodUs = RadioWifiServicePeriodUs.uint32)
   if WifiSsid.len == 0:
     logError "no Wi-Fi network: build with -d:WifiSsid=... -d:WifiPassword=..."
     return

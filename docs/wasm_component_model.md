@@ -1,6 +1,13 @@
 # Component Model implementation status
 
-The target is the synchronous [Component Model 0.2 MVP binary format](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md) and [Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md) at spec revision `585526aa1f2c7f76f07557d16e265dede38b3acb`, with `wasm-tools 1.263.0` generating and validating the test components. The decoder accepts the component binary header `00 61 73 6d 0d 00 01 00`. `ComponentVersion` and `ComponentSpecRevision` in `src/cps/wasm/component.nim` name this target. This is an incremental implementation, not yet full conformance to the proposal.
+`ComponentVersion` identifies the 0.2 MVP base profile, and
+`ComponentSpecRevision` pins binary and ABI semantics to
+`585526aa1f2c7f76f07557d16e265dede38b3acb`. This revision also defines the
+async facilities being added behind build flags. `wasm-tools 1.263.0`
+generates and validates the test components. The decoder accepts the binary
+header `00 61 73 6d 0d 00 01 00`. Full conformance remains in progress.
+[Pinned binary format](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md)
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md)
 
 `src/cps/wasm/component.nim` validates and links multiple embedded core modules
 within one component using the full interpreter's store. Core functions, tables,
@@ -8,6 +15,28 @@ memories, globals and exception tags link by identity. A module importing mutabl
 changes made by the other module. The linker validates the full core graph before
 running guest start functions. The decoder accepts valid empty components and
 checks kebab-case labels, name collisions, and qualified interface name syntax.
+
+Embedded core modules and module type declarations support Core WebAssembly
+function-only recursive type groups with scalar signatures. The decoder
+handles the Component Model's prefixed non-final subtype encoding and the
+unprefixed Core encoding inside a module type. Function imports and exports
+match declared ancestors across separately encoded modules. Indirect calls,
+including tail calls, check that same subtype relation. A plain canonical
+lift requires the ABI's final singleton type. Core GC reference types and
+aggregate types remain outside the interpreter's supported profile.
+
+`python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-core-function-types`
+checks cross-module imports, indirect calls and indirect tail calls. LP uses
+a smaller two-module import fixture and the same indirect-call fixture as
+M0 and D0. It runs with the standard 16 KiB writable layout and a 4,096-byte
+stack. With the larger typed-module ascription fixture, the expanded-RAM LP
+diagnostic peaked at 11,904 bytes of heap, exceeding the standard layout.
+
+| Core function type QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 17,392 | 3,976 |
+| D0 | 56,048 | 6,960 |
+| LP | 7,728 | 3,600 |
 
 Core tag imports use the supplying module's store address. Whole-instance
 imports, synthesized instances, aliases, and typed core module re-exports
@@ -331,20 +360,87 @@ alignment and bounds,
 variant discriminants and joined payload lanes, recursive records and
 tuples, flags masking, structural value type equality, nominal resource
 substitution, cross-guest resource moves, borrow lifetimes and table reuse.
-The pinned revision passed 465 checks across 35 instantiations, 37
-definition validations, 258 rejections, 100 return assertions and 35 trap
-assertions. The 35 selected `values/concat.wast` returns cover the upstream
-aggregate fixture. The second fixture, which uses maps, is excluded.
+The pinned revision passed 849 selected checks across 45 instantiations, 66
+definition validations, 394 rejections, 306 return assertions and 38 trap
+assertions. Eleven local core function type checks cover subtype linking,
+contravariant imports, canonical lift identity, indirect calls and rejection
+of malformed subtype declarations. All 44 returns in `values/concat.wast`
+run, including nine map cases. Nine synchronous rejections from
+`validation/map.wast` and five local map cases cover key and value
+validation, named type visibility, linking, map results, and alignment.
+The other four upstream map validation cases involve streams or futures.
 The generated core function cases exercise lifting `resource.drop` through
 resource visibility and identity rules.
-The `resources/borrows.wast`, `resources/multiple-resources.wast`, and
+All 72 cases in `validation/resources.wast` run. The `resources/borrows.wast`,
+`resources/multiple-resources.wast`, and
 `resources/handle-table.wast` runtime files run in full. All 11 cases in
 `validation/core-modules.wast` run. The runner also covers the full
-`linking/tags.wast` and `validation/defined-types.wast` files.
-The core memory variance case in
-`validation/instantiation.wast` that declares two memories remains outside
-the interpreter's single-memory profile.
+`linking/unit.wast`, `linking/tags.wast`,
+`linking/link-time-virtualization.wast`,
+`linking/shared-everything-dynamic-linking.wast`,
+`validation/defined-types.wast`, `validation/external-visibility.wast`,
+`validation/annotated-names.wast`, `validation/version-suffix.wast`,
+`values/numerics.wast`, and `values/realloc.wast` files. All 25 binary
+cases in `validation/attributes.wast` run. The other four cases test
+malformed WAT source. The selected cases include synchronous
+post-return checks and the two-memory variance case in
+`validation/instantiation.wast`.
 The runner prints the number of excluded cases per selected WAST file.
+All 62 external-visibility cases pass, including the two instance
+re-exports at lines 459 and 475. The linker substitutes parent type names
+when they are supplied as child arguments. Instance export validation checks
+each member in declaration order. Five local WAST checks also cover that
+ordering, an ascribed instance with a renamed nested type, a function that
+uses an imported type across a component boundary, and an alias of an
+ascribed function export.
+
+Resource validation tracks the external name separately from the nominal
+resource identity used at runtime. An instance method can use a name already
+published by its enclosing component, including a name supplied as a child
+argument. A raw type reference to the same resource still needs its own
+publication. Nine local checks cover nested export order, publication
+through aliases, the separation of import and export names, and destruction
+of a resource relayed through a child component. A child also binds a
+`[constructor]` import by its declared name, calls it, and drops the
+returned owner.
+
+Explicit `(eq ...)` export ascriptions preserve a resource's nominal type.
+Defined value types compare structurally and check the nominal identity of
+embedded handles. `(sub resource)` export ascriptions introduce a fresh
+static resource type backed by the original implementation and destructor.
+An abstract export permits `resource.drop`. `resource.new` and `resource.rep`
+require a local concrete resource definition.
+
+The pinned Component Model text describes abstract export ascription.
+[Type definitions](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Text.md#type-definitions)
+
+`wasm-tools 1.263.0` assembles these exports and rejects them at validation.
+The reference gate recognizes that specific validator diagnostic and runs
+the assembled fixtures through the Nim decoder and runtime. The upstream
+negative case reaches the intended type substitution check. Local tests
+exercise destructor dispatch through an abstract re-export and reject
+incompatible identities and representation operations on an abstract type.
+
+The decoder validates `implements` and `external-id` attributes on the
+binary name encoding. Version suffixes require
+`-d:wasmComponentCanonicalNames`, matching the opt-in `cm-canon-names`
+profile in `wasm-tools 1.263.0`. The linker uses literal declared names
+for host bindings and child instantiation. The attribute values are
+metadata. A host can inspect the attributes on a component's immediate
+definitions with `componentNameAttributes`. The fixture in
+`python3 tools/run_wasm_component.py --qemu-interface` imports a service
+under a plain attributed name, calls it from core Wasm, and re-exports the
+interface under its declared versioned name.
+
+| Name attribute QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 13,400 bytes | 4,256 bytes |
+| D0 | 50,448 bytes | 7,568 bytes |
+| LP | 7,872 bytes | 3,828 bytes |
+
+The LP attribute fixture runs separately from the earlier interface fixture.
+The attribute case uses 16 KiB of writable RAM and the default 4,096-byte
+stack reservation.
 
 ```sh
 mkdir -p build/wasm-component/spec
@@ -356,7 +452,880 @@ git -C build/wasm-component/spec checkout --detach FETCH_HEAD
 python3 tools/run_wasm_component_spec.py build/wasm-component/spec
 python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu
 python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-tags
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-multi-memory
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-resource-visibility
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-resource-ascription
 ```
+
+The resource-ascription QEMU probe moves handles across components on M0
+and D0. LP runs a smaller graph that drops through an equality-bound alias
+of an abstract export. Both fixtures check two calls to the original
+destructor. The native probe uses the smaller fixture and publishes
+`0x57524100` at the existing scalar probe status address after both calls
+pass. Generate the fixture with `--qemu-resource-ascription` before building.
+
+| QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 29,504 bytes | 8,048 bytes |
+| D0 | 105,432 bytes | 11,136 bytes |
+| LP | 8,744 bytes | 3,996 bytes |
+
+The native LP probe reserves 336 bytes of `.data`, 2,212 bytes of `.bss`,
+9,740 bytes of heap, and a 4,096-byte stack. Those are link sizes. The native
+probe still needs a coordinated Ox64 run to measure actual stack and heap use.
+
+```sh
+for core in m0 d0 lp; do
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentResourceAscriptionFirmware \
+    --nimcache:build/wasm-component/resource-audit/"$core"-ascription-cache \
+    --out:build/wasm-component/resource-audit/"$core"-ascription.elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+Embedded core modules validate and execute indexed memory32 instructions in
+the full interpreter. Standalone managed jobs and the native backends retain
+single-memory admission. The multi-memory fixture writes to two separate
+memories and lifts a string through the Canonical ABI using memory index one.
+It passed on all three QEMU CPU profiles.
+
+| QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 10,760 bytes | 3,952 bytes |
+| D0 | 46,264 bytes | 6,928 bytes |
+| LP | 5,296 bytes | 3,576 bytes |
+
+The LP QEMU build links 336 bytes of `.data`, 3,040 bytes of `.bss`,
+8,896 bytes of heap, and a 4,096-byte stack within 16 KiB of writable RAM.
+The host regression exercises indexed load and store, grow, cross-memory
+copy and data initialization, bounds checks after `data.drop`, and fault
+routing to the correct backing memory. The test runs with and without
+chunked memory and interpreter peephole optimization.
+
+```sh
+mkdir -p build/wasm-component/multi-memory
+wasm-tools parse tools/wasm_multi_memory.wat \
+  -o build/wasm-component/multi-memory/guest.wasm
+nim c -r --skipUserCfg --skipParentCfg --skipProjCfg --path:src \
+  --out:build/wasm-component/multi-memory/host tools/test_wasm_multi_memory.nim \
+  build/wasm-component/multi-memory/guest.wasm
+nim c -r --skipUserCfg --skipParentCfg --skipProjCfg --path:src \
+  -d:wasmChunkedMemory -d:WasmMemoryChunkBytesConfig=512 \
+  --out:build/wasm-component/multi-memory/chunked tools/test_wasm_multi_memory.nim \
+  build/wasm-component/multi-memory/guest.wasm
+```
+
+The resource relay QEMU gate runs two transfers on each CPU profile.
+M0 and D0 run the full fixture. A core Wasm caller lowers a function from
+the child's re-exported interface, transfers each handle, and reads the
+parent guest destructor's cumulative values of 42 and 84. The compact LP
+fixture invokes the same ownership path through the exported interface and
+checks that each source handle is unusable after the child consumes it.
+The full fixture exceeded the 16 KiB LP layout. With 32 KiB in QEMU, it used
+14,424 bytes of peak heap and 6,656 bytes of native stack.
+
+| Resource relay QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0, guest caller and destructor | 19,904 bytes | 7,040 bytes |
+| D0, guest caller and destructor | 60,528 bytes | 9,680 bytes |
+| LP, component interface ownership transfer | 7,928 bytes | 3,692 bytes |
+
+## WIT maps
+
+The linker treats `map<K,V>` as a distinct value type. Canonical lowering
+and lifting use the existing list memory layout with a two-field entry.
+Keys can be integers, Boolean, Unicode scalars, or strings. Map values can
+use the supported synchronous types and must be free of handles. The host
+API exposes ordered entries via `componentMap` and `cpMap`. It preserves
+duplicate keys on the wire. Language bindings that expose an associative
+container use the last entry for a duplicate key.
+[Pinned map validation](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md#type-definitions)
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#despecialization)
+[Pinned WIT rules](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/WIT.md#value-types)
+
+`python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-map`
+builds the component from `tools/wasm_component_map.wit` and exercises
+an empty map, duplicate keys, and an aligned u64 value including its
+maximum. The same fixture runs on all three QEMU CPU profiles. The
+build-only native map probe uses `-d:wasmComponentMapFirmware` and
+status prefix `0x574D5000` with the firmware command below. For LP add
+`-d:WasmLpNativeStackBytes=4608` and
+`--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608`. Both LP binaries link
+with 336 bytes of `.data`, 2,728 bytes of `.bss`, 8,712 bytes of heap,
+and a 4,608-byte stack. Physical validation remains pending.
+
+| Map round-trip QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 12,920 bytes | 4,704 bytes |
+| D0 | 49,272 bytes | 7,152 bytes |
+| LP | 7,304 bytes | 4,008 bytes |
+
+The QEMU LP profile uses a 4,096-byte stack within 16 KiB and has 88 bytes
+of measured stack headroom for this fixture. The native LP probe links with
+336 bytes of `.data`, 2,728 bytes of `.bss`, 8,712 bytes of heap and a
+4,608-byte stack.
+
+## WIT fixed-length lists
+
+`-d:wasmComponentFixedLists` enables `list<T,N>`, matching the opt-in
+`cm-fixed-length-lists` feature of the pinned toolchain. Length is part
+of the component type. The Canonical ABI uses repeated element lanes
+for flat calls and consecutive aligned elements for memory-backed calls.
+The host constructs values with `componentFixedList` and reads their
+`cpFixedList` fields. Validation checks the spec's strict 2²⁸-byte limit
+for both pointer widths without allocating individual elements. The
+firmware executes the memory32 Canonical ABI with its existing transfer
+quotas. [Pinned Binary Format](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md#type-definitions)
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#element-size)
+
+`python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-fixed-list`
+builds two WIT worlds and validates them using `wasm-tools`. The host
+checks the default feature gate, and the enabled cases run on the host
+and all three QEMU CPU profiles. They cover a direct i64 result, inline
+parameters with an indirect result, a 17-element indirect parameter,
+and rejection of a mismatched length. Running the two components
+independently fits LP's 16 KiB layout. The combined diagnostic exceeded
+that budget. The host suite also tests Canonical ABI lowering across a
+component boundary, invalid alignment, byte-size overflow and transfer
+quota failures. The mixed upstream size-boundary component still
+includes stream and future types. The local suite covers its synchronous
+boundary cases.
+
+| Fixed-length list QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 13,032 bytes | 4,120 bytes |
+| D0 | 49,512 bytes | 7,232 bytes |
+| LP | 7,432 bytes | 3,828 bytes |
+
+For the build-only native probes, add `-d:wasmComponentFixedLists` and
+`-d:wasmComponentFixedListFirmware` to the firmware command below. The
+direct probe uses status prefix `0x57464C00`. Add
+`-d:wasmComponentFixedListIndirectFirmware` to build the indirect probe,
+which uses `0x57464900`. The LP probes cross-link with
+`-d:WasmLpNativeStackBytes=4608` and
+`--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608`. Physical validation
+remains pending.
+
+## Canonical context storage
+
+`-d:wasmComponentContext` enables the base `canon context.get` and
+`canon context.set` built-ins with an i32 cell at slot zero. Each
+synchronous entry and core start gets a zeroed cell. Post-return shares
+its entry's cell. Realloc and resource destructor calls get independent
+zeroed cells and restore any active caller's context when they return.
+The cell is private to the active synchronous call. Async suspension,
+explicit threads, and the optional i64 and second-slot extensions remain
+outside this execution profile. [Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#-canon-contextget)
+[Pinned concurrency model](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Concurrency.md#thread-local-storage)
+
+The host specification gate runs the upstream post-return context case
+and the synchronous recursive destructor case. Local tests also check
+cross-component calls, realloc while the caller is active, direct lifts
+of the built-ins, and invalid types or slots.
+
+`python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-context`
+checks the default feature gate and runs start, realloc, post-return
+and repeated-entry cases on all three QEMU profiles. M0 and D0 use a
+combined fixture. LP runs start and realloc separately from the
+upstream post-return fixture within its 16 KiB writable layout.
+
+| Context QEMU profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 14,960 bytes | 4,208 bytes |
+| D0 | 52,728 bytes | 7,216 bytes |
+| LP | 8,592 bytes | 4,236 bytes |
+
+The native probe uses `-d:wasmComponentContext` and
+`-d:wasmComponentContextFirmware` with the firmware command below.
+Its success status is `0x57435400`. For the LP post-return probe also
+add `-d:wasmComponentContextPostReturnFirmware` and expect
+`0x57435000`. LP builds use `-d:WasmLpNativeStackBytes=4608` and
+`--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608`. The native LP probes
+reserve 8,684 heap bytes, 92 more than the QEMU peak. Actual
+heap and stack margins still need to be measured on the Ox64.
+
+## Async callback lifts
+
+`-d:wasmComponentAsyncCallbacks` enables `async` function types, Canonical
+ABI callback lifts, `task.return`, and the context built-ins. Async function
+types retain their effect through typed linking. An async-typed function
+using the synchronous Canonical ABI can still complete in an ordinary call.
+[Pinned function types](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md#type-definitions)
+
+`beginCallback` prepares a root export or a named interface method for
+polling. Each `pollCallback` executes the entry or one callback turn. `YIELD`
+releases control with the guest stack unwound, and the invocation retains
+its own context for the next poll. `callbackResultReady` and
+`takeCallbackResult` expose `task.return` once, including when the callback
+thread continues after resolving. `EXIT` before resolution leaves the call
+unresolved. The callback entry and its callback function are checked against
+their core signatures before instantiation. Runtime return validation checks
+the result type, memory instance, and string encoding.
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-lift)
+
+The current host-polling profile runs each guest turn to completion. Async
+callback turns have no instruction budget, so this profile stays outside hard
+slots. `pollComponentTasks` advances one runnable guest subtask, including a
+callback that continues after returning its result.
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-callbacks
+for core in m0 d0 lp; do
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentCallbackFirmware \
+    --nimcache:build/wasm-component/callback/"$core"-cache \
+    --out:build/wasm-component/callback/"$core".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+The runner builds the interleaving fixture from WIT with `wasm-tools
+component embed` and `component new`, validates the binaries, and tests the
+opt-in gate. The host tests cover inline and indirect result tuples, a
+string result, an owned resource result with destructor dispatch, nested
+interface targeting, duplicate return, mismatched return type or options,
+invalid callback flags, and an unresolved exit. The pinned upstream cases
+cover async option validation and rejection of borrowed return types.
+
+| QEMU callback profile | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 14,752 bytes | 3,768 bytes |
+| D0 | 52,104 bytes | 6,608 bytes |
+| LP | 9,248 bytes | 3,372 bytes |
+
+The native LP probe reserves 392 bytes of `.data`, 2,212 bytes of `.bss`,
+9,684 bytes of heap, and a 4,096-byte stack. The probe publishes `0x57434100`
+at the scalar firmware status address on success. Physical Ox64 testing
+and native high-water measurements remain pending.
+
+### Guest subtasks and waitable sets
+
+The async option also enables async lowering, explicit backpressure,
+waitable-set new, poll and drop, waitable join, subtask drop, and callback
+`WAIT`. Before a callee starts, `STARTING` tells the caller to keep its
+argument area alive. The callee captures arguments when it starts and writes
+the canonical result area before announcing `RETURNED`. An immediate result
+uses the packed status directly. A suspended subtask uses the same handle
+namespace as resources and waitable sets. Guest subtasks are capped at four
+per LP component store and 32 per M0 or D0 store.
+[Pinned async lowering and subtask state](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-lower)
+
+The host suite tests the one-, 16-, and 17-lane result layouts and the
+4-, 5-, and 17-lane argument layouts in the upstream cross-ABI fixture.
+Two upstream assertions at lines 491 and 495 expect a return even though
+the lift specifies memory and `task.return` omits it. The gate excludes
+those assertions and retains the pinned `LiftOptions.equal` check.
+[Pinned ABI options](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canonical-abi-options)
+
+The M0 and D0 QEMU probes exercise result-buffer visibility, progress
+events, backpressure, handle reuse, and a callback that exits after returning
+a result. The LP QEMU probes use `--qemu-lp-subtasks-diagnostic` and 32 KiB
+of writable RAM. Both LP fixtures exceeded the standard 16 KiB layout. The
+same-component probe timed out during instantiation at 16 KiB. The separate
+WIT callback probe still passes on LP at 16 KiB.
+
+| QEMU subtask probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 cross-component | 37,864 bytes | 6,308 bytes |
+| D0 cross-component | 116,904 bytes | 9,168 bytes |
+| LP same-component, 32 KiB diagnostic | 11,040 bytes | 3,424 bytes |
+| LP cross-component, 32 KiB diagnostic | 15,208 bytes | 4,384 bytes |
+
+The LP native probe uses a memoryless same-component subtask. Use
+`-d:wasmComponentSubtasksFirmware` in the native build command above. It
+publishes `0x57535400` at the scalar firmware status address on success.
+Its 16 KiB link reserves 9,572 bytes of heap and 4,096 bytes of stack.
+LP subtask admission within that layout and physical Ox64 runs remain pending.
+
+### Callback subtask cancellation
+
+`subtask.cancel` releases a backpressured subtask without entering the callee
+or reading its arguments, returning `CANCELLED_BEFORE_STARTED`. A started
+callback receives `TASK_CANCELLED` once, ahead of any queued wait-set event.
+It can acknowledge with `task.cancel` or write a normal result with
+`task.return`. An async request that has not resolved returns `BLOCKED`.
+The caller can join the handle to a waitable set and collect its final status
+there. A subtask can be dropped after its terminal status has been delivered.
+[Pinned subtask cancellation](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-subtaskcancel)
+[Pinned cancellation acknowledgement](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-taskcancel)
+
+`tools/wasm_component_cancellation.wast` isolates these cases from APIs that
+require stackful execution. It covers queue reuse within a single guest
+turn, waking an empty wait set, delayed acknowledgement, targeted resumption,
+returning a value, a completed subtask whose result has yet to be delivered,
+and invalid cancellation. The runner assembles and validates the fixture with
+`wasm-tools --features=cm-more-async-builtins` and executes it with the
+project's interpreter. The QEMU options above also exercise cancellation.
+The LP diagnostic fixture tests both cancellation before start and
+delivery to a running callback.
+
+| QEMU cancellation probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 43,952 bytes | 6,372 bytes |
+| D0 | 124,304 bytes | 9,216 bytes |
+| LP, 32 KiB diagnostic | 17,656 bytes | 4,540 bytes |
+
+The LP cancellation probe exceeds the standard 16 KiB writable layout.
+Blocking `subtask.cancel` requires the stackful option below.
+
+### Stackful async lifts
+
+Enable `-d:wasmComponentAsyncCallbacks -d:wasmComponentStackful` for
+callback-free async lifts, blocking `waitable-set.wait`, `thread.yield`,
+and synchronous `subtask.cancel` that waits for acknowledgement. Drive the
+exports with `beginCallback` and `pollCallback`. A `ccsCoreWaiting` state
+keeps the thread's guest operands, frames, and locals in its arena. A
+completed host import supplies its return lanes exactly once. Multiple
+guest threads in one instance share the store while retaining their own
+stacks and context cells. A callback that blocks inside a core turn retains
+its exclusive reservation until the turn exits. Portable migration rejects
+continuations waiting on a host import.
+[Pinned Canonical ABI async lift](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-lift)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec \
+  --stackful --qemu-callbacks --qemu-lp-subtasks-diagnostic
+wasm-tools parse tools/wasm_host_suspend.wat -o build/wasm-component/host-suspend.wasm
+nim c -r --skipUserCfg --skipParentCfg --skipProjCfg --path:src \
+  --checks:on --assertions:on -d:wasmSuspendableHostCalls \
+  --out:build/wasm-component/host-suspend tools/test_wasm_host_suspend.nim \
+  build/wasm-component/host-suspend.wasm
+```
+
+The upstream startup cases verify the trap when a synchronous core start
+function tries to block. The M0 and D0 QEMU fixture drives two subtasks in a
+shared callee, waits for both sets of results, and waits for a cancellation
+acknowledgement after the target yields. The compact LP fixture suspends and
+resumes two calls with distinct locals and context cells in 16 KiB of writable
+RAM.
+
+| QEMU stackful probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 39,264 bytes | 7,512 bytes |
+| D0 | 118,616 bytes | 11,048 bytes |
+| LP, compact fixture | 7,824 bytes | 3,424 bytes |
+
+The native probe uses the compact fixture and reports `0x57534600` at the
+scalar build test's per-core status address. To build it after generating the
+fixtures above:
+
+```sh
+for core in m0 lp d0; do
+  link_flags=()
+  if [ "$core" = d0 ]; then link_flags=(-d:bl808D0Xip); fi
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentStackful \
+    -d:wasmComponentStackfulFirmware "${link_flags[@]}" \
+    --nimcache:build/wasm-component/stackful/"$core"-cache \
+    --out:build/wasm-component/stackful/"$core".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+nim c -d:bl808d0 -d:bl808kernel -d:bl808WasmFull \
+  -d:wasmComponentAsyncCallbacks -d:wasmComponentStackful \
+  -d:wasmComponentStackfulFirmware --passC:-flto \
+  '--passL:-flto -Wl,--undefined=trap_entry,--undefined=main,--undefined=memcpy' \
+  --nimcache:build/wasm-component/stackful/d0-lto-cache \
+  --out:build/wasm-component/stackful/d0-lto.elf \
+  examples/wasm_component_scalar_build_test.nim
+```
+
+The D0 DRAM probe links with LTO and reserves 92,392 bytes of heap and
+an 8 KiB stack. The larger QEMU test exceeds both reservations. The native
+LP image reserves 560 bytes of `.data`, 2,212 bytes of `.bss`,
+9,516 bytes of heap, and 4,096 bytes of stack. These are build results.
+Ox64 execution and D0's concurrent XIP mapping still need bench validation.
+
+### Synchronous lowering of async functions
+
+The stackful profile supports synchronous `canon lower` calls to async
+functions. The caller uses the synchronous ABI for its arguments and
+results. Backpressure delays lifting the caller's arguments until the
+callee starts. If the callee suspends, the caller waits on its own guest
+continuation. The callee publishes flat lanes or writes the caller's
+indirect result area as soon as it resolves. A synchronous lift runs
+`post-return` after writing the result. A callback can continue running
+after the caller has resumed. The synchronous caller receives no
+guest-visible subtask handle.
+[Pinned Canonical ABI lowering](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-lower)
+
+Async-typed exports using the synchronous lift ABI can be driven through
+`beginCallback` and `pollCallback`. The existing synchronous invocation API
+still requires the call to return directly. The upstream startup traps
+cover attempts to block during instantiation. The upstream subtask
+drop tests cover waiting inside an async-typed synchronous lift and
+rejecting premature drops.
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-sync-lower
+```
+
+The M0 and D0 fixtures cover flat results, indirect strings, deferred
+argument lifting, and `post-return` ordering. They also exercise a callback
+that waits on a stackful callee while an earlier queue entry needs the
+callback's exclusive lock. The memoryless LP fixture
+lifts the generated core import directly and checks suspension and flat
+result delivery in the standard 16 KiB writable layout. Smaller initial
+LP arenas grow on demand and let the fixture reserve a 5,120-byte stack.
+
+| QEMU synchronous lower probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 49,096 bytes | 7,584 bytes |
+| D0 | 133,272 bytes | 11,280 bytes |
+| LP, compact fixture | 8,096 bytes | 4,872 bytes |
+
+For the native probe, use `-d:wasmComponentSyncLowerFirmware` in place of
+`-d:wasmComponentStackfulFirmware` in the commands above. Add
+`-d:wasmComponentLocalReentry --passL:-Wl,--defsym=__bl808_lp_stack_bytes=5120`
+for LP. The compact probe links on M0, LP, D0 XIP and D0 DRAM with LTO.
+It reports `0x57534C00` at the scalar build test's status address.
+The LP link reserves 8,464 bytes of heap and a 5,120-byte stack. The larger
+D0 fixture exceeds the DRAM probe's heap and stack reservations in QEMU.
+
+### Borrowed resources across async calls
+
+Async calls use the existing nominal resource table and attach foreign
+borrow handles to the receiving task's scope. The scope survives callback
+turns and stackful waits. A borrowed handle may be dropped from another
+task in the same instance. A task traps if it tries to return or
+acknowledge cancellation while handles from its scope remain live.
+Reborrowing retains the source scope until the nested result is delivered.
+[Pinned Canonical ABI resource lifting](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#lifting)
+
+The caller starts lending when the callee reads the arguments. The loan
+stays active until terminal status is delivered through the packed
+return, the waitable event, or cancellation. A synchronous lower keeps
+the loan active through result delivery on its continuation. Cancelling
+before start leaves the arguments unread. Host-owned values borrowed
+through `beginCallback` stay pinned until the result is taken. The
+ARC lifetime test also covers callback abandonment with an outstanding
+reborrow, delivery by a separate task, and graph cleanup with pending
+internal loans.
+[Pinned subtask resolution](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#subtask-state)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-async-borrows
+```
+
+The M0 and D0 fixtures cover transitive loans, concurrent scopes, borrow
+delivery, and cancellation. LP's standard 16 KiB probe borrows a
+host-owned resource in its defining component. LP's cross-component
+fixture uses a 32 KiB diagnostic layout to exercise a foreign borrow
+handle and cancellation.
+
+| QEMU async borrow probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 67,328 bytes | 11,392 bytes |
+| D0 | 159,816 bytes | 16,848 bytes |
+| LP, resource in its defining component | 8,808 bytes | 3,424 bytes |
+| LP, cross-component, 32 KiB diagnostic | 19,424 bytes | 4,516 bytes |
+
+The compact native fixture links for M0, LP, D0 DRAM, and D0 XIP. Build the
+scalar probe with `-d:wasmComponentAsyncCallbacks -d:wasmComponentAsyncBorrowsFirmware`
+after running the fixture command above. It reports `0x57414200` at the
+per-core status address. The LP link reserves 9,572 bytes of heap and a
+4,096-byte stack. Ox64 execution remains pending.
+
+### Canonical ABI futures
+
+`-d:wasmComponentFutures` enables the pinned Canonical ABI's typed pairs,
+read and write, cancellation, drop, forwarding, and waitable delivery.
+Lifting moves an idle, unjoined reader out of its guest handle table.
+Lowering consumes the lifted value and installs a handle in the receiving
+guest. These moves work through synchronous calls, async task results,
+and compound values. Copies of a consumed host value stay invalid.
+Embeddings can release a lifted reader with `dropComponentFuture`.
+A same-instance rendezvous accepts unit and numeric payloads.
+Cross-instance delivery uses each endpoint's memory, encoding, realloc,
+and nominal resource bindings. Synchronous read and write require
+`-d:wasmComponentStackful`.
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-streamfuturereadwrite)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-futures
+```
+
+The host gate includes all ten assertions in upstream
+`future-completion-order.wast`, `futures-must-write.wast`, and
+`cross-task-future.wast`. Local tests cover blocking, forwarding,
+buffer and transfer-state validation, UTF-8 to UTF-16 delivery in both
+arrival orders, and an owned resource whose destructor runs in its
+defining component once the receiver drops it. The ARC test uses a
+WIT-generated component to check direct and tuple returns, consumed
+values, reader abandonment, and peer closure.
+
+The QEMU fixture parks a guest continuation on a synchronous future read.
+M0 and D0 start the producer via an asynchronous lowering. The LP probe
+starts it as a second callback to fit the standard 16 KiB budget.
+
+| QEMU future wait probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 19,504 bytes | 7,592 bytes |
+| D0 | 59,360 bytes | 11,240 bytes |
+| LP | 9,480 bytes | 3,488 bytes |
+
+The cross-component string transfer probe also runs on M0 and D0 QEMU.
+It measured 34,864 bytes peak heap and 9,408 bytes of native stack on
+M0, and 112,712 bytes of heap and 13,680 bytes of native stack on D0.
+The LP transfer probe moves a memoryless reader through the embedding
+and back into its guest with a write pending. It measured 9,168 bytes
+of heap and 3,688 bytes of native stack in the 16 KiB layout.
+
+Build the native scalar probe after generating both fixtures. Success
+reports `0x57465700` at the per-core status address.
+
+```sh
+for profile in m0 lp d0-dram d0-xip; do
+  core="${profile%%-*}"
+  link_flags=()
+  case "$profile" in
+    lp) link_flags=(-d:WasmLpNativeStackBytes=3968
+      --passL:-Wl,--defsym=__bl808_lp_stack_bytes=3968) ;;
+    d0-dram) link_flags=(--passC:-flto
+      '--passL:-flto -Wl,--undefined=trap_entry,--undefined=main,--undefined=memcpy,--defsym=__bl808_d0_stack_bytes=16384') ;;
+    d0-xip) link_flags=(-d:bl808D0Xip
+      --passL:-Wl,--defsym=__bl808_d0_stack_bytes=16384) ;;
+  esac
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentStackful \
+    -d:wasmComponentFutures -d:wasmComponentFutureWaitFirmware "${link_flags[@]}" \
+    --nimcache:build/wasm-component/future-wait/"$profile"-cache \
+    --out:build/wasm-component/future-wait/"$profile".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+All four firmware profiles cross-link. The LP link reserves 644 bytes of
+`.data`, 2,212 bytes of `.bss`, 9,560 bytes of heap, and 3,968 bytes of
+stack. D0 uses a 16 KiB stack reservation for this probe. Ox64 execution
+and concurrent XIP validation remain pending.
+
+### Canonical ABI streams
+
+`-d:wasmComponentStreams` enables the stream builtins and readable
+stream values independently of the future flag. Both use the same
+endpoint table, ownership transfers, and waitable sets. Stream events
+pack the total copied element count with the status. Several calls can
+drain a pending buffer before its owner takes the event. Taking the
+event releases the pending region. A peer drop takes precedence over
+cancellation and completion, while preserving any elements already
+copied. Zero-length readiness follows the Canonical ABI writer-first
+rule. Synchronous copies require `-d:wasmComponentStackful`.
+[Pinned stream and future state](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#stream-and-future-state)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-streams --qemu-futures
+```
+
+The stream gate runs the upstream partial copy, cancellation, closure,
+forwarding, ready-state, and transfer cases. Local tests cover the
+28-bit buffer count and status encoding. The WIT-generated fixture
+passes a lifted reader through direct and tuple results and checks
+stale handle rejection. The M0 and D0 QEMU probes verify byte order and
+waitable progress on a partially drained buffer. The LP fixture uses
+a unit stream and cancels a partially drained write.
+
+| QEMU stream probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 24,760 bytes | 4,416 bytes |
+| D0 | 66,992 bytes | 7,408 bytes |
+| LP | 8,712 bytes | 3,488 bytes |
+
+Unit and numeric buffers support the Canonical ABI count encoding.
+Compound transfers use the existing canonical value and byte budgets,
+and overlapping same-instance numeric copies preserve source order.
+The runtime rejects same-instance nonnumeric rendezvous and
+`stream<char>` under the pinned revision's restrictions.
+
+Build the native scalar probe after generating the fixtures with the
+suite above. The unit-stream success code is `0x57535200`.
+
+```sh
+for profile in m0 lp d0-dram d0-xip; do
+  core="${profile%%-*}"
+  link_flags=()
+  case "$profile" in
+    lp) link_flags=(-d:WasmLpNativeStackBytes=3968
+      --passL:-Wl,--defsym=__bl808_lp_stack_bytes=3968) ;;
+    d0-dram) link_flags=(--passC:-flto
+      '--passL:-flto -Wl,--undefined=trap_entry,--undefined=main,--undefined=memcpy') ;;
+    d0-xip) link_flags=(-d:bl808D0Xip) ;;
+  esac
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentStreams \
+    -d:wasmComponentStreamFirmware "${link_flags[@]}" \
+    --nimcache:build/wasm-component/stream/"$profile"-cache \
+    --out:build/wasm-component/stream/"$profile".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+The four firmware profiles cross-link. The LP image reserves
+532 bytes of `.data`, 2,212 bytes of `.bss`, 9,672 bytes of
+heap, and 3,968 bytes of native stack. Ox64 execution is pending.
+
+### Host-owned endpoints
+
+`-d:wasmComponentHostEndpoints` adds an embedding API for the enabled
+future and stream types. `newComponentEndpointPair` creates a readable
+value and a host writer. The embedding can declare a unit or primitive
+payload or derive the full payload type from an export parameter or
+result. `hostEndpoint` exposes a readable value to the same host API,
+including values lifted from guest functions. The writer stays with the
+embedding. Passing the reader to a guest consumes the host handle.
+
+Host reads and writes use the same rendezvous, cancellation, and
+waitable rules as guest copies. `readComponentEndpoint`,
+`writeComponentEndpoint`, and `writeComponentUnits` return immediately
+and share the component store's cooperative execution thread. A pending
+copy holds its buffer until `pollComponentEndpoint` delivers its event
+or `cancelComponentEndpoint` cancels it.
+Write results return the unused suffix after partial completion,
+cancellation, or a peer drop. Submitting owned payloads consumes their
+original handles. If guest lowering traps, the runtime locks the guest
+store and rolls back the handles allocated by that copy so the
+embedding can recover its unsent values. The guest memory in that
+store may contain partial writes.
+[Pinned Canonical ABI buffer state](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#buffer-state)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec --qemu-host-endpoints
+```
+
+The host suite checks typed delivery in both directions, a guest
+continuation resumed by a host write, waitable events, zero-length
+readiness, cancellation and retry of resource payloads, nested
+endpoint ownership, and recovery after a guest realloc trap. The QEMU
+probe starts a host-owned unit write and drains it with two guest
+reads. It uses the standard LP RAM layout.
+
+| QEMU host-owned unit stream | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 11,840 bytes | 4,104 bytes |
+| D0 | 48,008 bytes | 7,280 bytes |
+| LP | 6,152 bytes | 3,488 bytes |
+
+The same probe can be cross-linked with the native scalar fixture.
+It reports `0x57484500` on success.
+
+```sh
+for profile in m0 lp d0-dram d0-xip; do
+  core="${profile%%-*}"
+  link_flags=()
+  case "$profile" in
+    lp) link_flags=(-d:WasmLpNativeStackBytes=3968
+      --passL:-Wl,--defsym=__bl808_lp_stack_bytes=3968) ;;
+    d0-dram) link_flags=(--passC:-flto
+      '--passL:-flto -Wl,--undefined=trap_entry,--undefined=main,--undefined=memcpy') ;;
+    d0-xip) link_flags=(-d:bl808D0Xip) ;;
+  esac
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentStreams \
+    -d:wasmComponentHostEndpoints -d:wasmComponentHostEndpointFirmware "${link_flags[@]}" \
+    --nimcache:build/wasm-component/host-endpoint/"$profile"-cache \
+    --out:build/wasm-component/host-endpoint/"$profile".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+The M0, LP, D0 DRAM, and D0 XIP firmware profiles cross-link.
+The LP image reserves 532 bytes of `.data`, 2,212 bytes of `.bss`,
+9,672 bytes of heap, and 3,968 bytes of native stack. Ox64 execution
+remains pending.
+
+### Cooperative guest threads
+
+`-d:wasmComponentThreads` extends the stackful profile with
+`thread.index`, `thread.new-indirect`, `thread.resume-later`, and
+the suspend, resume, and promote operations for guest continuations.
+Each explicit thread starts suspended and uses a private interpreter
+arena on its component's core. The scheduler runs an immediate switch
+after saving the current guest frames. A thread may resolve its task
+after the implicit entry has exited. The i32 context slots are private
+to each thread.
+[Pinned Canonical ABI threads](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#threads)
+
+The thread registry is bounded to 3 entries on LP and 32 elsewhere.
+Indices belong to the current component instance. An exhausted
+explicit creation returns `-1`. Invalid table entries, unassigned
+indices, and attempts to switch to the current thread trap. The local fixture
+tests both a parent-child handoff and task resolution by a queued
+worker. The upstream selection covers ready-callback promotion and
+cancellation during a switch.
+
+A synchronous lift drives ready threads in its own component instance
+until its implicit thread returns. The lift traps if it is still waiting
+and that instance has no ready threads. The worker's continuation can
+complete a nested synchronous lower, waitable, future, stream, or subtask
+cancellation. Guest resource destructors use the same scheduling rule
+with a fresh thread and zeroed context slots. The pinned tests exercise
+these operations, callback-exclusive resumption, and sibling isolation.
+[Pinned Canonical ABI synchronous lift](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#canon-lift)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec \
+  --qemu-guest-threads --host-endpoints
+```
+
+The run passes 1,196 host checks from the pinned corpus and local fixtures.
+The memoryless target probes run sequentially. One exits its implicit
+thread and uses `pollComponentTasks` to deliver the queued worker's result.
+The other yields from a synchronous export and returns the value written
+by its worker. Each probe loads a separate module to fit LP's decode budget.
+
+| QEMU guest thread probe | Peak heap | Peak native stack |
+| --- | ---: | ---: |
+| M0 | 14,776 bytes | 4,308 bytes |
+| D0 | 52,712 bytes | 6,720 bytes |
+| LP | 9,232 bytes | 3,476 bytes |
+
+The corresponding firmware probe reports `0x57544800` on success.
+
+```sh
+for profile in m0 lp d0-dram d0-xip; do
+  core="${profile%%-*}"
+  link_flags=()
+  case "$profile" in
+    d0-dram) link_flags=(--passC:-flto
+      '--passL:-flto -Wl,--undefined=trap_entry,--undefined=main,--undefined=memcpy') ;;
+    d0-xip) link_flags=(-d:bl808D0Xip) ;;
+  esac
+  nim c -d:bl808"$core" -d:bl808kernel -d:bl808WasmFull \
+    -d:wasmComponentAsyncCallbacks -d:wasmComponentStackful \
+    -d:wasmComponentThreads -d:wasmComponentGuestThreadsFirmware "${link_flags[@]}" \
+    --nimcache:build/wasm-component/guest-threads/"$profile"-cache \
+    --out:build/wasm-component/guest-threads/"$profile".elf \
+    examples/wasm_component_scalar_build_test.nim
+done
+```
+
+The M0, LP, D0 DRAM, and D0 XIP profiles cross-link. The LP firmware
+reserves 644 bytes of `.data`, 2,212 bytes of `.bss`, 9,432 bytes of
+heap, and 4,096 bytes of native stack. Ox64 execution remains pending.
+
+### Cooperative phase-two spawning
+
+`-d:wasmComponentThreadSpawn` adds cooperative `thread.spawn-ref` and
+`thread.available-parallelism` to the existing guest-thread scheduler. It
+requires `-d:wasmFunctionReferences` and the guest-thread flags above.
+The spawn import has a nullable reference to the declared core entry type.
+It queues the worker on the current component's core and passes it the
+i32 closure argument. The registry traps on spawn capacity exhaustion.
+`thread.available-parallelism` returns one for this cooperative profile.
+[Pinned Canonical ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#-canon-threadspawn-ref)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec \
+  --qemu-thread-spawn --error-context --host-endpoints
+```
+
+The fixture uses toolchain-generated core and component sections and emits
+the pinned sharedness immediates in the canonical section. `wasm-tools
+1.263.0` uses an earlier spelling and binary encoding for these operations.
+The runner validates the embedded core module with that tool before
+running the pinned component. The tests cover deferred execution, closure
+delivery, null and capacity traps, and rejection of a legacy encoding,
+invalid sharedness, an unknown type, and an erased `funcref` import.
+[Pinned binary format](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md)
+
+Both fixtures run sequentially on each QEMU profile. The combined fixture
+exceeded the LP heap, so spawning and parallelism use separate component
+instances within the same 16 KiB writable layout.
+
+| QEMU profile | Peak heap | Native stack used |
+| --- | ---: | ---: |
+| M0 RV32 | 13,632 B | 4,456 B |
+| D0 RV64 | 50,904 B | 7,408 B |
+| LP RV32E | 8,128 B | 3,792 B |
+
+`thread.spawn-indirect` requires a shared core table. Its cooperative form
+also requires an unshared element heap type, while the pinned core draft
+requires a shared heap type in a shared table. The preemptive form requires
+a preemptive execution backend. The interpreter gates both forms and
+shared `thread.spawn-ref`. The host fixture exercises rejection of an
+ordinary `funcref` table.
+[Pinned table requirement](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#-canon-threadspawn-indirect)
+
+The opt-in core interpreter supports shared function types, tables, and
+globals. The Component Model host gate checks a core module type ascription,
+links an explicitly initialized shared table and typed shared globals to
+a second core module, and calls both references through a Canonical ABI lift.
+The lifted call also updates an imported shared integer with an atomic add
+and atomically loads a provider-initialized byte from an imported shared memory.
+Enable this check with
+`--shared-core-types` on `tools/run_wasm_component_spec.py`.
+[Shared core function types, tables, and globals](wasm_full_baseline.md#shared-core-function-types-tables-and-globals)
+
+The `--atomic-wait` baseline gate validates a component that imports shared
+core memory and starts a sibling with `canon thread.new-indirect` and
+`canon thread.resume-later`. The first guest thread parks in
+`memory.atomic.wait32`. The sibling writes a result and notifies the waiter
+through that memory. The lifted call returns 42 after the first guest
+resumes. Both threads execute in the existing cooperative component
+scheduler.
+[Atomic wait gate](wasm_full_baseline.md#cooperative-atomic-wait-and-notify)
+
+For the native probe, add `-d:wasmFunctionReferences
+-d:wasmComponentThreadSpawn` to the guest-thread build commands and use
+`-d:wasmComponentThreadSpawnFirmware` in place of
+`-d:wasmComponentGuestThreadsFirmware`. The probe reports `0x57535000` on
+success at the existing Component Model status address. D0 DRAM uses the
+link-time optimization flags above and reserves 62,432 bytes of heap.
+The LP image reserves 644 bytes of `.data`, 2,212 bytes of `.bss`,
+9,432 bytes of heap, and 4,096 bytes of stack. Physical Ox64 execution
+remains pending.
+
+Native stacks and host wait closures are
+core-local. Live Component Model migration needs a portable representation
+of the guest continuations and their resources.
+[Pinned binary format](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/Binary.md)
+
+## Error contexts
+
+`-d:wasmComponentErrorContext` enables the `error-context` WIT type and the
+three canonical builtins. The guest sees a bounded i32 handle in the
+instance's canonical handle table. Lifting an error context preserves the
+source handle. Lowering creates a handle in the destination that refers to
+the same immutable value. Resource, waitable, and error-context handle kinds
+are checked independently. Closing an instance releases its handles.
+
+The default error-context policy discards guest debug messages at creation,
+as permitted by the pinned Canonical ABI. With
+`-d:wasmComponentErrorContextMessages`, the VM reads, validates, and retains
+the guest message using the selected canonical string encoding and the
+existing string limits. Host code can construct an error context with
+`componentErrorContext` and inspect it with `componentErrorContextMessage`.
+The debug-message builtin validates its memory32 return area before calling
+canonical `realloc` to write the encoded string.
+[Pinned error-context ABI](https://github.com/WebAssembly/component-model/blob/585526aa1f2c7f76f07557d16e265dede38b3acb/design/mvp/CanonicalABI.md#-canon-error-contextnew)
+
+```sh
+python3 tools/run_wasm_component_spec.py build/wasm-component/spec \
+  --qemu-error-context --guest-threads --host-endpoints
+```
+
+The command checks feature gating and invalid canonical options,
+builds a component from WIT, and checks host values, records, inter-component
+calls, typed futures, invalid handles, and handle capacity. The QEMU fixture
+runs all three builtins as directly lifted exports using one resident
+512-byte memory chunk. Its LP profile reserves 4,608 bytes of native stack
+within the 16 KiB writable layout.
+
+| QEMU CPU profile | Peak heap | Native stack used |
+| --- | ---: | ---: |
+| M0 | 14,232 bytes | 4,496 bytes |
+| D0 | 51,392 bytes | 7,744 bytes |
+| LP | 8,752 bytes | 4,536 bytes |
+
+The native probe is `examples/wasm_component_scalar_build_test.nim` with
+`-d:bl808kernel -d:bl808WasmFull -d:wasmChunkedMemory
+-d:WasmMemoryChunkBytesConfig=512 -d:wasmComponentErrorContext
+-d:wasmComponentErrorContextFirmware`. For LP use
+`-d:WasmLpNativeStackBytes=4608` and
+`--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608`. It cross-links
+with 364 bytes of `.data`, 2,212 bytes of `.bss`, and 9,200 bytes
+of heap on LP. The probe reports `0x57454300` on success. Device
+execution and device high-water measurements remain pending.
 
 ## WIT-generated fixtures and target coverage
 
@@ -390,7 +1359,7 @@ and invalid alignment. A separate regression reenters the interpreter from a
 host call and forces both the value and locals arenas to grow before returning.
 The component graph test shares a memory, a global, a table and functions on
 the host and the M0 and D0 QEMU targets. The LP fixture links two modules
-around one shared linear memory, using the same linker and interpreter. This
+that use the same memory instance, using the same linker and interpreter. This
 smaller fixture passed in QEMU within LP's 16 KiB writable budget.
 
 The core-module gate executes a host-supplied module on all three QEMU
@@ -633,7 +1602,7 @@ The latest LP QEMU fixtures measured these heap and stack peaks within the
 | LP QEMU fixture | Peak heap | Peak stack | Stack reserved |
 | --- | ---: | ---: | ---: |
 | `option<string>` | 9,080 | 4,148 | 4,224 |
-| Two core modules with shared linear memory | 6,864 | 3,624 | 4,096 |
+| Two core modules using one memory instance | 6,864 | 3,624 | 4,096 |
 | Scalar record | 9,104 | 3,732 | 4,096 |
 
 The M0 and D0 QEMU tests run the pinned upstream nested Boolean case. The
@@ -696,13 +1665,13 @@ local resources without an actual resource export.
 
 | Instance type equality QEMU fixture | Peak heap | Peak stack | Stack reserved |
 | --- | ---: | ---: | ---: |
-| M0, typed relay | 22,296 | 4,752 | 16,384 |
-| D0, typed relay | 65,944 | 8,192 | 16,384 |
-| LP, type argument | 6,880 | 3,984 | 4,096 |
+| M0, typed relay | 22,920 | 5,128 | 16,384 |
+| D0, typed relay | 67,440 | 8,784 | 16,384 |
+| LP, type argument | 6,896 | 4,080 | 4,608 |
 
-The LP fixture stayed within the 16 KiB layout with 112 bytes of stack
-headroom. The D0 fixture reached the size of the default firmware stack in
-the emulator, which reserved 16 KiB for this run.
+The LP fixture stayed within the 16 KiB layout with 528 bytes of stack
+headroom. The D0 fixture exceeded the default firmware stack size in
+QEMU, which reserved 16 KiB for this run.
 
 `python3 tools/run_wasm_component.py --qemu-contract-capture` tests a typed
 component bound to an enclosing resource. M0 and D0 run a guest borrow,
@@ -767,8 +1736,8 @@ for core in m0 d0 lp; do
 done
 ```
 
-The latest LP string-result firmware link has 392 bytes `.data`, 2,728 bytes
-`.bss`, 9,168 bytes of heap and a 4,096-byte stack in its 16 KiB writable
+The latest LP string-result firmware link has 336 bytes `.data`, 2,728 bytes
+`.bss`, 9,224 bytes of heap and a 4,096-byte stack in its 16 KiB writable
 region. The string
 firmware entry writes status `0x57435200` after both greetings. The record
 entry writes `0x57524300` after both exports.

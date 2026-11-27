@@ -14,22 +14,35 @@ var trace: seq[string]
 var tick: uint64
 var timerPending, allowSleep: bool
 var interruptEnables: int
-template withInterruptsDisabled(body: untyped) = body
+var interruptsDisabled: bool
+template withInterruptsDisabled(body: untyped) =
+  block:
+    let saved = interruptsDisabled
+    interruptsDisabled = true
+    try:
+      body
+    finally:
+      interruptsDisabled = saved
 proc enableInterrupts() = inc interruptEnables
 proc drainIsrCompletions() = discard
 proc isrBridgePendingCompletions(): int = 0
 proc readTick(): uint64 = tick
 proc reprogramNextDeadline(s: Scheduler) = discard
+proc runPriorityCallback(s: var Scheduler; earlyOnly: static bool)
 proc fireExpiredTimers(s: var Scheduler) =
   if timerPending and tick >= 1:
     timerPending = false
     trace.add("timer")
+    s.priorityRan = false
+    s.runPriorityCallback(earlyOnly = true)
 proc faultCheckStackGuard(): bool = true
 const FaultReasonStackGuard = 0
 proc faultHalt(reason: int; a, b, c: uint) = doAssert false
 var timerIsrFired = false
 proc wfi() =
-  doAssert allowSleep and scheduler.ready.len == 0
+  # The final ready check and WFI must share one masked interval. Otherwise
+  # a timer can fire and clear its compare between them, then WFI can sleep.
+  doAssert interruptsDisabled and allowSleep and scheduler.ready.len == 0
   raise newException(StopScheduler, "idle")
 '''
 
@@ -95,6 +108,54 @@ doAssert trace == @["first", "poll", "timer"] and scheduler.ready.len == 1
 pollScheduler()
 doAssert trace == @["first", "poll", "timer", "second", "poll"]
 doAssert scheduler.totalTicks == 2 and interruptEnables == 0
+
+# Priority work posted by a callback can run before the next ready callback.
+# A repeat post coalesces, and a self-repost leaves room for ordinary work.
+scheduler = default(Scheduler)
+schedulerPollHooks = @[]
+trace.setLen(0)
+var priorityRuns = 0
+proc eligible(): bool = true
+proc other() = doAssert false
+proc priority() =
+  doAssert not interruptsDisabled
+  trace.add("priority")
+  inc priorityRuns
+  if priorityRuns < 3:
+    withInterruptsDisabled:
+      doAssert tryPostPriorityFromIsr(priority, eligible)
+post(proc() =
+  trace.add("first")
+  withInterruptsDisabled:
+    doAssert tryPostPriorityFromIsr(priority, eligible)
+    doAssert tryPostPriorityFromIsr(priority, eligible)
+    doAssert not tryPostPriorityFromIsr(other, eligible))
+post(proc() = trace.add("second"))
+pollScheduler()
+doAssert trace == @["first", "priority", "second", "priority"]
+doAssert scheduler.priorityCallback != nil and scheduler.totalCallbacks == 4
+allowSleep = true
+runUntilStopped()
+doAssert trace == @["first", "priority", "second", "priority", "priority"]
+doAssert scheduler.totalCallbacks == 5
+
+# The priority slot alone must keep the core awake across a self-repost.
+scheduler = default(Scheduler)
+trace.setLen(0)
+priorityRuns = 1
+withInterruptsDisabled:
+  doAssert tryPostPriorityFromIsr(priority, eligible)
+runUntilStopped()
+doAssert trace == @["priority", "priority"] and scheduler.totalTicks == 2
+
+# A wake that is not urgent runs after the ready batch, even with no timer.
+trace.setLen(0)
+proc regular() = trace.add("regular")
+post(proc() = trace.add("ready"))
+withInterruptsDisabled:
+  doAssert tryPostPriorityFromIsr(regular, nil)
+pollScheduler()
+doAssert trace == @["ready", "regular"]
 '''
 
 
@@ -103,7 +164,8 @@ def test_scheduler_ready_batches_preserve_hook_and_timer_progress(tmp_path: Path
     sched = (ROOT / "src/bl808/kernel/sched.nim").read_text()
     code = sched[sched.index("const\n"):sched.index("# ===", sched.index("proc addSchedulerTimedPollHook*"))]
     code += PLATFORM
-    for name in ("post", "postFromIsr", "drainIsrPending", "runReadyCallbacks",
+    for name in ("post", "tryPostFromIsr", "postFromIsr", "tryPostPriorityFromIsr",
+                 "drainIsrPending", "runPriorityCallback", "runReadyCallbacks",
                  "runPollHooks", "runTimedPollHooks", "hasUntimedPollHooks",
                  "hasDueTimedPollHooks", "runSchedulerIteration", "pollScheduler",
                  "runScheduler"):

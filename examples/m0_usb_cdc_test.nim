@@ -2,7 +2,7 @@
 ##
 ## QEMU auto-enumerates the device and provides bulk data loopback.
 ##
-## Build: nim c -d:bl808m0 -d:bl808kernel examples/m0_usb_cdc_test.nim
+## QEMU build: nim c -d:bl808m0 -d:bl808kernel -d:bl808UsbPioModel examples/m0_usb_cdc_test.nim
 ## Run:
 ##   qemu-system-riscv32 -M bl808 -nographic \
 ##     -icount shift=0,align=off,sleep=on \

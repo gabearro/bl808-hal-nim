@@ -41,6 +41,7 @@ proc hal_machw_gen_handler() =
 proc bl_irq_handler() =
   doAssert (irqState and 8) == 0
   handlers.add("ipc")
+proc vendorNotifyWork() = discard
 proc setup(enabled: bool) =
   irqState = 0xA5A50000'u32 or (if enabled: 8'u32 else: 0'u32)
   saves = 0

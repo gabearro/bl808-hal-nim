@@ -18,7 +18,7 @@ proc expectInvalid(data: seq[byte]) =
   doAssert rejected
 
 proc main() =
-  doAssert paramCount() == 179
+  doAssert paramCount() == 180
   let bytes = cast[seq[byte]](readFile(paramStr(1)))
   let plan = decodeComponent(bytes)
   doAssert plan.exports.len == 3
@@ -1190,6 +1190,7 @@ proc main() =
     doAssert false, "accepted a typed core tag with the wrong payload"
   except ComponentError as error:
     doAssert "core module export type mismatch: t" in error.msg, error.msg
+  doAssert checkNameAttributes(cast[seq[byte]](readFile(paramStr(180))))
   echo "component scalar ABI:ok"
 
 main()

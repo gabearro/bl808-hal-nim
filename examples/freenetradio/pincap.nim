@@ -28,7 +28,27 @@
 ## Firmware only.
 
 import bl808/[dma, gpio, core, mmio, i2s, timer, irq]
+import bl808/dmablock
 import bl808/kernel/cps
+when defined(radioDiag):
+  import bl808/wifi
+  import bl808/wifi/wpa2_pmk
+  import bl808/kernel/sched
+  proc bl808_wifi_backend_phase_timing_snapshot(
+      snapshot: ptr array[11, uint32]) {.importc, cdecl.}
+  proc bl808_wifi_backend_phase_timing_reset() {.importc, cdecl.}
+  proc bl808_wifi_backend_drain_timing_snapshot(
+      snapshot: ptr array[6, uint32]) {.importc, cdecl.}
+  proc bl808_wifi_backend_drain_timing_reset() {.importc, cdecl.}
+  proc bl808_wifi_backend_cps_compat_counts(
+      snapshot: ptr array[3, uint32]) {.importc, cdecl.}
+  proc bl808_wifi_backend_cps_compat_reset() {.importc, cdecl.}
+  proc wifi_fw_main_phase_snapshot(
+      snapshot: ptr array[4, uint32]) {.importc, cdecl.}
+  proc wifi_fw_event_timing_snapshot(
+      snapshot: ptr array[5, uint32]) {.importc, cdecl.}
+  proc wifi_fw_sta_add_phase_snapshot(
+      snapshot: ptr array[4, uint32]) {.importc, cdecl.}
 import ./board, ./text, ./timebase, ./i2s_out, ./i2s_ring, ./httpd, ./diag
 
 const
@@ -110,7 +130,6 @@ proc setUp(): bool =
       nextLli = (if i + 1 < Items: cast[uint32](addr cap.lli[i + 1]) else: 0),
       srcBurst = burst1, dstBurst = burst1)
   dcacheCleanRange(cast[uint](cap.lli), sizeof(cap.lli[]).uint)
-  cap.dma = initDma(dma0)
   for pin in [I2sBclkPin, I2sFsPin, I2sDoPin, OledSclkPin, OledSdinPin, OledCsPin,
               OledDcPin, OledResPin]:
     watch(pin)
@@ -610,6 +629,180 @@ proc sliceReport(t: var Text[960]) =
   t.add " s\n"
 
 proc route(isPost: bool; path: openArray[char]; t: var Text[960]; blob: var Chunk): bool {.nimcall.} =
+  when defined(radioDiag):
+    if path.has("/selftest/cpu"):
+      if isPost:
+        schedulerCpuTimingReset()
+      let cpu = schedulerCpuTimingSnapshot()
+      t.add "window-us "
+      t.addInt cpu.elapsedUs
+      t.add " wfi-us "
+      t.addInt cpu.wfiUs
+      t.add " wfi-calls "
+      t.addInt cpu.wfiCalls
+      t.add '\n'
+      t.add "wfi-permille "
+      t.addInt min(cpu.wfiUs, cpu.elapsedUs) * 1000 div max(cpu.elapsedUs, 1'u64)
+      t.add '\n'
+      return true
+    if path.has("/selftest/wifi-pmk"):
+      let pmk = wpa2PmkTimingSnapshot()
+      t.add "slices "
+      t.addInt pmk.slices
+      t.add " max-slice-us "
+      t.addInt pmk.maxSliceUs
+      t.add '\n'
+      t.add "prepared-hits "
+      t.addInt pmk.preparedHits
+      t.add " fallback-calls "
+      t.addInt pmk.fallbackCalls
+      t.add '\n'
+      return true
+    if path.has("/selftest/wifi-main"):
+      var phases: array[4, uint32]
+      var event: array[5, uint32]
+      var staAdd: array[4, uint32]
+      wifi_fw_main_phase_snapshot(addr phases)
+      wifi_fw_event_timing_snapshot(addr event)
+      wifi_fw_sta_add_phase_snapshot(addr staAdd)
+      const names = ["control", "sleep", "wait", "dispatch"]
+      for i in 0 ..< phases.len:
+        t.add names[i]
+        t.add ' '
+        t.addInt phases[i]
+        t.add '\n'
+      t.add "event-index "
+      t.addInt event[0]
+      t.add " event-us "
+      t.addInt event[1]
+      t.add '\n'
+      t.add "message-id "
+      t.addInt event[2]
+      t.add " destination "
+      t.addInt event[3]
+      t.add " message-us "
+      t.addInt event[4]
+      t.add '\n'
+      const staNames = ["key-plan", "register", "hardware-address", "key-setup"]
+      for i in 0 ..< staAdd.len:
+        t.add staNames[i]
+        t.add ' '
+        t.addInt staAdd[i]
+        t.add '\n'
+      return true
+    if path.has("/selftest/wifi-compat"):
+      if isPost:
+        bl808_wifi_backend_cps_compat_reset()
+      var counts: array[3, uint32]
+      bl808_wifi_backend_cps_compat_counts(addr counts)
+      t.add "nested-wait-polls "
+      t.addInt counts[0]
+      t.add " sleep-polls "
+      t.addInt counts[1]
+      t.add " legacy-poll-calls "
+      t.addInt counts[2]
+      t.add '\n'
+      return true
+    if path.has("/selftest/wifi-drain"):
+      if isPost:
+        bl808_wifi_backend_drain_timing_reset()
+      var drain: array[6, uint32]
+      bl808_wifi_backend_drain_timing_snapshot(addr drain)
+      const names = ["irq", "firmware", "host", "step", "total", "steps"]
+      for i in 0 ..< drain.len:
+        t.add names[i]
+        t.add ' '
+        t.addInt drain[i]
+        t.add '\n'
+      return true
+    if path.has("/selftest/audio-sched"):
+      if isPost:
+        stats.audioYieldWaitMaxUs = 0
+        stats.audioSleepOvershootMaxUs = 0
+        stats.audioYieldWaitOver15ms = 0
+        stats.audioSleepOver15ms = 0
+      t.add "yield-wait-us "
+      t.addInt stats.audioYieldWaitMaxUs
+      t.add " over-15ms "
+      t.addInt stats.audioYieldWaitOver15ms
+      t.add '\n'
+      t.add "sleep-overshoot-us "
+      t.addInt stats.audioSleepOvershootMaxUs
+      t.add " over-15ms "
+      t.addInt stats.audioSleepOver15ms
+      t.add '\n'
+      return true
+    if path.has("/selftest/wifi-phases"):
+      if isPost:
+        bl808_wifi_backend_phase_timing_reset()
+      var phaseUs: array[11, uint32]
+      bl808_wifi_backend_phase_timing_snapshot(addr phaseUs)
+      const names = ["emb", "mac", "main", "scheduled", "mgmr", "host",
+                     "timer", "events", "delayed", "pending", "poll"]
+      for i in 0 ..< phaseUs.len:
+        t.add names[i]
+        t.add ' '
+        t.addInt phaseUs[i]
+        t.add '\n'
+      return true
+    if path.has("/selftest/wifi-sched"):
+      if isPost:
+        wifiServiceTimingReset()
+      let s = wifiServiceTimingSnapshot()
+      t.add "callbacks "
+      t.addInt s.callbacks
+      t.add " full-budget "
+      t.addInt s.fullBudgetCallbacks
+      t.add " over-15ms "
+      t.addInt s.slowCallbacks
+      t.add '\n'
+      t.add "max rounds "
+      t.addInt s.maxRounds
+      t.add " callback-us "
+      t.addInt s.maxCallbackUs
+      t.add " backend-us "
+      t.addInt s.maxBackendUs
+      t.add " tx-us "
+      t.addInt s.maxTxUs
+      t.add " completion-us "
+      t.addInt s.maxCompletionUs
+      t.add '\n'
+      t.add "total callback-us "
+      t.addInt s.totalCallbackUs
+      t.add " backend-us "
+      t.addInt s.totalBackendUs
+      t.add '\n'
+      return true
+    if path.has("/selftest/scheduler"):
+      if isPost:
+        schedulerTimingReset()
+      let s = schedulerTimingSnapshot()
+      t.add "iteration-us "
+      t.addInt s.maxIterationUs
+      t.add " long-iterations "
+      t.addInt s.longIterations
+      t.add " batch-us "
+      t.addInt s.maxReadyBatchUs
+      t.add " batch-len "
+      t.addInt s.maxReadyBatchLen
+      t.add '\n'
+      t.add "ready-us "
+      t.addInt s.maxReadyCallbackUs
+      t.add " timer-us "
+      t.addInt s.maxTimerCallbackUs
+      t.add " poll-us "
+      t.addInt s.maxPollHookUs
+      t.add " timed-us "
+      t.addInt s.maxTimedHookUs
+      t.add '\n'
+      t.add "timer-late-us "
+      t.addInt s.maxTimerLatenessUs
+      t.add " late-over-15ms "
+      t.addInt s.lateTimersOver15ms
+      t.add " between-iterations-us "
+      t.addInt s.maxBetweenIterationsUs
+      t.add '\n'
+      return true
   if path.has("/selftest/profile"):
     if isPost:
       t.add (if profileStart(circular = path.has("stall")): "profiling\n"
@@ -693,4 +886,7 @@ proc route(isPost: bool; path: openArray[char]; t: var Text[960]; blob: var Chun
   true
 
 proc pincapInit*() =
+  cap.dma = openCoreDma()
+  let channel = cap.dma.reserveChannel(Channel)
+  doAssert channel == Channel
   diagExtra = route

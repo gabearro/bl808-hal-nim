@@ -109,7 +109,23 @@ The first build takes a few minutes (it compiles lwIP, the Wi-Fi stack and Mbed 
 
 `bl808WifiApp` selects the linker profile for a Wi-Fi application (`src/linker/bl808_m0_wifi_app.ld`): a 1 MB heap in PSRAM, and the zero-initialised globals of every module in this directory in PSRAM too, which leaves the 64 KB of on-chip RAM to the HAL, Wi-Fi, lwIP and the stack. `bl808WifiHttpServer` stays: the Wi-Fi code keys its own RAM placement on it. The two `HwValidationLog*` defines move a log buffer out of the nearly full on-chip RAM. `freenetradio.nims`, which Nim reads by itself, sets lwIP's TCP receive window to 10 KB (`TCP_WND` is a C setting and has no Nim define). The build needs `gzip` and `od` on the build machine (the web page is compressed at compile time).
 
-Options:
+### Optional D0 MP3 decoder
+
+On an Ox64 dedicated to FreeNetRadio, the D0 worker can decode MP3 while M0
+services Wi-Fi and the display. Build the RAM-linked worker from the repository
+root.
+
+```sh
+nim c -d:bl808kernel -d:bl808d0 --out:build/freenetradio-d0.elf \
+  examples/freenetradio/d0_mp3_worker.nim
+riscv64-unknown-elf-objcopy -O binary build/freenetradio-d0.elf build/freenetradio-d0.bin
+```
+
+Add `-d:radioD0Mp3Image="$PWD/build/freenetradio-d0.bin"` to the M0 build above.
+The M0 image includes the worker and starts it in D0 RAM. The worker uses fused
+floating-point operations. If D0 stops responding, M0 resumes decoding locally.
+
+### Other build options
 
 | Define | Effect |
 |---|---|
@@ -128,9 +144,13 @@ Measured with `riscv64-unknown-elf-size -A` on a build with the command above (G
 |---|---|---|---|
 | Flash (`.init` + `.text` + `.data`) | 1,048,576 bytes in the linker profile; the harness's firmware partition is 983,040 | 800,810 bytes | 247,766 bytes (184,894 of the partition) |
 | On-chip RAM (`.data` + `.bss`, then the stack) | 65,536 bytes | 38,540 bytes | 26,992 bytes: the 20 KB stack (`freenetradio.nims`; its deepest use so far, through a TLS handshake, is 5 KB) and 6.5 KB of slack, of which the linker script insists on 4 KB |
-| Uncached Wi-Fi RAM (`.wifibss`, including the crypto engines' DMA buffers) | 117,760 bytes | 116,224 bytes | 1,536 bytes |
+| Uncached Wi-Fi RAM (`.wifibss`, including the crypto engines' DMA buffers) | 117,760 bytes | 51,664 bytes | 66,096 bytes |
 | PSRAM bss window (`.psrambss`: the radio's globals and the 8 KB log buffer) | 131,072 bytes | 11,024 bytes | 120,048 bytes |
 | PSRAM heap (every buffer over ~1 KB, lwIP, Mbed TLS) | 1 MB | at run time; a TLS session peaks around 36 KB | |
+
+FreeNetRadio uses an eight-slot native Wi-Fi RX DMA ring, set in
+`freenetradio.nims`. The Wi-Fi firmware default is 41 slots for builds
+without an application setting.
 
 `-d:radioDiag` adds 14,628 bytes of flash (the diagnostic routes, the `/stats` text and the pin and crypto self-tests are left out of the firmware without it). `-d:radioNoTls` takes flash down to 655,390 bytes, but on-chip `.data` + `.bss` grow to 45,688 bytes, leaving 19,840 bytes for the stack: without the TLS module the Wi-Fi code's software AES builds its lookup tables in RAM, while the TLS build keeps them in flash. `-d:bl808MbedTlsSoftware` (TLS without the crypto engines) is 19,468 bytes smaller in flash than the default and has the same RAM cost as `radioNoTls` plus 1,452 bytes, so its stack is 12 KB. `freenetradio.nims` also switches on the repository's SHA-1 engine provider for Wi-Fi key derivation (`bl808WifiMbedTlsSha1Hardware`), which the repository's other Wi-Fi images leave off by default.
 
@@ -281,7 +301,7 @@ curl -s http://<address>/screen | \
 - **`/stats`**: the same lines in the same format. "rx ring overflows" is always 0 (there is no Ethernet receive ring), "last error" is the raw Mbed TLS error code, "tls decoded" and "pending" are Mbed TLS's nearest equivalents (plaintext of the current record not yet read, and bytes of the record being received), and one line is added at the end: "wifi reconnects". The stack line is measured as upstream, from the end of `.bss` to the top of on-chip RAM.
 - **Web server details**: a path of `/presets/play` answers "No such preset" (upstream panics on it); `/screen/stream` refuses a second recording while one is running and always releases the display when its connection ends.
 - **Buffers are deeper** than upstream's, because Wi-Fi is not wired Ethernet and its stack shares the processor with the decoder (`freenetradio.nims`). The DAC queue is 12,288 frames (279 ms at 44.1 kHz) instead of 4,096: on this chip the decoder regularly waits 50 to 150 ms for its turn, which emptied a 93 ms queue about once in ten minutes. The audio task also decodes up to three frames without yielding when less than 78 ms is queued. The stream buffer is 64 KB instead of 10 KB; playback still starts at upstream's level, and the rest (four seconds at 128 kbit/s) carries the radio through a pause in reception. Volume and equaliser changes are heard a quarter of a second later than upstream, and the level meters lead the sound by as much. The host tests run at upstream's sizes.
-- **Display SPI** is interrupt-driven (the HAL's `asyncspi`) rather than DMA; the frame timing is the same. A frame that misses its 100 ms deadline is dropped and the next one starts afresh, as upstream.
+- **Display SPI** uses the HAL's bulk SPI DMA path to feed the SPI0 FIFO from the 8 KiB framebuffer. The HAL claims a DMA channel for the transfer and reports completion once the SPI bus goes idle. The display checks completion on its existing frame timer and then releases chip select. A frame that misses its 100 ms deadline is dropped and the next one starts afresh, as upstream.
 - **Preset saves at the same moment** (two browser tabs, a double click, a save straight after "reset to defaults") run one after the other in the order they arrived, each answering for itself. Upstream runs them interleaved, where two first saves can overwrite each other's slot.
 - **TCP receive window**: 10 KB for the stream, as upstream's plain-http connection (upstream's https one has 7 KB). It is lwIP's `TCP_WND`, set in `freenetradio.nims`, so the web server's two connections have the same window and a 10 KB receive buffer each.
 - **About page and `/licenses`** list this port's components instead of upstream's Rust crates.
@@ -296,7 +316,7 @@ A `-d:radioDiag` build can test most of the audio, display and remote paths on a
 |---|---|---|
 | I2S clock and framing | `GET /selftest/i2s`: the I2S registers, and how many frames the audio DMA takes from the ring in 60 ms with interrupts off | 44,102 frames/s for a 44.1 kHz stream (BCK 2.8225 MHz from a 22.58 MHz audio PLL); registers say master, Philips I2S, 16 bits in 32-bit slots, one FIFO word per stereo frame |
 | Display control pins | `POST /selftest/capture?t=init`: a spare DMA channel samples the GPIO input register 4.16 million times a second while the panel init and one frame go out at 1 MHz | all 23 commands seen on CS and D/C with the right argument counts, RES high, pixel data after `0x5C`; each byte lasts the 9.5 us a 1 MHz SPI clock gives |
-| Display transfer | `/stats` | 45 frames a second, no flush timeouts: SPI0's FIFO and end-of-transfer interrupts work |
+| Display transfer | `/stats` and the cycle profiler | About 49 frames a second during playback, zero flush timeouts and zero SPI0 interrupts in a 12-second capture |
 | IR receive | `POST /selftest/ir` plays an NEC frame on the IR pin by switching the pad between pull-down and pull-up | decoded as address 0x00 command 0x45, no errors, on a pin with nothing attached |
 
 The same build can say where the processor's time goes, which is how the drop-outs above were traced: `GET /selftest/slices` (the longest stretch and the share of time of each task since the last read), `POST` then `GET /selftest/stalls` (a task that only yields logs every turn of the scheduler that took over 15 ms), and `POST /selftest/profile` then `GET` (16,384 program counters sampled at 2 kHz by a timer interrupt; match them to functions with `riscv64-unknown-elf-nm -S`; with `?stall` the run keeps the newest samples and stops at a 40 ms stall).
@@ -306,6 +326,123 @@ The same build can say where the processor's time goes, which is how the drop-ou
 What this cannot show: the BL808 reads a pad back only while the pad is a GPIO, so BCK, LCK, DIN, SCLK and SDIN themselves are not observed. That the pins carry those signals rests on the pin function numbers and the vendor's pin tables; it takes the real parts or a logic analyser to see it. The first thing to try if the panel stays dark is still `-d:radioOledSpiSwap`.
 
 Two things found this way. GPIO19, the default IR pin, is held high by something on the board that was tested (`GET /selftest/pulls` lists which unused pins follow their pull resistors); a VS1838B idles high and pulls low, so that is no obstacle, but the pull-resistor test needs a floating pin (`-d:IrPin=18`). And a capture slows the CPU while it runs, so frame times measured from a full-speed capture (`t=fast`) are longer than the real ones.
+
+## CPU profiling
+
+### From the host over JTAG
+
+With the Ox64 JTAG pins routed to M0, sample a running build using the
+T-Head hardware PC sampler. A matching ELF supplies function names.
+
+```sh
+.venv/bin/python tools/hw_validate.py --jtag-live-profile 30 \
+  --jtag-profile-elf build/hw-validation/bin/freenetradio/kernel.elf
+```
+
+This uses a TAP-only OpenOCD session. The MCU keeps running during attach
+and capture. It works on builds with no profiling option, needs accessible
+M0 JTAG, and saves the individual samples and a hotspot table in
+`build/hw-validation/logs/jtag-live-profile.json`. Use `--work-dir` to
+keep separate runs and `--jtag-profile-rate` to change the requested rate
+from 30 Hz. Omit the ELF to record addresses alone.
+
+The hardware reports the most recent branch destination, so samples taken
+while idle can repeat the same address and tight loops can be overrepresented.
+Use the counts to locate potential hotspots. Sample shares are approximate,
+especially for WFI and straight-line code. See table 5.3 in the
+[E907 manual](https://bbs.aw-ol.com/assets/uploads/files/1658215723286-%E7%8E%84%E9%93%81e907-r1s1%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C_occ.pdf#page=61).
+
+### D0 from the M0 observer
+
+The M0 observer reads the C906 retire monitor and sends samples over UART0.
+For a bench check, load the observer and the D0 test workload into RAM, then
+collect a profile with the matching D0 ELF. Set `UART_PORT` to the runtime
+serial device.
+
+```sh
+.venv/bin/python tools/hw_validate.py --test d0_profile_observer \
+  --jtag-load --no-jtag-reset --uart "$UART_PORT"
+.venv/bin/python tools/hw_validate.py --d0-live-profile 10 --profile-rate 100 \
+  --profile-elf build/hw-validation/bin/d0_profile_observer/d0.elf \
+  --uart "$UART_PORT"
+```
+
+The RAM load uses JTAG and temporarily replaces the running M0 and D0 images.
+Capture runs over UART while D0 executes. `logs/d0-live-profile.json` contains
+the 40-bit PCs, raw status, and hotspot shares. Halted and zero-address samples
+are retained in the report and excluded from hotspot shares. While D0 is
+idle, the monitor can repeat the last retired PC.
+
+Add `--profile-hpm` to include cycles, retired instructions, L1 instruction
+and data cache accesses and misses, conditional branches and mispredictions,
+and I-uTLB, D-uTLB, and joint TLB misses. The test workload enables counters
+and exercises Sv39. Other D0 images can opt in by calling `enableHpm` at boot
+in machine mode and passing its configuration and a persistent request
+sequence variable to `serviceD0Hpm` from a periodic hook. For a
+supervisor hook, enable supervisor reads at boot with `allowSupervisor = true`,
+identity-map XRAM uncached, and pass `supervisor = true` to the hook. Reserve
+XRAM offsets `0x3b00`–`0x3bbf` for the mailbox. The counters cover the whole
+capture window and can include scheduling and interrupt work. Use PC-only
+capture for D0 images without the counter hook.
+
+On C906 configurations with eight event slots, the default group includes
+the TLB events. To capture data-cache activity on those configurations,
+RAM-load the example with `--nim-define bl808D0ProfileDataCache=1`, or pass
+`preferDataCache = true` to `enableHpm` in your D0 firmware. Both groups
+include cycles, retired instructions, I-cache, and branch events. The report
+includes only events that the firmware configured successfully. See
+[C906 HPM, chapter 12](https://cs107e.github.io/readings/XuanTie-OpenC906-UserManual.pdf).
+
+### Cycle counts and audio timeline
+
+Add `--nim-define radioProfiler=1` to the normal harness build and flash
+command. This flag works on its own, with release optimization and without
+`radioDiag`. The profiler starts on request and stops automatically.
+
+```sh
+python3 examples/freenetradio/tools/profile_radio.py capture http://192.168.1.114 \
+  --seconds 30 --out build/hw-validation/logs/radio-playing
+```
+
+The command prints call counts, wall time, cycles and retired instructions
+per region and interrupt vector, plus audio wake delays, the DAC queue
+low-water mark and WFI time. It saves the binary capture, a summary JSON
+file, and a Perfetto JSON
+file for runs with tracing enabled. Open the latter in
+[Perfetto](https://ui.perfetto.dev) to see the audio wake, rendering, Wi-Fi
+and IRQ tracks. Decode a saved capture again with
+`profile_radio.py analyze <file.bin>`.
+
+The recorder retains the newest 2,048 events in RAM. The first playback wake
+that is at least 15 ms late, or the first underrun, freezes that history.
+Counters continue through the end of the window. Set `RadioProfileLateUs` at
+build time to change the trigger threshold. Use `--summary-only` for work
+comparisons without timeline writes. Board controls are
+`POST /profile/start` or `POST /profile/start-summary` (decimal milliseconds,
+100–120,000, default 30,000), `POST /profile/stop` for an early stop, and
+`GET /profile/capture` for the completed capture. The opt-in build exposes
+these routes to hosts that can reach the radio.
+
+The scope totals include nested calls and any interrupt time within the
+scope. Compare them individually. A Wi-Fi firmware call with work dispatched
+an event. A deferred TX call with work sent at least one frame. A posted
+Wi-Fi service call may still find an empty queue. Audio sleep delay is
+measured from the requested timer deadline, and yield delay from the time the
+audio task posts its continuation. Percentiles are histogram upper bounds.
+IRQ totals cover registered handler bodies. WFI is measured with the wall
+timer.
+
+The opt-in M0 capture also reports whole-window hardware counters for cycles,
+retired instructions, L1 instruction and data cache accesses and misses,
+conditional branches, and conditional branch mispredictions. The report lists
+the events that the firmware configured successfully. The decoder can still
+read older captures. See [E907 HPM, §5.2](https://bbs.aw-ol.com/assets/uploads/files/1658215723286-%E7%8E%84%E9%93%81e907-r1s1%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C_occ.pdf#page=62).
+
+For a meaningful before-and-after comparison, repeat runs on the same board
+with the same network and fixed MP3 input. Record both connected idle and
+playback. To estimate the extra cost of trace writes, compare WFI and audio
+wake delays in summary-only and trace runs. The existing `radioCpuMeter`
+build can provide a WFI baseline with the profiler disabled.
 
 ## Bring-up checklist
 
@@ -318,7 +455,7 @@ Nothing here has been run on hardware. Check, in this order:
 5. The I2S clock tree: the actual sample rates at 44.1 and 48 kHz, and the framing (`i2s.initI2s`: Philips, 16 bits in 32-bit slots; the block is left off until the clock and the DMA ring are ready). The audio PLL is reprogrammed by `glb.configAudioPll`, for a 40 MHz crystal, on the assumption that nothing else (in particular the M0's own clock) runs from that PLL; its settling delays are a counted loop, not a timer.
 6. An `https://` stream plays. With `-d:radioDiag`, read the `tls handshake` time and the `stack:` line of `/stats` afterwards (every task and the whole TLS handshake share one stack), and `GET /selftest/crypto`: for each crypto engine, its state and how many operations ran on hardware and in software. State 2 means the engine passed its first-use comparison with software and is in use; 3 means it failed and was retired. `GET /selftest/bench` times each engine against software. `-d:bl808MbedTlsSoftware` (or one of the per-engine defines in `src/bl808/mbedtls/build.nim`) turns the engines off if one misbehaves.
 7. The stream keeps up at 320 kbit/s. If one stalls where a 128 kbit/s stream does not, look at the receive window in a packet capture first: it should open at 10240 bytes (2920 means the build did not read `freenetradio.nims`).
-8. The display. Frames go out through `asyncspi`'s send-only transfer in SPI mode 0: the "FIFO has room" interrupt feeds the frame 16 bytes or more at a time, and once everything is queued the frame is done when SPI0 raises its end-of-transfer interrupt with the FIFO empty. Neither has run on the chip. If the end interrupt does not come, every frame is given up after 100 ms: the picture is right but updates ten times a second, and "flush timeouts" in `/stats` counts up. Then save a preset while the screen is animating and read "flush timeouts" again: a late interrupt should only stretch the frame.
+8. The display. Confirm it refreshes in SPI mode 0. Check `display frames` and `flush timeouts` in `/stats` while the screen animates. Each flush should finish within 100 ms, including when a preset is saved during playback.
 9. Whether a 4 KB sector erase (interrupts off, about 45 ms) is audible. It happens on one settings save in sixteen and on preset saves.
 10. Flash `0x680000..0x6FFFFF` is unused in the board's image layout, and presets and settings survive a power cycle: they are read back with `flashReadRaw`, which is new.
 11. The IR receiver: the GPIO interrupt keeps firing after the first edge (`gpioClearInterrupt` pulses the latch's clear bit).
@@ -326,7 +463,7 @@ Nothing here has been run on hardware. Check, in this order:
 
 ## For the HAL
 
-The gaps this example first worked around are closed in the HAL, and the example now uses the HAL for them: the lwIP client bindings and the TCP window, I2S with the audio PLL and the DMA ring, SPI0 with `asyncspi` and the GPIO setup, raw flash reads and the application-data partition, the Wi-Fi application linker profile, TLS's two kinds of "closed", and the validation manifest entry.
+The gaps this example first worked around are closed in the HAL, and the example now uses the HAL for them: the lwIP client bindings and the TCP window, I2S with the audio PLL and the DMA ring, SPI0 with DMA and the GPIO setup, raw flash reads and the application-data partition, the Wi-Fi application linker profile, TLS's two kinds of "closed", and the validation manifest entry.
 
 Still open, and still worked around here:
 

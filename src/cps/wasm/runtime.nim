@@ -15,6 +15,12 @@ when defined(wasmGuardPages):
 
 const WasmPageSize* = 65536
 const MaxPages = 65536  # 4 GiB
+const WasmSuspendableHostCalls* = defined(wasmSuspendableHostCalls) or
+  defined(wasmComponentStackful)
+const WasmAtomicWaitEnabled* = defined(wasmSharedCoreTypes) and defined(wasmAtomicWait)
+when WasmAtomicWaitEnabled:
+  const WasmMaxAtomicWaiters* {.intdefine.} = when defined(bl808lp): 4 else: 16
+  static: doAssert WasmMaxAtomicWaiters > 0
 # Arena sizes: start small, grow by doubling.
 # Small defaults keep per-VM overhead low; most programs fit in the initial
 # allocation and never pay a reallocation cost on the hot path.
@@ -53,6 +59,26 @@ type
 
   HostFunc* = proc(args: openArray[WasmValue]): seq[WasmValue] {.closure.}
 
+  WasmHostWait* = object
+    ## ready is a side-effect-free readiness check. finish produces the return
+    ## lanes exactly once, on the originating core, after ready becomes true.
+    ready*: proc(): bool {.closure.}
+    finish*: proc(): seq[WasmValue] {.closure.}
+
+  WasmAtomicClock* = proc(): uint64 {.nimcall.}
+    ## Monotonic nanoseconds in the store's executor.
+
+  WasmAtomicWaitState = enum
+    wawPending, wawNotified, wawExpired, wawAborted
+
+  WasmAtomicWait = ref object
+    owner: ptr WasmVM
+    arena: ptr Frame
+    stackTop: int
+    memory: int
+    offset, started, duration: uint64
+    state: WasmAtomicWaitState
+
   FuncInst* = object
     funcType*: FuncType
     case isHost*: bool
@@ -86,10 +112,14 @@ type
     elemType*: ValType
     elems*: seq[WasmValue]
     dropped*: bool
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   DataInst* = object
     data*: seq[byte]
     dropped*: bool
+    when defined(wasmSharedCoreTypes):
+      shared*: bool
 
   ExportInst* = object
     name*: string
@@ -169,9 +199,21 @@ type
     localsTop*: int
     # call_indirect inline cache (power-of-two, 2-way slots)
     callIcBuf*: seq[CallIcSlot]
+    when WasmSuspendableHostCalls:
+      hostWaitSlot: ptr WasmHostWait
+    when WasmAtomicWaitEnabled:
+      atomicClock: WasmAtomicClock
+      atomicWaits: seq[WasmAtomicWait]
     when defined(wasmChunkedMemory):
       memoryFactory*: MemoryBackendFactory
       memoryFactoryContext*: pointer
+
+  WasmExecutionArena* = object
+    valueStack: seq[uint64]
+    callStack: seq[Frame]
+    labelStack: seq[Label]
+    locals: seq[uint64]
+    valueStackTop, callStackTop, labelStackTop, localsTop: int
 
   ExternalVal* = object
     case kind*: ExportKind
@@ -201,6 +243,63 @@ type
 template trap(msg: string) =
   raise newException(WasmTrap, msg)
 
+when defined(wasmFunctionReferences):
+  proc checkReferenceValues(vm: WasmVM, signature: FuncType, values: openArray[WasmValue],
+                            parameters: static bool) =
+    let lanes {.cursor.} = when parameters: signature.params else: signature.results
+    if signature.references == nil:
+      when defined(wasmSharedCoreTypes):
+        if vtFuncRef notin lanes: return
+      else: return
+    if values.len != lanes.len: trap("typed function arity mismatch")
+    for i, value in values:
+      if value.kind != lanes[i].toValueKind(): trap("typed function value kind mismatch")
+      let reference = when parameters: signature.coreParamReference(i)
+        else: signature.coreResultReference(i)
+      if reference.member == 0 and not reference.nonNull:
+        when defined(wasmSharedCoreTypes):
+          if value.kind != wvkFuncRef: continue
+        else: continue
+      if value.isNull():
+        if reference.nonNull: trap("null in non-null reference lane")
+      elif value.kind == wvkFuncRef:
+        let address = value.funcRef.int
+        if address < 0 or address >= vm.store.funcs.len or
+            not vm.store.funcs[address].funcType.matchesFunctionReference(reference):
+          trap("typed function reference value mismatch")
+
+  proc resolveFunctionReference(vm: var WasmVM, moduleIndex, typeIndex: int,
+                                reference: int32): int =
+    if reference == -1: trap("null function reference")
+    if reference < 0 or reference.int >= vm.store.funcs.len:
+      trap("invalid function reference")
+    result = reference.int
+    if not vm.store.funcs[result].funcType.matchesCoreFunctionType(
+        vm.store.modules[moduleIndex].types[typeIndex]):
+      trap("function reference type mismatch")
+
+when WasmSuspendableHostCalls:
+  proc canSuspendHostCall*(vm: var WasmVM): bool {.inline.} =
+    vm.hostWaitSlot != nil
+
+  proc suspendHostCall*(vm: var WasmVM, wait: sink WasmHostWait): seq[WasmValue] =
+    ## Register a continuation from a host import, then return it immediately.
+    if vm.hostWaitSlot == nil:
+      trap("host suspension requires sliced interpreter execution")
+    if wait.ready == nil or wait.finish == nil or vm.hostWaitSlot[].finish != nil:
+      trap("invalid interpreter host wait")
+    vm.hostWaitSlot[] = move wait
+
+  proc callSuspendableHost(vm: var WasmVM, host: HostFunc,
+                           args: openArray[WasmValue], wait: var WasmHostWait):
+                           seq[WasmValue] {.noinline.} =
+    let previous = vm.hostWaitSlot
+    vm.hostWaitSlot = addr wait
+    defer: vm.hostWaitSlot = previous
+    result = host(args)
+    if wait.finish != nil and result.len != 0:
+      trap("suspended host call returned values")
+
 # ---------------------------------------------------------------------------
 # VM initialization
 # ---------------------------------------------------------------------------
@@ -216,6 +315,83 @@ proc initWasmVM*(): WasmVM =
   result.localsTop = 0
   # A smaller power-of-two cache preserves semantics while bounding LP RAM.
   result.callIcBuf = newSeq[CallIcSlot](InitialCallIcSlots)
+
+when WasmSuspendableHostCalls or WasmAtomicWaitEnabled:
+  proc initWasmExecutionArena*(): WasmExecutionArena =
+    # Several waiters can have live arenas. Each stack grows on demand.
+    when defined(bl808lp):
+      result.valueStack = newSeq[uint64](16)
+      result.callStack = newSeq[Frame](2)
+      result.labelStack = newSeq[Label](4)
+      result.locals = newSeq[uint64](8)
+    else:
+      result.valueStack = newSeq[uint64](32)
+      result.callStack = newSeq[Frame](4)
+      result.labelStack = newSeq[Label](8)
+      result.locals = newSeq[uint64](16)
+
+  proc swapWasmExecutionArena*(vm: var WasmVM, arena: var WasmExecutionArena) =
+    ## Install a guest thread's stacks while retaining the instance store and
+    ## indirect-call cache. Pair calls around each interpreter entry.
+    swap(vm.valueStack, arena.valueStack)
+    swap(vm.callStack, arena.callStack)
+    swap(vm.labelStack, arena.labelStack)
+    swap(vm.locals, arena.locals)
+    swap(vm.valueStackTop, arena.valueStackTop)
+    swap(vm.callStackTop, arena.callStackTop)
+    swap(vm.labelStackTop, arena.labelStackTop)
+    swap(vm.localsTop, arena.localsTop)
+
+when WasmAtomicWaitEnabled:
+  proc setWasmAtomicClock*(vm: var WasmVM, clock: WasmAtomicClock) =
+    if vm.atomicWaits.len != 0: trap("cannot replace clock while atomic waits are queued")
+    vm.atomicClock = clock
+
+  proc clearWasmAtomicWaits*(vm: var WasmVM) =
+    ## Invalidate unfinished notifications when the owning store is closed.
+    for wait in vm.atomicWaits:
+      wait.state = wawAborted
+    vm.atomicWaits.setLen(0)
+
+  proc atomicRemaining(wait: WasmAtomicWait, now: uint64): uint64 =
+    if wait.state != wawPending: return 0
+    if wait.duration == 0: return uint64.high
+    let elapsed = now - wait.started
+    if elapsed < wait.duration: wait.duration - elapsed else: 0'u64
+
+  proc beginAtomicWait(vm: var WasmVM, memory: int, offset: uint64,
+      timeout: int64): WasmAtomicWait {.noinline.} =
+    if vm.atomicWaits.len >= WasmMaxAtomicWaiters: trap("atomic wait capacity exhausted")
+    result = WasmAtomicWait(owner: addr vm, arena: addr vm.callStack[0],
+      stackTop: vm.callStackTop, memory: memory, offset: offset)
+    if timeout > 0:
+      if vm.atomicClock == nil: trap("finite atomic wait requires an executor clock")
+      result.started = vm.atomicClock()
+      result.duration = timeout.uint64
+    vm.atomicWaits.add(result)
+
+  proc removeAtomicWait(vm: var WasmVM, wait: WasmAtomicWait) =
+    for i, candidate in vm.atomicWaits:
+      if candidate == wait:
+        vm.atomicWaits.delete(i)
+        return
+
+  proc notifyAtomicWaits(vm: var WasmVM, memory: int, offset: uint64,
+      count: uint32): uint32 {.noinline.} =
+    if count == 0 or vm.atomicWaits.len == 0: return 0
+    let now = if vm.atomicClock == nil: 0'u64 else: vm.atomicClock()
+    var i = 0
+    while i < vm.atomicWaits.len and result < count:
+      let wait = vm.atomicWaits[i]
+      if wait.atomicRemaining(now) == 0:
+        wait.state = wawExpired
+        vm.atomicWaits.delete(i)
+      elif wait.memory == memory and wait.offset == offset:
+        wait.state = wawNotified
+        vm.atomicWaits.delete(i)
+        inc result
+      else:
+        inc i
 
 when defined(wasmChunkedMemory):
   proc setMemoryBackendFactory*(vm: var WasmVM, factory: MemoryBackendFactory,
@@ -323,6 +499,9 @@ proc rawToWasmValue*(raw: uint64, vt: ValType): WasmValue {.inline.} =
   of vtFuncRef: wasmFuncRef(cast[int32](raw and 0xFFFFFFFF'u64))
   of vtExternRef: wasmExternRef(cast[int32](raw and 0xFFFFFFFF'u64))
   of vtV128: WasmValue(kind: wvkV128)
+
+func initialLocalBits(kind: ValType): uint64 {.inline.} =
+  if kind.isRefType(): uint32.high.uint64 else: 0'u64
 
 # ---------------------------------------------------------------------------
 # Label stack operations
@@ -445,6 +624,59 @@ proc memByteLen(mem: var MemInst): uint64 {.inline.} =
     if mem.useGuard:
       return mem.guardMem.accessibleBytes
   mem.data.len.uint64
+
+when defined(wasmSharedCoreTypes):
+  proc transferMemoryAtomicWord(mem: var MemInst, offset: uint64, width: uint32,
+      value: var uint64, writing: static bool, allowIo: bool): bool =
+    # A naturally aligned word fits entirely in one chunk of at least 512
+    # bytes. A blocked transfer has not read or changed any guest bytes.
+    var bytes: array[8, byte]
+    when writing:
+      for i in 0 ..< width.int: bytes[i] = byte((value shr (8 * i)) and 0xff)
+    template transferFlat() =
+      when writing: copyMem(mem.memBulkPtr(offset), addr bytes[0], width.int)
+      else: copyMem(addr bytes[0], mem.memBulkPtr(offset), width.int)
+    when defined(wasmChunkedMemory):
+      if mem.chunked != nil:
+        let buffer = cast[ptr UncheckedArray[byte]](addr bytes[0])
+        let status = when writing: mem.chunked[].writeAt(offset, buffer, width, allowIo)
+          else: mem.chunked[].readAt(offset, buffer, width, allowIo)
+        if status == lmWouldBlock: return false
+        if status != lmOk: trap("linear memory atomic transfer failed: " & $status)
+      else: transferFlat()
+    else: transferFlat()
+    when not writing:
+      value = 0
+      for i in 0 ..< width.int: value = value or (bytes[i].uint64 shl (8 * i))
+    true
+
+  proc checkAtomicAddress(mem: var MemInst, offset: uint64, width: uint32) {.inline.} =
+    let length = mem.memByteLen()
+    if offset > length or width.uint64 > length - offset:
+      trap("out of bounds memory access")
+    if (offset and (width - 1).uint64) != 0: trap("unaligned atomic memory access")
+
+  proc executeMemoryAtomic(mem: var MemInst, access: MemoryAtomicSpec,
+      offset, expected, input: uint64, allowIo: bool, previous: var uint64): bool =
+    if access.kind == maInvalid: trap("unknown memory atomic operation")
+    let width = 1'u32 shl access.alignment
+    mem.checkAtomicAddress(offset, width)
+    if access.kind != maStore and
+        not mem.transferMemoryAtomicWord(offset, width, previous, false, allowIo):
+      return false
+    if access.kind == maLoad: return true
+    if access.kind == maCompareExchange:
+      let mask = uint64.high shr ((8 - width) * 8)
+      if previous != (expected and mask): return true
+    var replacement = case access.kind
+      of maStore, maExchange, maCompareExchange: input
+      of maAdd: previous + input
+      of maSub: previous - input
+      of maAnd: previous and input
+      of maOr: previous or input
+      of maXor: previous xor input
+      else: trap("unknown memory atomic operation")
+    mem.transferMemoryAtomicWord(offset, width, replacement, true, allowIo)
 
 proc loadValSync[T](mem: var MemInst, ea: uint64): T {.inline.} =
   boundsCheck(mem, ea, sizeof(T))
@@ -590,7 +822,7 @@ proc growMemory(mem: var MemInst, delta: int32): int32 =
 # Init expression evaluator (for globals, data/elem offsets)
 # ---------------------------------------------------------------------------
 
-proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
+proc evalModuleInitializer(vm: var WasmVM, expr: Expr, instance: ModuleInst): WasmValue =
   for instr in expr.code:
     case instr.op
     of opI32Const:
@@ -608,7 +840,7 @@ proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
       return WasmValue(kind: wvkV128, v128: expr.v128Consts[int(instr.imm1)])
     of opGlobalGet:
       let globalIdx = instr.imm1.int
-      let globalAddr = vm.store.modules[modIdx].globalAddrs[globalIdx]
+      let globalAddr = instance.globalAddrs[globalIdx]
       return vm.store.globals[globalAddr].value
     of opRefNull:
       let rtOrd = instr.imm1
@@ -617,7 +849,7 @@ proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
       else: trap("invalid ref.null type in init expr")
     of opRefFunc:
       let funcIdx = instr.imm1.int
-      let funcAddr = vm.store.modules[modIdx].funcAddrs[funcIdx]
+      let funcAddr = instance.funcAddrs[funcIdx]
       return wasmFuncRef(funcAddr.int32)
     of opEnd:
       break
@@ -625,15 +857,68 @@ proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
       trap("invalid instruction in init expression: " & $instr.op)
   trap("init expression did not produce a value")
 
+proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
+  evalModuleInitializer(vm, expr, vm.store.modules[modIdx])
+
 # ---------------------------------------------------------------------------
 # Module instantiation
 # ---------------------------------------------------------------------------
 
 proc importLimitsMatch*(actual, required: Limits): bool =
+  when defined(wasmSharedCoreTypes):
+    if actual.shared != required.shared: return false
   actual.min >= required.min and
     (not required.hasMax or (actual.hasMax and actual.max <= required.max))
 
-proc bindStoreImport(vm: WasmVM, modInst: var ModuleInst, module: WasmModule,
+proc importTableTypeMatch*(actual, required: TableType): bool =
+  when defined(wasmFunctionReferences):
+    if not sameCoreReference(actual.elementReference, required.elementReference):
+      return false
+  actual.elemType == required.elemType and importLimitsMatch(actual.limits, required.limits)
+
+when defined(wasmFunctionReferences):
+  proc typedValueMatches(vm: WasmVM, lane: ValType, reference: CoreReferenceType,
+                         value: WasmValue): bool =
+    if value.kind != lane.toValueKind(): return false
+    if not lane.isRefType(): return true
+    if value.isNull(): return not reference.nonNull
+    if value.kind != wvkFuncRef: return true
+    let address = value.funcRef.int
+    address >= 0 and address < vm.store.funcs.len and
+      vm.store.funcs[address].funcType.matchesFunctionReference(reference)
+
+  proc checkHostTable(vm: WasmVM, table: TableInst, expected: TableType) =
+    let limits = table.tableType.limits
+    if not importTableTypeMatch(table.tableType, expected) or
+        table.elems.len.uint64 < limits.min.uint64 or
+        (limits.hasMax and table.elems.len.uint64 > limits.max.uint64):
+      trap("incompatible host table import")
+    for value in table.elems:
+      if not vm.typedValueMatches(expected.elemType, expected.elementReference, value):
+        trap("host table element reference type mismatch")
+
+proc allocateDefinedTables(vm: var WasmVM, module: WasmModule, instance: var ModuleInst) =
+  when defined(wasmFunctionReferences):
+    var nextInitializer = 0
+  for i, tableType in module.tables:
+    var initial = if tableType.elemType == vtFuncRef: wasmNullFuncRef()
+                  else: wasmNullExternRef()
+    when defined(wasmFunctionReferences):
+      if nextInitializer < module.tableInitializers.len and
+          module.tableInitializers[nextInitializer].index == i.uint32:
+        let init {.cursor.} = module.tableInitializers[nextInitializer].init
+        initial = vm.evalModuleInitializer(init, instance)
+        inc nextInitializer
+      if not vm.typedValueMatches(tableType.elemType, tableType.elementReference, initial):
+        trap("table initializer reference type mismatch")
+    if tableType.limits.min.uint64 > uint64(high(int) div sizeof(WasmValue)):
+      trap("initial table size exceeds host address range")
+    var elems = newSeq[WasmValue](tableType.limits.min.int)
+    for entry in elems.mitems: entry = initial
+    instance.tableAddrs.add(vm.store.tables.len)
+    vm.store.tables.add(TableInst(tableType: tableType, elems: move elems))
+
+proc bindStoreImport(vm: var WasmVM, modInst: var ModuleInst, module: WasmModule,
                      imp: Import, source: ExternalStoreRef) =
   ## Retain the address instead of copying mutable state out of its owner.
   let address = source.address
@@ -642,26 +927,26 @@ proc bindStoreImport(vm: WasmVM, modInst: var ModuleInst, module: WasmModule,
   case imp.kind
   of ikFunc:
     if address >= vm.store.funcs.len or
-        vm.store.funcs[address].funcType != module.types[imp.funcTypeIdx.int]:
+        not vm.store.funcs[address].funcType.matchesCoreFunctionType(module.types[imp.funcTypeIdx.int]):
       trap("incompatible store function import")
     modInst.funcAddrs.add(address)
   of ikTable:
     if address >= vm.store.tables.len:
       trap("unknown store table")
     let actual = vm.store.tables[address].tableType
-    if actual.elemType != imp.tableType.elemType or
-        not importLimitsMatch(actual.limits, imp.tableType.limits):
+    if not importTableTypeMatch(actual, imp.tableType):
       trap("incompatible store table import")
     modInst.tableAddrs.add(address)
   of ikMemory:
-    if address >= vm.store.mems.len or
-        not importLimitsMatch(vm.store.mems[address].memType.limits,
-                              imp.memType.limits):
+    if address >= vm.store.mems.len: trap("unknown store memory")
+    var actual = vm.store.mems[address].memType.limits
+    actual.min = vm.store.mems[address].pageCount().uint32
+    if not importLimitsMatch(actual, imp.memType.limits):
       trap("incompatible store memory import")
     modInst.memAddrs.add(address)
   of ikGlobal:
     if address >= vm.store.globals.len or
-        vm.store.globals[address].globalType != imp.globalType:
+        not importGlobalTypeMatch(vm.store.globals[address].globalType, imp.globalType):
       trap("incompatible store global import")
     modInst.globalAddrs.add(address)
   of ikTag:
@@ -708,6 +993,10 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
         of ikFunc:
           if extVal.kind != ekFunc:
             trap("import type mismatch for " & imp.module & "." & imp.name & ": expected function")
+          let expected {.cursor.} = module.types[imp.funcTypeIdx.int]
+          if (expected.definition != nil or extVal.funcType.definition != nil) and
+              not extVal.funcType.matchesCoreFunctionType(expected):
+            trap("incompatible host function import")
           let funcAddr = vm.store.funcs.len
           vm.store.funcs.add(FuncInst(
             funcType: extVal.funcType,
@@ -718,18 +1007,28 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
         of ikTable:
           if extVal.kind != ekTable:
             trap("import type mismatch for " & imp.module & "." & imp.name & ": expected table")
+          when defined(wasmFunctionReferences):
+            vm.checkHostTable(extVal.tableInst, imp.tableType)
           let tableAddr = vm.store.tables.len
           vm.store.tables.add(extVal.tableInst)
           modInst.tableAddrs.add(tableAddr)
         of ikMemory:
           if extVal.kind != ekMemory:
             trap("import type mismatch for " & imp.module & "." & imp.name & ": expected memory")
+          when defined(wasmSharedCoreTypes):
+            if imp.memType.limits.shared or extVal.memInst.memType.limits.shared:
+              trap("shared memory requires a store import")
           let memAddr = vm.store.mems.len
           vm.store.mems.add(extVal.memInst)
           modInst.memAddrs.add(memAddr)
         of ikGlobal:
           if extVal.kind != ekGlobal:
             trap("import type mismatch for " & imp.module & "." & imp.name & ": expected global")
+          when defined(wasmFunctionReferences):
+            let expected {.cursor.} = imp.globalType
+            if not importGlobalTypeMatch(extVal.globalInst.globalType, expected) or
+                not vm.typedValueMatches(expected.valType, expected.reference, extVal.globalInst.value):
+              trap("incompatible host global import")
           let globalAddr = vm.store.globals.len
           vm.store.globals.add(extVal.globalInst)
           modInst.globalAddrs.add(globalAddr)
@@ -775,15 +1074,7 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
     modInst.funcAddrs.add(funcAddr)
 
   # --- Allocate defined tables ---
-  for tt in module.tables:
-    let tableAddr = vm.store.tables.len
-    var elems = newSeq[WasmValue](tt.limits.min.int)
-    let initVal = if tt.elemType == vtFuncRef: wasmNullFuncRef()
-                  else: wasmNullExternRef()
-    for i in 0 ..< elems.len:
-      elems[i] = initVal
-    vm.store.tables.add(TableInst(tableType: tt, elems: elems))
-    modInst.tableAddrs.add(tableAddr)
+  vm.allocateDefinedTables(module, modInst)
 
   # --- Allocate defined memories ---
   for mt in module.memories:
@@ -827,6 +1118,9 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
   for gd in module.globals:
     let globalAddr = vm.store.globals.len
     let initVal = vm.evalInitExpr(gd.init, modIdx)
+    when defined(wasmFunctionReferences):
+      if not vm.typedValueMatches(gd.globalType.valType, gd.globalType.reference, initVal):
+        trap("global initializer value type mismatch")
     vm.store.globals.add(GlobalInst(
       globalType: gd.globalType,
       value: initVal
@@ -836,9 +1130,12 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
   # --- Allocate element segments ---
   for es in module.elements:
     let elemAddr = vm.store.elems.len
-    var elemInst = ElemInst(elemType: es.elemType, dropped: false)
-    for initExpr in es.init:
-      elemInst.elems.add(vm.evalInitExpr(initExpr, modIdx))
+    var elemInst = ElemInst(elemType: es.elemType, dropped: es.mode == elemDeclarative)
+    when defined(wasmSharedCoreTypes):
+      elemInst.shared = es.shared
+    if not elemInst.dropped:
+      for initExpr in es.init:
+        elemInst.elems.add(vm.evalInitExpr(initExpr, modIdx))
     vm.store.elems.add(elemInst)
     vm.store.modules[modIdx].elemAddrs.add(elemAddr)
 
@@ -846,6 +1143,8 @@ proc instantiateImpl(vm: var WasmVM, module: WasmModule,
   for ds in module.datas:
     let dataAddr = vm.store.datas.len
     vm.store.datas.add(DataInst(data: ds.data, dropped: false))
+    when defined(wasmSharedCoreTypes):
+      vm.store.datas[dataAddr].shared = ds.shared
     vm.store.modules[modIdx].dataAddrs.add(dataAddr)
 
   # --- Initialize active element segments ---
@@ -1262,6 +1561,8 @@ type
     wesYielded
     wesMemoryBlocked
     wesComplete
+    wesHostBlocked
+    wesAtomicBlocked
 
   WasmContinuation* = object
     ## Native interpreter frames are never moved between cores. Only the
@@ -1273,6 +1574,13 @@ type
     entryCallStackTop: int
     entryLabelStackTop: int
     entryLocalsTop: int
+    when WasmAtomicWaitEnabled:
+      atomicWait: WasmAtomicWait
+    when WasmSuspendableHostCalls:
+      hostWait: WasmHostWait
+      hostVm: ptr WasmVM
+      hostFuncAddr, hostCallStackTop: int
+      hostTailCall: bool
     when defined(wasmChunkedMemory):
       faultMemAddr: int
       retryMemoryInstruction: bool
@@ -1286,6 +1594,52 @@ type
 
 proc continuationEntryFuncAddr*(continuation: WasmContinuation): int {.inline.} =
   continuation.funcAddr
+
+const SuspendedExecution = {wesYielded, wesMemoryBlocked, wesHostBlocked, wesAtomicBlocked}
+
+when WasmAtomicWaitEnabled:
+  proc executionAtomicRemainingNs*(vm: var WasmVM, continuation: WasmContinuation): uint64 =
+    ## Zero means ready. uint64.high means there is no scheduled wake.
+    let wait {.cursor.} = continuation.atomicWait
+    if continuation.status != wesAtomicBlocked or wait == nil or
+        wait.owner != addr(vm): return uint64.high
+    if wait.state != wawPending: return 0
+    wait.atomicRemaining(if wait.duration == 0: 0'u64 else: vm.atomicClock())
+
+  proc validateAtomicContinuation(vm: var WasmVM, wait: WasmAtomicWait) =
+    if wait == nil or wait.state == wawAborted or wait.owner != addr(vm) or
+        wait.stackTop != vm.callStackTop or
+        wait.arena != addr(vm.callStack[0]):
+      trap("stale interpreter atomic continuation")
+
+when WasmSuspendableHostCalls:
+  proc executionHostReady*(continuation: WasmContinuation): bool =
+    continuation.status == wesHostBlocked and continuation.hostWait.ready != nil and
+      continuation.hostWait.ready()
+
+  proc finishHostWait(vm: var WasmVM, continuation: var WasmContinuation):
+      seq[WasmValue] {.noinline.} =
+    # Release captures if the result validation or completion callback traps.
+    let finish = move continuation.hostWait.finish
+    continuation.hostWait.ready = nil
+    result = finish()
+    let types {.cursor.} = vm.store.funcs[continuation.hostFuncAddr].funcType.results
+    if result.len != types.len: trap("suspended host call result arity mismatch")
+    for i, lane in result:
+      if lane.kind != types[i].toValueKind(): trap("suspended host call result type mismatch")
+    when defined(wasmFunctionReferences):
+      vm.checkReferenceValues(vm.store.funcs[continuation.hostFuncAddr].funcType, result, false)
+
+proc executionRunnable*(vm: var WasmVM, continuation: WasmContinuation): bool =
+  case continuation.status
+  of wesYielded: true
+  of wesHostBlocked:
+    when WasmSuspendableHostCalls: continuation.executionHostReady()
+    else: false
+  of wesAtomicBlocked:
+    when WasmAtomicWaitEnabled: vm.executionAtomicRemainingNs(continuation) == 0
+    else: false
+  else: false
 
 const OsrBackEdgeThreshold* = 50_000  ## back-edges before signalling OSR
 
@@ -1302,47 +1656,114 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
   ## If osrOut is non-nil and the top-level function executes OsrBackEdgeThreshold
   ## loop back-edges, osrOut[].triggered is set to true so the caller can JIT-compile
   ## the function for subsequent calls.
-  let funcInst {.cursor.} = vm.store.funcs[funcAddr]
+  when WasmSuspendableHostCalls:
+    # Nested guest execution must never complete a request in its caller's slot.
+    let previousHostWaitSlot = vm.hostWaitSlot
+    vm.hostWaitSlot = nil
+    defer: vm.hostWaitSlot = previousHostWaitSlot
+  let sliced = when resumable and WasmSuspendableHostCalls: continuation != nil
+    else: resumable
+  when resumable and WasmAtomicWaitEnabled:
+    if sliced and continuation[].status == wesAtomicBlocked:
+      let wait {.cursor.} = continuation[].atomicWait
+      vm.validateAtomicContinuation(wait)
+      if continuation[].funcAddr != funcAddr:
+        trap("stale interpreter atomic continuation")
+      if (deadlineClock != nil and deadlineClock() >= deadlineTick) or
+          vm.executionAtomicRemainingNs(continuation[]) != 0:
+        return @[]
+      let resultBits = if wait.state == wawNotified: 0'u64 else: 2'u64
+      if wait.state == wawPending: vm.removeAtomicWait(wait)
+      wait.state = wawAborted
+      continuation[].atomicWait = nil
+      vm.pushRaw(resultBits)
+      continuation[].status = wesYielded
+  when resumable and WasmSuspendableHostCalls:
+    if continuation != nil and continuation[].status == wesHostBlocked:
+      if continuation[].funcAddr != funcAddr or continuation[].hostVm != (addr vm) or
+          continuation[].hostCallStackTop != vm.callStackTop:
+        trap("stale interpreter host continuation")
+      if (deadlineClock != nil and deadlineClock() >= deadlineTick) or
+          not continuation[].executionHostReady():
+        return @[]
+      let lanes = vm.finishHostWait(continuation[])
+      continuation[].hostVm = nil
+      if continuation[].hostTailCall:
+        let frame = vm.callStack[vm.callStackTop - 1]
+        vm.localsTop = frame.localsStart
+        vm.labelStackTop = frame.labelStackStart
+        dec vm.callStackTop
+      if vm.callStackTop == continuation[].entryCallStackTop:
+        vm.valueStackTop = continuation[].entryValueStackTop
+        continuation[].status = wesComplete
+        return lanes
+      for lane in lanes: vm.pushRaw(wasmValueToRaw(lane))
+      continuation[].status = wesYielded
 
+    var hostWait: WasmHostWait
+    template recordHostWait(address: int, tail: static bool) =
+      continuation[].hostWait = move hostWait
+      continuation[].hostVm = addr vm
+      continuation[].hostFuncAddr = address
+      continuation[].hostCallStackTop = vm.callStackTop
+      continuation[].hostTailCall = tail
+      continuation[].status = wesHostBlocked
+
+  let funcInst {.cursor.} = vm.store.funcs[funcAddr]
   # Handle host functions directly
   if funcInst.isHost:
     when resumable:
-      if continuation == nil or continuation[].status in {wesYielded, wesMemoryBlocked}:
+      if sliced and continuation[].status in SuspendedExecution:
         trap("invalid host-function continuation")
+    when defined(wasmFunctionReferences): vm.checkReferenceValues(funcInst.funcType, args, true)
+    when resumable and WasmSuspendableHostCalls:
+      if sliced:
+        continuation[] = WasmContinuation(
+          status: wesRunning, funcAddr: funcAddr,
+          entryValueStackTop: vm.valueStackTop, entryCallStackTop: vm.callStackTop,
+          entryLabelStackTop: vm.labelStackTop, entryLocalsTop: vm.localsTop)
+        result = vm.callSuspendableHost(funcInst.hostFunc, args, hostWait)
+        if hostWait.finish != nil: recordHostWait(funcAddr, false)
+        else:
+          when defined(wasmFunctionReferences): vm.checkReferenceValues(funcInst.funcType, result, false)
+          continuation[].status = wesComplete
+        return result
+    elif resumable:
       continuation[].status = wesComplete
-    return funcInst.hostFunc(args)
+    result = funcInst.hostFunc(args)
+    when defined(wasmFunctionReferences): vm.checkReferenceValues(funcInst.funcType, result, false)
+    return
 
   let ft = funcInst.funcType
+  var entryValueStackTop = vm.valueStackTop
+  var entryCallStackTop = vm.callStackTop
+  var entryLabelStackTop = vm.labelStackTop
+  var entryLocalsTop = vm.localsTop
+  var resuming = false
   when resumable:
-    if continuation == nil: trap("missing interpreter continuation")
-    if continuation[].status in {wesYielded, wesMemoryBlocked}:
-      if continuation[].funcAddr != funcAddr or
-          vm.callStackTop <= continuation[].entryCallStackTop:
-        trap("stale interpreter continuation")
-    else:
-      continuation[] = WasmContinuation(
-        status: wesReady, funcAddr: funcAddr,
-        entryValueStackTop: vm.valueStackTop,
-        entryCallStackTop: vm.callStackTop,
-        entryLabelStackTop: vm.labelStackTop,
-        entryLocalsTop: vm.localsTop)
-    let resuming = continuation[].status in {wesYielded, wesMemoryBlocked}
-    let entryValueStackTop = continuation[].entryValueStackTop
-    let entryCallStackTop = continuation[].entryCallStackTop
-    let entryLabelStackTop = continuation[].entryLabelStackTop
-    let entryLocalsTop = continuation[].entryLocalsTop
-    continuation[].status = wesRunning
-  else:
-    let resuming = false
-    let entryValueStackTop = vm.valueStackTop
-    let entryCallStackTop = vm.callStackTop
-    let entryLabelStackTop = vm.labelStackTop
-    let entryLocalsTop = vm.localsTop
+    if sliced:
+      resuming = continuation[].status in SuspendedExecution
+      if resuming:
+        if continuation[].funcAddr != funcAddr or
+            vm.callStackTop <= continuation[].entryCallStackTop:
+          trap("stale interpreter continuation")
+        entryValueStackTop = continuation[].entryValueStackTop
+        entryCallStackTop = continuation[].entryCallStackTop
+        entryLabelStackTop = continuation[].entryLabelStackTop
+        entryLocalsTop = continuation[].entryLocalsTop
+      else:
+        continuation[] = WasmContinuation(
+          funcAddr: funcAddr, entryValueStackTop: entryValueStackTop,
+          entryCallStackTop: entryCallStackTop, entryLabelStackTop: entryLabelStackTop,
+          entryLocalsTop: entryLocalsTop)
+      continuation[].status = wesRunning
 
   if not resuming:
     if args.len != ft.params.len:
       trap("argument count mismatch: expected " & $ft.params.len &
            ", got " & $args.len)
+
+    when defined(wasmFunctionReferences): vm.checkReferenceValues(ft, args, true)
 
     # Allocate locals: params + body locals
     let localsStart = vm.localsTop
@@ -1353,9 +1774,9 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
     # Copy args into params (convert WasmValue -> uint64)
     for i in 0 ..< ft.params.len:
       vm.locals[localsStart + i] = wasmValueToRaw(args[i])
-    # Zero-init body locals
+    # Numeric locals start at zero and nullable reference locals at null.
     for i in ft.params.len ..< totalLocals:
-      vm.locals[localsStart + i] = 0'u64
+      vm.locals[localsStart + i] = initialLocalBits(funcInst.localTypes[i])
     vm.localsTop = localsStart + totalLocals
 
     # Push frame
@@ -1400,6 +1821,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
   # for self-recursive calls (same function calling itself). Set on first
   # self-call, invalidated when a different function is entered.
   var scParamCount: int = -1    # -1 = cache invalid
+  var scFuncAddr: int = -1
   var scTotalLocals: int
   var scReturnArity: int
   var scCode: ptr Expr
@@ -1466,6 +1888,23 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
     dec sp
     vsBase[sp]
 
+  template invokeHost(callee: untyped, address: int, hostArgs: untyped, tail: static bool) =
+    syncSp()
+    when resumable and WasmSuspendableHostCalls:
+      let hostResults = if sliced: vm.callSuspendableHost(callee.hostFunc, hostArgs, hostWait)
+        else: callee.hostFunc(hostArgs)
+      if hostWait.finish != nil:
+        saveFramePc()
+        continuation[].instructions += sliceInstructions.uint64
+        recordHostWait(address, tail)
+        return @[]
+    else:
+      let hostResults = callee.hostFunc(hostArgs)
+    when defined(wasmFunctionReferences): vm.checkReferenceValues(callee.funcType, hostResults, false)
+    refreshAfterHost()
+    for lane in hostResults:
+      spush(wasmValueToRaw(lane))
+
   template speek(): uint64 =
     vsBase[sp - 1]
 
@@ -1494,16 +1933,18 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       continuation[].status = wesMemoryBlocked
       return @[]
 
-  template loadVal[T](mem: var MemInst, ea: uint64): T =
+  template loadVal[T](memoryIndex: int, ea: uint64): T =
     block:
+      let memAddr = vm.store.modules[cachedModIdx].memAddrs[memoryIndex]
+      template mem: untyped = vm.store.mems[memAddr]
       when resumable and defined(wasmChunkedMemory):
-        if mem.chunked != nil:
+        if sliced and mem.chunked != nil:
           var value: T
           let status = mem.chunked[].readAtProgress(ea,
             cast[ptr UncheckedArray[byte]](addr continuation[].transferBytes[0]),
             sizeof(T).uint32, continuation[].transferProgress)
           if status == lmWouldBlock:
-            suspendMemoryFault(vm.store.modules[cachedModIdx].memAddrs[0])
+            suspendMemoryFault(memAddr)
           if status != lmOk: trap("linear memory read failed: " & $status)
           copyMem(addr value, addr continuation[].transferBytes[0], sizeof(T))
           continuation[].transferProgress = 0
@@ -1513,23 +1954,26 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       else:
         loadValSync[T](mem, ea)
 
-  template storeVal[T](mem: var MemInst, ea: uint64, val: T) =
-    when resumable and defined(wasmChunkedMemory):
-      if mem.chunked != nil:
-        if continuation[].transferProgress == 0:
-          var value = val
-          copyMem(addr continuation[].transferBytes[0], addr value, sizeof(T))
-        let status = mem.chunked[].writeAtProgress(ea,
-          cast[ptr UncheckedArray[byte]](addr continuation[].transferBytes[0]),
-          sizeof(T).uint32, continuation[].transferProgress)
-        if status == lmWouldBlock:
-          suspendMemoryFault(vm.store.modules[cachedModIdx].memAddrs[0])
-        if status != lmOk: trap("linear memory write failed: " & $status)
-        continuation[].transferProgress = 0
+  template storeVal[T](memoryIndex: int, ea: uint64, val: T) =
+    block:
+      let memAddr = vm.store.modules[cachedModIdx].memAddrs[memoryIndex]
+      template mem: untyped = vm.store.mems[memAddr]
+      when resumable and defined(wasmChunkedMemory):
+        if sliced and mem.chunked != nil:
+          if continuation[].transferProgress == 0:
+            var value = val
+            copyMem(addr continuation[].transferBytes[0], addr value, sizeof(T))
+          let status = mem.chunked[].writeAtProgress(ea,
+            cast[ptr UncheckedArray[byte]](addr continuation[].transferBytes[0]),
+            sizeof(T).uint32, continuation[].transferProgress)
+          if status == lmWouldBlock:
+            suspendMemoryFault(memAddr)
+          if status != lmOk: trap("linear memory write failed: " & $status)
+          continuation[].transferProgress = 0
+        else:
+          storeValSync[T](mem, ea, val)
       else:
         storeValSync[T](mem, ea, val)
-    else:
-      storeValSync[T](mem, ea, val)
 
   template inlineBranch(depth: int) =
     ## Inline fast-path branch for arity 0/1 (same logic as opBr).
@@ -1569,15 +2013,15 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       # each guest instruction boundary bounds guest compute preemption to
       # one decoded instruction; host imports and backing I/O need separate
       # admission and may not run inside a hard slot.
-      if sliceInstructions >= instructionBudget or
-          (deadlineClock != nil and deadlineClock() >= deadlineTick):
+      if sliced and (sliceInstructions >= instructionBudget or
+          (deadlineClock != nil and deadlineClock() >= deadlineTick)):
         syncSp()
         saveFramePc()
         continuation[].instructions += sliceInstructions.uint64
         continuation[].status = wesYielded
         return @[]
     when resumable and defined(wasmChunkedMemory):
-      continuation[].retryMemoryInstruction = false
+      if sliced: continuation[].retryMemoryInstruction = false
     if unlikely(cachedPc >= cachedCodeLen):
       # Implicit return — function body end reached
       let curFrame = vm.callStack[vm.callStackTop - 1]
@@ -1886,7 +2330,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       # Frame/Label field writes, skip redundant loadFrameCache fields.
       # The self-call cache (sc*) is populated on the first self-call and
       # reused on subsequent calls to the same function.
-      if calleeAddr == cachedFuncAddr and scParamCount >= 0:
+      if calleeAddr == cachedFuncAddr and calleeAddr == scFuncAddr and scParamCount >= 0:
         let newLocalsStart = vm.localsTop
         let needed = newLocalsStart + scTotalLocals
 
@@ -1898,12 +2342,12 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         for i in 0 ..< scParamCount:
           locBase[newLocalsStart + i] = vsBase[sp + i]
         for i in scParamCount ..< scTotalLocals:
-          locBase[newLocalsStart + i] = 0'u64
+          locBase[newLocalsStart + i] = initialLocalBits(vm.store.funcs[cachedFuncAddr].localTypes[i])
         vm.localsTop = needed
 
         # Save caller pc; write only varying Frame fields
         vm.callStack[vm.callStackTop - 1].pc = cachedPc
-        vm.callStack[vm.callStackTop] = Frame(
+        vm.pushFrame(Frame(
           pc: 0,
           code: scCode,
           brTables: scCode[].brTables.addr,
@@ -1913,17 +2357,15 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           returnArity: scReturnArity,
           moduleIdx: cachedModIdx,
           funcAddr: calleeAddr
-        )
-        inc vm.callStackTop
+        ))
 
-        vm.labelStack[vm.labelStackTop] = Label(
+        vm.pushLabel(Label(
           arity: scReturnArity,
           pc: scCodeLen,
           stackHeight: sp,
           isLoop: false,
           catchTableIdx: -1
-        )
-        inc vm.labelStackTop
+        ))
 
         # Only update varying cached fields (code/brTables/moduleIdx/funcAddr unchanged)
         cachedPc = 0
@@ -1939,11 +2381,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         var hostArgs = newSeq[WasmValue](nParams)
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
-        syncSp()
-        let hostResults = callee.hostFunc(hostArgs)
-        refreshAfterHost()
-        for r in hostResults:
-          spush(wasmValueToRaw(r))
+        invokeHost(callee, calleeAddr, hostArgs, false)
       else:
         let paramCount = callee.funcType.params.len
         let newLocalsStart = vm.localsTop
@@ -1963,11 +2401,12 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         for i in 0 ..< paramCount:
           locBase[newLocalsStart + i] = vsBase[sp + i]
         for i in paramCount ..< newTotalLocals:
-          locBase[newLocalsStart + i] = 0'u64
+          locBase[newLocalsStart + i] = initialLocalBits(callee.localTypes[i])
         vm.localsTop = needed
 
         # Populate self-call cache if this is a self-recursive call
         if calleeAddr == cachedFuncAddr:
+          scFuncAddr = calleeAddr
           scParamCount = paramCount
           scTotalLocals = newTotalLocals
           scReturnArity = returnArity
@@ -1976,9 +2415,9 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         else:
           scParamCount = -1  # invalidate: entering a different function
 
-        # Save caller pc, push frame inline (skip pushFrame proc overhead)
+        # Save the caller PC before growing the execution arena.
         vm.callStack[vm.callStackTop - 1].pc = cachedPc
-        vm.callStack[vm.callStackTop] = Frame(
+        vm.pushFrame(Frame(
           pc: 0,
           code: calleeCode,
           brTables: calleeCode[].brTables.addr,
@@ -1988,18 +2427,15 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           returnArity: returnArity,
           moduleIdx: calleeModIdx,
           funcAddr: calleeAddr
-        )
-        inc vm.callStackTop
+        ))
 
-        # Push label inline
-        vm.labelStack[vm.labelStackTop] = Label(
+        vm.pushLabel(Label(
           arity: returnArity,
           pc: calleeCode[].code.len,
           stackHeight: sp,
           isLoop: false,
           catchTableIdx: -1
-        )
-        inc vm.labelStackTop
+        ))
 
         # Inline loadFrameCache for callee
         cachedCode = cast[ptr UncheckedArray[Instr]](calleeCode[].code[0].addr)
@@ -2011,63 +2447,61 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         cachedFuncAddr = calleeAddr
         continue
 
-    of opCallIndirect:
+    of opCallIndirect, opCallRef:
       let typeIdx = instr.imm1.int
-      let tableIdx = instr.imm2.int
       let modIdx = cachedModIdx
-      let tableAddr = vm.store.modules[modIdx].tableAddrs[tableIdx]
-      let elemIdx = spopI32()
-      if elemIdx < 0 or elemIdx.int >= vm.store.tables[tableAddr].elems.len:
-        trap("undefined element")
-
-      # --- 2-way associative inline cache ---
-      # Key encodes the call site uniquely: upper 32 bits = funcAddr,
-      # lower 32 bits = PC of this call_indirect instruction.
-      # Power-of-two 2-way cache; both entries are checked in order.
-      let icKey  = (cachedFuncAddr.uint64 shl 32) or (cachedPc - 1).uint32.uint64
-      let icSlot = (icKey and (vm.callIcBuf.len.uint64 - 1'u64)).int
       var calleeAddr: int
-      var skipTypeCheck = false
-      block icCheck:
-        # Check entry A first, then entry B.
-        template tryEntry(entry: CallIcEntry) =
-          if entry.key == icKey and entry.elemIdx == elemIdx:
-            let cachedCallee = entry.calleeAddr.int
-            let elem2 = vm.store.tables[tableAddr].elems[elemIdx.int]
-            if elem2.kind == wvkFuncRef and elem2.funcRef == cachedCallee:
-              calleeAddr = cachedCallee
-              skipTypeCheck = true
-              break icCheck
-        tryEntry(vm.callIcBuf[icSlot].a)
-        tryEntry(vm.callIcBuf[icSlot].b)
-      if not skipTypeCheck:
-        let elem = vm.store.tables[tableAddr].elems[elemIdx.int]
-        if elem.kind != wvkFuncRef:
-          trap("indirect call on non-funcref")
-        if elem.funcRef < 0:
-          trap("uninitialized element")
-        calleeAddr = elem.funcRef.int
-        if calleeAddr >= vm.store.funcs.len:
-          trap("undefined function")
-        let callee2 {.cursor.} = vm.store.funcs[calleeAddr]
-        let expectedType {.cursor.} = vm.store.modules[modIdx].types[typeIdx]
-        if callee2.funcType.params.len != expectedType.params.len or
-           callee2.funcType.results.len != expectedType.results.len:
-          trap("indirect call type mismatch")
-        for i in 0 ..< expectedType.params.len:
-          if callee2.funcType.params[i] != expectedType.params[i]:
+      if instr.op == opCallRef:
+        when defined(wasmFunctionReferences):
+          calleeAddr = vm.resolveFunctionReference(modIdx, typeIdx, spopI32())
+        else: trap("typed function references are disabled")
+      else:
+        let tableIdx = instr.imm2.int
+        let tableAddr = vm.store.modules[modIdx].tableAddrs[tableIdx]
+        let elemIdx = spopI32()
+        if elemIdx < 0 or elemIdx.int >= vm.store.tables[tableAddr].elems.len:
+          trap("undefined element")
+
+        # --- 2-way associative inline cache ---
+        # Key encodes the call site uniquely: upper 32 bits = funcAddr,
+        # lower 32 bits = PC of this call_indirect instruction.
+        # Power-of-two 2-way cache; both entries are checked in order.
+        let icKey  = (cachedFuncAddr.uint64 shl 32) or (cachedPc - 1).uint32.uint64
+        let icSlot = (icKey and (vm.callIcBuf.len.uint64 - 1'u64)).int
+        var skipTypeCheck = false
+        block icCheck:
+          # Check entry A first, then entry B.
+          template tryEntry(entry: CallIcEntry) =
+            if entry.key == icKey and entry.elemIdx == elemIdx:
+              let cachedCallee = entry.calleeAddr.int
+              let elem2 = vm.store.tables[tableAddr].elems[elemIdx.int]
+              if elem2.kind == wvkFuncRef and elem2.funcRef == cachedCallee:
+                calleeAddr = cachedCallee
+                skipTypeCheck = true
+                break icCheck
+          tryEntry(vm.callIcBuf[icSlot].a)
+          tryEntry(vm.callIcBuf[icSlot].b)
+        if not skipTypeCheck:
+          let elem = vm.store.tables[tableAddr].elems[elemIdx.int]
+          if elem.kind != wvkFuncRef:
+            trap("indirect call on non-funcref")
+          if elem.funcRef < 0:
+            trap("uninitialized element")
+          calleeAddr = elem.funcRef.int
+          if calleeAddr >= vm.store.funcs.len:
+            trap("undefined function")
+          let callee2 {.cursor.} = vm.store.funcs[calleeAddr]
+          let expectedType {.cursor.} = vm.store.modules[modIdx].types[typeIdx]
+          if not callee2.funcType.matchesCoreFunctionType(expectedType):
             trap("indirect call type mismatch")
-        for i in 0 ..< expectedType.results.len:
-          if callee2.funcType.results[i] != expectedType.results[i]:
-            trap("indirect call type mismatch")
-        # Update the LRU entry: evictB toggles on each miss so both entries age fairly.
-        let newEntry = CallIcEntry(key: icKey, elemIdx: elemIdx,
-                                   calleeAddr: calleeAddr.int32)
-        if vm.callIcBuf[icSlot].evictB:
-          vm.callIcBuf[icSlot].b = newEntry
-        else:
-          vm.callIcBuf[icSlot].a = newEntry
-        vm.callIcBuf[icSlot].evictB = not vm.callIcBuf[icSlot].evictB
+          # Update the LRU entry: evictB toggles on each miss so both entries age fairly.
+          let newEntry = CallIcEntry(key: icKey, elemIdx: elemIdx,
+                                     calleeAddr: calleeAddr.int32)
+          if vm.callIcBuf[icSlot].evictB:
+            vm.callIcBuf[icSlot].b = newEntry
+          else:
+            vm.callIcBuf[icSlot].a = newEntry
+          vm.callIcBuf[icSlot].evictB = not vm.callIcBuf[icSlot].evictB
 
       let callee {.cursor.} = vm.store.funcs[calleeAddr]
 
@@ -2080,11 +2514,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         var hostArgs = newSeq[WasmValue](nParams)
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
-        syncSp()
-        let hostResults = callee.hostFunc(hostArgs)
-        refreshAfterHost()
-        for r in hostResults:
-          spush(wasmValueToRaw(r))
+        invokeHost(callee, calleeAddr, hostArgs, false)
       else:
         let paramCount = callee.funcType.params.len
         let newLocalsStart = vm.localsTop
@@ -2104,12 +2534,12 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         for i in 0 ..< paramCount:
           locBase[newLocalsStart + i] = vsBase[sp + i]
         for i in paramCount ..< newTotalLocals:
-          locBase[newLocalsStart + i] = 0'u64
+          locBase[newLocalsStart + i] = initialLocalBits(callee.localTypes[i])
         vm.localsTop = needed
 
-        # Save caller pc, push frame inline (skip pushFrame proc overhead)
+        # Save the caller PC before growing the execution arena.
         vm.callStack[vm.callStackTop - 1].pc = cachedPc
-        vm.callStack[vm.callStackTop] = Frame(
+        vm.pushFrame(Frame(
           pc: 0,
           code: calleeCode,
           brTables: calleeCode[].brTables.addr,
@@ -2119,18 +2549,15 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           returnArity: returnArity,
           moduleIdx: calleeModIdx,
           funcAddr: calleeAddr
-        )
-        inc vm.callStackTop
+        ))
 
-        # Push label inline
-        vm.labelStack[vm.labelStackTop] = Label(
+        vm.pushLabel(Label(
           arity: returnArity,
           pc: calleeCode[].code.len,
           stackHeight: sp,
           isLoop: false,
           catchTableIdx: -1
-        )
-        inc vm.labelStackTop
+        ))
 
         # Inline loadFrameCache for callee
         cachedCode = cast[ptr UncheckedArray[Instr]](calleeCode[].code[0].addr)
@@ -2179,15 +2606,53 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let modIdx = cachedModIdx
       let globalIdx = instr.imm1.int
       let globalAddr = vm.store.modules[modIdx].globalAddrs[globalIdx]
-      spush(wasmValueToRaw(vm.store.globals[globalAddr].value))
+      let cell {.cursor.} = vm.store.globals[globalAddr]
+      when defined(wasmSharedCoreTypes):
+        if cell.globalType.shared and cell.globalType.valType == vtV128:
+          trap("shared v128 global requires SIMD execution support")
+      spush(wasmValueToRaw(cell.value))
 
     of opGlobalSet:
       let modIdx = cachedModIdx
       let globalIdx = instr.imm1.int
       let globalAddr = vm.store.modules[modIdx].globalAddrs[globalIdx]
-      if vm.store.globals[globalAddr].globalType.mut != mutVar:
+      let cell = addr vm.store.globals[globalAddr]
+      if cell[].globalType.mut != mutVar:
         trap("cannot set immutable global")
-      vm.store.globals[globalAddr].value = rawToWasmValue(spop(), vm.store.globals[globalAddr].globalType.valType)
+      when defined(wasmSharedCoreTypes):
+        if cell[].globalType.shared and cell[].globalType.valType == vtV128:
+          trap("shared v128 global requires SIMD execution support")
+      cell[].value = rawToWasmValue(spop(), cell[].globalType.valType)
+
+    of opGlobalAtomicGet .. opGlobalAtomicCmpXchg:
+      when defined(wasmSharedCoreTypes):
+        # One executor owns this store. The entire operation runs in one
+        # dispatch with no yield, callout, or reference to peer storage.
+        let globalAddr = vm.store.modules[cachedModIdx].globalAddrs[instr.imm1.int]
+        let cell = addr vm.store.globals[globalAddr]
+        let lane = cell[].globalType.valType
+        if lane notin {vtI32, vtI64}: trap("global.atomic requires an i32 or i64 global")
+        let previous = wasmValueToRaw(cell[].value)
+        if instr.op != opGlobalAtomicGet:
+          if cell[].globalType.mut != mutVar: trap("global.atomic: immutable global")
+          let mask = if lane == vtI32: uint32.high.uint64 else: uint64.high
+          let operand = spop() and mask
+          if instr.op == opGlobalAtomicCmpXchg:
+            let expected = spop() and mask
+            if previous == expected: cell[].value = rawToWasmValue(operand, lane)
+          else:
+            let next = case instr.op
+              of opGlobalAtomicSet, opGlobalAtomicXchg: operand
+              of opGlobalAtomicAdd: previous + operand
+              of opGlobalAtomicSub: previous - operand
+              of opGlobalAtomicAnd: previous and operand
+              of opGlobalAtomicOr: previous or operand
+              of opGlobalAtomicXor: previous xor operand
+              else: trap("invalid global atomic operation")
+            cell[].value = rawToWasmValue(next, lane)
+        if instr.op != opGlobalAtomicSet: spush(previous)
+      else:
+        trap("global atomic instructions are disabled")
 
     # ===== Table =====
     of opTableGet:
@@ -2210,137 +2675,197 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       vm.store.tables[tableAddr].elems[idx.int] = rawToWasmValue(rawVal, vm.store.tables[tableAddr].tableType.elemType)
 
     # ===== Memory load/store =====
+    of opMemoryAtomic:
+      when defined(wasmSharedCoreTypes):
+        let access = memoryAtomicSpec(instr.imm2 and 0xff)
+        let input = if access.kind != maLoad: spop() else: 0'u64
+        let expected = if access.kind == maCompareExchange: spop() else: 0'u64
+        let offset = cast[uint32](spopI32()).uint64 + instr.imm1.uint64
+        let memAddr = vm.store.modules[cachedModIdx].memAddrs[instr.pad.int]
+        var previous: uint64
+        let allowIo = when resumable and defined(wasmChunkedMemory): not sliced else: true
+        if not executeMemoryAtomic(vm.store.mems[memAddr], access, offset, expected, input,
+            allowIo, previous):
+          # No write has occurred. Restore operands and recompute from the
+          # current word after the backing store makes the chunk resident.
+          when resumable and defined(wasmChunkedMemory):
+            suspendMemoryFault(memAddr)
+          else:
+            trap("linear memory atomic transfer blocked")
+        if access.kind != maStore: spush(previous)
+      else: trap("atomic instructions are disabled")
+
+    of opAtomicFence:
+      # All guest instructions within a store already execute in one order.
+      when not defined(wasmSharedCoreTypes): trap("atomic instructions are disabled")
+
+    of opMemoryAtomicNotify, opMemoryAtomicWait32, opMemoryAtomicWait64:
+      when WasmAtomicWaitEnabled:
+        let waiting = instr.op != opMemoryAtomicNotify
+        let wide = instr.op == opMemoryAtomicWait64
+        let timeoutOrCount = spop()
+        let expected = if wide: spop()
+          elif waiting: cast[uint32](spopI32()).uint64
+          else: 0'u64
+        let offset = cast[uint32](spopI32()).uint64 + instr.imm1.uint64
+        let memAddr = vm.store.modules[cachedModIdx].memAddrs[instr.pad.int]
+        template memory: untyped = vm.store.mems[memAddr]
+        let width = if wide: 8'u32 else: 4'u32
+        memory.checkAtomicAddress(offset, width)
+        if not waiting:
+          spush(vm.notifyAtomicWaits(memAddr, offset, cast[uint32](timeoutOrCount)).uint64)
+        else:
+          if not memory.memType.limits.shared: trap("atomic wait on unshared memory")
+          let allowIo = when resumable and defined(wasmChunkedMemory): not sliced else: true
+          var current: uint64
+          if not memory.transferMemoryAtomicWord(offset, width, current, false, allowIo):
+            when resumable and defined(wasmChunkedMemory): suspendMemoryFault(memAddr)
+            else: trap("linear memory atomic transfer blocked")
+          if expected != current: spush(1)
+          elif timeoutOrCount == 0: spush(2)
+          else:
+            when resumable:
+              if sliced:
+                continuation[].atomicWait = vm.beginAtomicWait(memAddr, offset,
+                  cast[int64](timeoutOrCount))
+                syncSp()
+                saveFramePc()
+                continuation[].instructions += sliceInstructions.uint64
+                continuation[].status = wesAtomicBlocked
+                return @[]
+            trap("blocking atomic wait requires sliced interpreter execution")
+      else: trap("atomic wait and notify are disabled")
+
     of opI32Load:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI32(loadVal[int32](vm.getMem(cachedModIdx), ea))
+      spushI32(loadVal[int32](instr.pad.int, ea))
 
     of opI64Load:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(loadVal[int64](vm.getMem(cachedModIdx), ea))
+      spushI64(loadVal[int64](instr.pad.int, ea))
 
     of opF32Load:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushF32(loadVal[float32](vm.getMem(cachedModIdx), ea))
+      spushF32(loadVal[float32](instr.pad.int, ea))
 
     of opF64Load:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushF64(loadVal[float64](vm.getMem(cachedModIdx), ea))
+      spushF64(loadVal[float64](instr.pad.int, ea))
 
     of opI32Load8S:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI32(int32(loadVal[int8](vm.getMem(cachedModIdx), ea)))
+      spushI32(int32(loadVal[int8](instr.pad.int, ea)))
 
     of opI32Load8U:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI32(int32(loadVal[uint8](vm.getMem(cachedModIdx), ea)))
+      spushI32(int32(loadVal[uint8](instr.pad.int, ea)))
 
     of opI32Load16S:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI32(int32(loadVal[int16](vm.getMem(cachedModIdx), ea)))
+      spushI32(int32(loadVal[int16](instr.pad.int, ea)))
 
     of opI32Load16U:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI32(int32(loadVal[uint16](vm.getMem(cachedModIdx), ea)))
+      spushI32(int32(loadVal[uint16](instr.pad.int, ea)))
 
     of opI64Load8S:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[int8](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[int8](instr.pad.int, ea)))
 
     of opI64Load8U:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[uint8](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[uint8](instr.pad.int, ea)))
 
     of opI64Load16S:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[int16](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[int16](instr.pad.int, ea)))
 
     of opI64Load16U:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[uint16](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[uint16](instr.pad.int, ea)))
 
     of opI64Load32S:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[int32](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[int32](instr.pad.int, ea)))
 
     of opI64Load32U:
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      spushI64(int64(loadVal[uint32](vm.getMem(cachedModIdx), ea)))
+      spushI64(int64(loadVal[uint32](instr.pad.int, ea)))
 
     of opI32Store:
       let val = spopI32()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[int32](vm.getMem(cachedModIdx), ea, val)
+      storeVal[int32](instr.pad.int, ea, val)
 
     of opI64Store:
       let val = spopI64()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[int64](vm.getMem(cachedModIdx), ea, val)
+      storeVal[int64](instr.pad.int, ea, val)
 
     of opF32Store:
       let val = spopF32()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[float32](vm.getMem(cachedModIdx), ea, val)
+      storeVal[float32](instr.pad.int, ea, val)
 
     of opF64Store:
       let val = spopF64()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[float64](vm.getMem(cachedModIdx), ea, val)
+      storeVal[float64](instr.pad.int, ea, val)
 
     of opI32Store8:
       let val = spopI32()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[uint8](vm.getMem(cachedModIdx), ea, uint8(val and 0xFF))
+      storeVal[uint8](instr.pad.int, ea, uint8(val and 0xFF))
 
     of opI32Store16:
       let val = spopI32()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[uint16](vm.getMem(cachedModIdx), ea, uint16(val and 0xFFFF))
+      storeVal[uint16](instr.pad.int, ea, uint16(val and 0xFFFF))
 
     of opI64Store8:
       let val = spopI64()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[uint8](vm.getMem(cachedModIdx), ea, uint8(val and 0xFF))
+      storeVal[uint8](instr.pad.int, ea, uint8(val and 0xFF))
 
     of opI64Store16:
       let val = spopI64()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[uint16](vm.getMem(cachedModIdx), ea, uint16(val and 0xFFFF))
+      storeVal[uint16](instr.pad.int, ea, uint16(val and 0xFFFF))
 
     of opI64Store32:
       let val = spopI64()
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm1.uint64
-      storeVal[uint32](vm.getMem(cachedModIdx), ea, uint32(val and 0xFFFFFFFF))
+      storeVal[uint32](instr.pad.int, ea, uint32(val and 0xFFFFFFFF))
 
     of opMemorySize:
-      spushI32(vm.getMem(cachedModIdx).pageCount())
+      spushI32(vm.getMem(cachedModIdx, instr.imm1.int).pageCount())
 
     of opMemoryGrow:
       let delta = spopI32()
-      let memAddr = vm.store.modules[cachedModIdx].memAddrs[0]
-      spushI32(vm.store.mems[memAddr].growMemory(delta))
+      spushI32(vm.getMem(cachedModIdx, instr.imm1.int).growMemory(delta))
 
     # ===== Constants =====
     of opI32Const:
@@ -2919,6 +3444,9 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let funcAddr2 = vm.store.modules[modIdx].funcAddrs[funcIdx]
       spush(wasmValueToRaw(wasmFuncRef(funcAddr2.int32)))
 
+    of opRefAsNonNull:
+      if speek().uint32 == uint32.high: trap("null reference")
+
     # ===== Saturating truncations =====
     of opI32TruncSatF32S:
       let a = spopF32()
@@ -2962,12 +3490,9 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let d = cast[uint32](spopI32())
       let dataAddr = vm.store.modules[modIdx].dataAddrs[dataIdx]
       let dataInst = vm.store.datas[dataAddr]
-      if dataInst.dropped:
-        if n != 0:
-          trap("out of bounds memory access")
-      else:
-        if s.uint64 + n.uint64 > dataInst.data.len.uint64:
-          trap("out of bounds memory access")
+      let sourceLen = if dataInst.dropped: 0'u64 else: dataInst.data.len.uint64
+      if s.uint64 + n.uint64 > sourceLen:
+        trap("out of bounds memory access")
       let memAddr = vm.store.modules[modIdx].memAddrs[memIdx]
       if d.uint64 + n.uint64 > vm.store.mems[memAddr].memByteLen():
         trap("out of bounds memory access")
@@ -2975,7 +3500,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         let source = cast[ptr UncheckedArray[byte]](
           vm.store.datas[dataAddr].data[s.int].unsafeAddr)
         when resumable and defined(wasmChunkedMemory):
-          if vm.store.mems[memAddr].chunked != nil:
+          if sliced and vm.store.mems[memAddr].chunked != nil:
             let status = vm.store.mems[memAddr].chunked[].writeAtProgress(
               d.uint64, source, n, continuation[].transferProgress)
             if status == lmWouldBlock: suspendMemoryFault(memAddr)
@@ -3008,14 +3533,14 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         trap("out of bounds memory access")
       if n > 0:
         when resumable and defined(wasmChunkedMemory):
-          if dstMemAddr == srcMemAddr and vm.store.mems[dstMemAddr].chunked != nil:
+          if sliced and dstMemAddr == srcMemAddr and vm.store.mems[dstMemAddr].chunked != nil:
             let status = vm.store.mems[dstMemAddr].chunked[].copyWithinProgress(
               d.uint64, s.uint64, n, continuation[].copyCursor)
             if status == lmWouldBlock: suspendMemoryFault(dstMemAddr)
             if status != lmOk: trap("linear memory copy failed: " & $status)
             continuation[].copyCursor = LinearMemoryCopyCursor()
-          elif vm.store.mems[dstMemAddr].chunked != nil or
-              vm.store.mems[srcMemAddr].chunked != nil:
+          elif sliced and (vm.store.mems[dstMemAddr].chunked != nil or
+              vm.store.mems[srcMemAddr].chunked != nil):
             while continuation[].bulkDone < n:
               let part = min(n - continuation[].bulkDone,
                              continuation[].bulkScratch.len.uint32)
@@ -3066,7 +3591,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         trap("out of bounds memory access")
       if n > 0:
         when resumable and defined(wasmChunkedMemory):
-          if vm.store.mems[memAddr].chunked != nil:
+          if sliced and vm.store.mems[memAddr].chunked != nil:
             for cell in continuation[].bulkScratch.mitems: cell = val
             while continuation[].bulkDone < n:
               let part = min(n - continuation[].bulkDone,
@@ -3095,13 +3620,10 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let d = cast[uint32](spopI32())
       let elemAddr = vm.store.modules[modIdx].elemAddrs[elemIdx]
       let tableAddr = vm.store.modules[modIdx].tableAddrs[tableIdx]
-      let elemInst = vm.store.elems[elemAddr]
-      if elemInst.dropped:
-        if n != 0:
-          trap("out of bounds table access")
-      else:
-        if s.uint64 + n.uint64 > elemInst.elems.len.uint64:
-          trap("out of bounds table access")
+      let elemInst {.cursor.} = vm.store.elems[elemAddr]
+      let elemCount = if elemInst.dropped: 0'u64 else: elemInst.elems.len.uint64
+      if s.uint64 + n.uint64 > elemCount:
+        trap("out of bounds table access")
       if d.uint64 + n.uint64 > vm.store.tables[tableAddr].elems.len.uint64:
         trap("out of bounds table access")
       for i in 0'u32 ..< n:
@@ -3145,17 +3667,14 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let n = cast[uint32](spopI32())
       let initVal = rawToWasmValue(spop(), vm.store.tables[tableAddr].tableType.elemType)
       let oldSize = vm.store.tables[tableAddr].elems.len
-      let newSize = oldSize + n.int
-      let maxSize = if vm.store.tables[tableAddr].tableType.limits.hasMax:
-                      vm.store.tables[tableAddr].tableType.limits.max.int
-                    else:
-                      high(int)
-      if newSize > maxSize:
+      let newSize = oldSize.uint64 + n.uint64
+      let limits = vm.store.tables[tableAddr].tableType.limits
+      let maxSize = if limits.hasMax: limits.max.uint64 else: uint32.high.uint64
+      if newSize > maxSize or newSize > uint64(high(int) div sizeof(WasmValue)):
         spushI32(-1'i32)
       else:
-        let oldLen = vm.store.tables[tableAddr].elems.len
-        vm.store.tables[tableAddr].elems.setLen(newSize)
-        for i in oldLen ..< newSize:
+        vm.store.tables[tableAddr].elems.setLen(newSize.int)
+        for i in oldSize ..< newSize.int:
           vm.store.tables[tableAddr].elems[i] = initVal
         vm.store.tables[tableAddr].tableType.limits.min = uint32(newSize)
         spushI32(int32(oldSize))
@@ -3243,13 +3762,13 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       let localVal = locBase[cachedLocalsStart + instr.imm1.int]
       let base = cast[uint32](spopI32())
       let ea = base.uint64 + instr.imm2.uint64
-      storeVal[int32](vm.getMem(cachedModIdx), ea, cast[int32](localVal and 0xFFFFFFFF'u64))
+      storeVal[int32](0, ea, cast[int32](localVal and 0xFFFFFFFF'u64))
 
     of opLocalGetI32Load:
       # load mem[local[X] + offset]
       let base = cast[uint32](locBase[cachedLocalsStart + instr.imm1.int] and 0xFFFFFFFF'u64)
       let ea = base.uint64 + instr.imm2.uint64
-      spushI32(loadVal[int32](vm.getMem(cachedModIdx), ea))
+      spushI32(loadVal[int32](0, ea))
 
     of opI32ConstI32Eq:
       # TOS == C
@@ -3338,7 +3857,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
       # push(TOS + mem[local[X] + offset])
       let base = cast[uint32](locBase[cachedLocalsStart + instr.imm1.int] and 0xFFFFFFFF'u64)
       let ea = base.uint64 + instr.imm2.uint64
-      let loaded = loadVal[int32](vm.getMem(cachedModIdx), ea)
+      let loaded = loadVal[int32](0, ea)
       let tos = spopI32()
       spushI32(tos + loaded)
 
@@ -3500,11 +4019,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
         sp = frameStackBase
-        syncSp()
-        let hostResults = callee.hostFunc(hostArgs)
-        refreshAfterHost()
-        for r in hostResults:
-          spush(wasmValueToRaw(r))
+        invokeHost(callee, calleeAddr, hostArgs, true)
         # Treat as return
         vm.localsTop = curFrame.localsStart
         vm.labelStackTop = curFrame.labelStackStart
@@ -3532,7 +4047,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           locBase[localsStart + i] = vsBase[sp + i]
         sp = frameStackBase
         for i in paramCount ..< newTotalLocals:
-          locBase[localsStart + i] = 0'u64
+          locBase[localsStart + i] = initialLocalBits(callee.localTypes[i])
         vm.localsTop = needed
         # Reuse frame: update in place (no push/pop)
         vm.labelStackTop = curFrame.labelStackStart
@@ -3544,7 +4059,8 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           localsCount: newTotalLocals,
           labelStackStart: curFrame.labelStackStart,
           returnArity: returnArity,
-          moduleIdx: calleeModIdx
+          moduleIdx: calleeModIdx,
+          funcAddr: calleeAddr
         )
         vm.labelStack[vm.labelStackTop] = Label(
           arity: returnArity,
@@ -3560,25 +4076,33 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         cachedModIdx = calleeModIdx
         cachedLocalsStart = localsStart
         cachedBrTables = calleeCode[].brTables.addr
+        cachedFuncAddr = calleeAddr
         continue
 
-    of opReturnCallIndirect:
+    of opReturnCallIndirect, opReturnCallRef:
       let typeIdx = instr.imm1.int
-      let tableIdx = instr.imm2.int
       let modIdx = cachedModIdx
-      let expectedType {.cursor.} = vm.store.modules[modIdx].types[typeIdx]
-      let tableAddr = vm.store.modules[modIdx].tableAddrs[tableIdx]
-      let elemIdx = spopI32()
-      if elemIdx < 0 or elemIdx.int >= vm.store.tables[tableAddr].elems.len:
-        trap("undefined element")
-      let elem = vm.store.tables[tableAddr].elems[elemIdx.int]
-      if elem.kind != wvkFuncRef or elem.funcRef < 0:
-        trap("uninitialized element")
-      let calleeAddr = elem.funcRef.int
+      var calleeAddr: int
+      if instr.op == opReturnCallRef:
+        when defined(wasmFunctionReferences):
+          calleeAddr = vm.resolveFunctionReference(modIdx, typeIdx, spopI32())
+        else: trap("typed function references are disabled")
+      else:
+        let tableIdx = instr.imm2.int
+        let tableAddr = vm.store.modules[modIdx].tableAddrs[tableIdx]
+        let elemIdx = spopI32()
+        if elemIdx < 0 or elemIdx.int >= vm.store.tables[tableAddr].elems.len:
+          trap("undefined element")
+        let elem = vm.store.tables[tableAddr].elems[elemIdx.int]
+        if elem.kind != wvkFuncRef or elem.funcRef < 0:
+          trap("uninitialized element")
+        calleeAddr = elem.funcRef.int
+        if calleeAddr >= vm.store.funcs.len:
+          trap("undefined function")
+        let expectedType {.cursor.} = vm.store.modules[modIdx].types[typeIdx]
+        if not vm.store.funcs[calleeAddr].funcType.matchesCoreFunctionType(expectedType):
+          trap("indirect call type mismatch")
       let callee {.cursor.} = vm.store.funcs[calleeAddr]
-      if callee.funcType.params.len != expectedType.params.len or
-         callee.funcType.results.len != expectedType.results.len:
-        trap("indirect call type mismatch")
       # Tail call reusing current frame
       let curFrame = vm.callStack[vm.callStackTop - 1]
       let frameStackBase = vm.labelStack[curFrame.labelStackStart].stackHeight
@@ -3588,11 +4112,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
         sp = frameStackBase
-        syncSp()
-        let hostResults = callee.hostFunc(hostArgs)
-        refreshAfterHost()
-        for r in hostResults:
-          spush(wasmValueToRaw(r))
+        invokeHost(callee, calleeAddr, hostArgs, true)
         vm.localsTop = curFrame.localsStart
         vm.labelStackTop = curFrame.labelStackStart
         dec vm.callStackTop
@@ -3617,7 +4137,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           locBase[localsStart + i] = vsBase[sp + i]
         sp = frameStackBase
         for i in paramCount ..< newTotalLocals:
-          locBase[localsStart + i] = 0'u64
+          locBase[localsStart + i] = initialLocalBits(callee.localTypes[i])
         vm.localsTop = needed
         vm.labelStackTop = curFrame.labelStackStart
         vm.callStack[vm.callStackTop - 1] = Frame(
@@ -3628,7 +4148,8 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
           localsCount: newTotalLocals,
           labelStackStart: curFrame.labelStackStart,
           returnArity: returnArity,
-          moduleIdx: calleeModIdx
+          moduleIdx: calleeModIdx,
+          funcAddr: calleeAddr
         )
         vm.labelStack[vm.labelStackTop] = Label(
           arity: returnArity,
@@ -3644,6 +4165,7 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
         cachedModIdx = calleeModIdx
         cachedLocalsStart = localsStart
         cachedBrTables = calleeCode[].brTables.addr
+        cachedFuncAddr = calleeAddr
         continue
 
     # ===== Exception handling =====
@@ -3774,8 +4296,9 @@ proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
   # Sync cached sp back before collecting results
   syncSp()
   when resumable:
-    continuation[].instructions += sliceInstructions.uint64
-    continuation[].status = wesComplete
+    if sliced:
+      continuation[].instructions += sliceInstructions.uint64
+      continuation[].status = wesComplete
 
   # Collect results (convert uint64 -> WasmValue based on result types)
   let returnArity = ft.results.len
@@ -3800,7 +4323,24 @@ proc execute*(vm: var WasmVM, funcAddr: int,
   let labelTop = vm.labelStackTop
   let localsTop = vm.localsTop
   try:
-    result = executeImpl[false](vm, funcAddr, args, profiler, osrOut, nil, 0, nil, 0)
+    # A direct host call can reenter the interpreter (for example via canonical
+    # realloc). Avoid reserving a dispatch frame before invoking the host.
+    let function {.cursor.} = vm.store.funcs[funcAddr]
+    if function.isHost:
+      when WasmSuspendableHostCalls:
+        let previous = vm.hostWaitSlot
+        vm.hostWaitSlot = nil
+        defer: vm.hostWaitSlot = previous
+      when defined(wasmFunctionReferences): vm.checkReferenceValues(function.funcType, args, true)
+      result = function.hostFunc(args)
+      when defined(wasmFunctionReferences): vm.checkReferenceValues(function.funcType, result, false)
+      return
+    when WasmSuspendableHostCalls:
+      # Keep one generated dispatch body in stackful firmware. A nil
+      # continuation selects the same synchronous host and memory semantics.
+      result = executeImpl[true](vm, funcAddr, args, profiler, osrOut, nil, 0, nil, 0)
+    else:
+      result = executeImpl[false](vm, funcAddr, args, profiler, osrOut, nil, 0, nil, 0)
   except CatchableError:
     vm.valueStackTop = valueTop
     vm.callStackTop = callTop
@@ -3816,7 +4356,7 @@ proc executeSlice*(vm: var WasmVM, funcAddr: int,
                    osrOut: ptr OsrTrigger = nil,
                    deadlineClock: WasmDeadlineClock = nil,
                    deadlineTick = 0'u64): seq[WasmValue] =
-  ## Resume on the same core and VM after wesYielded. The returned result seq
+  ## Resume on the same core and VM after wesYielded or wesHostBlocked. The returned result seq
   ## is meaningful only when status becomes wesComplete. This preempts at a
   ## guest instruction boundary; it does not bound a host import or page I/O.
   if instructionBudget == 0: trap("zero interpreter instruction budget")
@@ -3844,7 +4384,18 @@ proc abortExecution*(vm: var WasmVM,
                      continuation: var WasmContinuation) =
   ## Abandon a yielded or trapped call before reusing the VM. This does not
   ## undo guest memory side effects from completed instructions.
-  if continuation.status notin {wesRunning, wesYielded, wesMemoryBlocked}: return
+  if continuation.status != wesRunning and continuation.status notin SuspendedExecution: return
+  when WasmSuspendableHostCalls:
+    if continuation.status == wesHostBlocked and continuation.hostVm != (addr vm):
+      trap("stale interpreter host continuation")
+    continuation.hostWait = WasmHostWait()
+    continuation.hostVm = nil
+  when WasmAtomicWaitEnabled:
+    if continuation.status == wesAtomicBlocked:
+      vm.validateAtomicContinuation(continuation.atomicWait)
+      vm.removeAtomicWait(continuation.atomicWait)
+      continuation.atomicWait.state = wawAborted
+      continuation.atomicWait = nil
   vm.valueStackTop = continuation.entryValueStackTop
   vm.callStackTop = continuation.entryCallStackTop
   vm.labelStackTop = continuation.entryLabelStackTop
@@ -4039,6 +4590,17 @@ proc portableStoreEligible(vm: WasmVM): bool =
     if function.isHost or function.moduleIdx != 0 or function.code == nil or
         vtExternRef in function.funcType.params or vtExternRef in function.funcType.results:
       return false
+  when defined(wasmSharedCoreTypes):
+    for memory in vm.store.mems:
+      if memory.memType.limits.shared: return false
+    for table in vm.store.tables:
+      if table.tableType.limits.shared: return false
+    for segment in vm.store.elems:
+      if segment.shared: return false
+    for segment in vm.store.datas:
+      if segment.shared: return false
+    for global in vm.store.globals:
+      if global.globalType.shared: return false
   true
 
 include ./runtime_portable_store
@@ -4078,8 +4640,7 @@ proc checkPortablePrefix(vm: WasmVM, continuation: WasmContinuation,
       vm.labelStackTop <= 0 or vm.labelStackTop > vm.labelStack.len or
       vm.localsTop < 0 or vm.localsTop > vm.locals.len or
       continuation.funcAddr < 0 or
-      continuation.funcAddr >= vm.store.funcs.len or
-      vm.callStack[0].funcAddr != continuation.funcAddr:
+      continuation.funcAddr >= vm.store.funcs.len:
     return wpsUnsupportedState
   let valueCount = vm.valueStackTop
   let frameCount = vm.callStackTop
@@ -4100,6 +4661,11 @@ proc checkPortablePrefix(vm: WasmVM, continuation: WasmContinuation,
       return wpsUnsupportedState
     previousLabelStart = frame.labelStackStart
   if vm.callStack[0].labelStackStart != 0:
+    return wpsUnsupportedState
+  # A tail call can replace the first frame while the continuation still
+  # names the job's original export. It must preserve that export's results.
+  if vm.store.funcs[vm.callStack[0].funcAddr].funcType.results !=
+      vm.store.funcs[continuation.funcAddr].funcType.results:
     return wpsUnsupportedState
   for label in vm.labelStack.toOpenArray(0, labelCount - 1):
     if label.arity < 0 or label.arity > 16 or label.pc < 0 or
@@ -4306,8 +4872,8 @@ proc validatePortableSnapshot(vm: var WasmVM, continuation: WasmContinuation,
     let returnArity = portableRead32(data, at + 16)
     let moduleIdx = portableRead32(data, at + 20)
     let funcAddr = portableRead32(data, at + 24)
-    if moduleIdx != 0 or funcAddr >= vm.store.funcs.len.uint32 or
-        (i == 0 and funcAddr != root): return wpsInvalidSnapshot
+    if moduleIdx != 0 or funcAddr >= vm.store.funcs.len.uint32:
+      return wpsInvalidSnapshot
     let function = vm.store.funcs[funcAddr.int]
     if function.isHost or pc > function.code[].code.len.uint32 or
         count != function.localTypes.len.uint32 or
@@ -4316,7 +4882,9 @@ proc validatePortableSnapshot(vm: var WasmVM, continuation: WasmContinuation,
         labelStart > labelCount.uint32 or
         labelStart.int < previousLabelStart or returnArity > 16:
       return wpsInvalidSnapshot
-    if i == 0 and labelStart != 0: return wpsInvalidSnapshot
+    if i == 0 and (labelStart != 0 or function.funcType.results !=
+        vm.store.funcs[root.int].funcType.results):
+      return wpsInvalidSnapshot
     previousLabelStart = labelStart.int
     at += WasmPortableFrameBytes
   var owner = 0

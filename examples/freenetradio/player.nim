@@ -13,6 +13,8 @@
 ## module has no hardware in it and is tested on the host. Pure Nim.
 
 import ./mp3dec, ./i2s_ring, ./eq, ./pipe, ./status, ./spectrum, ./diag, ./timebase
+when defined(bl808m0) and defined(radioProfiler):
+  import bl808/kernel/profiler
 
 const
   Prebuffer* = UpstreamPipeLen * 15 div 16
@@ -40,6 +42,7 @@ type
     srIdle    ## nothing to play or still buffering: come back in 20 ms
     srWait    ## the ring is full or the data ran out: come back in 10 ms
     srYield   ## a frame was decoded: let the other tasks run, then continue
+    srDecodePending ## wait for an outstanding asynchronous decode
 
   DecodeFn* = proc(ctx: pointer; mp3: openArray[byte]; pcm: var openArray[int16];
                    info: var FrameInfo): tuple[consumed: int, status: DecodeStatus] {.nimcall.}
@@ -49,6 +52,7 @@ type
     ctx*: pointer
     decode*: DecodeFn
     takeSpectrum*: SpectrumFn
+    decodeUs*: proc(): uint32 {.nimcall.}
 
   OutputOps* = object
     ## The DAC side. All four are required.
@@ -82,6 +86,7 @@ type
     fullSinceSet: bool
     lastPassUs: uint64
     inPass: bool                       ## between the top of a pass and its end
+    waitingForDecode: bool
     gain: int32                        ## this pass's volume, 0..32768
 
 static:
@@ -142,7 +147,10 @@ proc beginPass(p: var Player): bool =
   stats.maxLoopGapUs = max(stats.maxLoopGapUs, satU32(now - p.lastPassUs))
   p.lastPassUs = now
   if p.playing:
-    stats.minQueued = min(stats.minQueued, p.ring.queuedFrames.uint32)
+    let queued = p.ring.queuedFrames.uint32
+    stats.minQueued = min(stats.minQueued, queued)
+    when defined(bl808m0) and defined(radioProfiler):
+      profileAudioQueue(queued)
   let phase = st.phase
   let volume = if st.muted: 0 else: st.volume.int
 
@@ -218,21 +226,23 @@ proc emitFrame(p: var Player; info: FrameInfo; us: uint32) =
     p.decodeTotalUs = p.decodeTotalUs div 2
     p.decodeCount = p.decodeCount div 2
 
-proc decodeOne(p: var Player): bool =
-  ## One turn of upstream's decode loop. True if a frame's worth of input
-  ## was used and the loop goes on (after a yield).
+proc decodeOne(p: var Player): StepResult =
+  ## One turn of upstream's decode loop.
   # Decode while there's room for a whole frame in the ring.
   if p.ring.freeFrames <= MaxSamplesPerFrame div 2 + 64:
-    return false
+    return srWait
   if p.windowLen < Window:
     p.windowLen += stream.read(toOpenArray(p.window, p.windowLen, Window - 1))
   if p.windowLen < MinDecodeInput:
-    return false
+    return srWait
   var info: FrameInfo
   let started = nowUs()
   let (used, status) = p.dec.decode(p.dec.ctx, toOpenArray(p.window, 0, p.windowLen - 1),
                                     toOpenArray(p.pcm, 0, MaxSamplesPerFrame - 1), info)
-  let us = satU32(nowUs() - started)
+  if status == dsPending:
+    return srDecodePending
+  let workerUs = if p.dec.decodeUs == nil: 0'u32 else: p.dec.decodeUs()
+  let us = if workerUs == 0: satU32(nowUs() - started) else: workerUs
   if used > 0:
     moveMem(addr p.window[0], addr p.window[used], p.windowLen - used)
   p.windowLen -= used
@@ -243,7 +253,8 @@ proc decodeOne(p: var Player): bool =
   of dsReservoirUnavailable: stats.decodeErrors[1] += 1
   of dsCorrupt: stats.decodeErrors[2] += 1
   of dsUnsupportedLayer: stats.decodeErrors[3] += 1
-  used != 0   # 0 shouldn't happen; avoid spinning
+  of dsPending: discard
+  if used != 0: srYield else: srWait
 
 proc endPass(p: var Player) =
   ## Running dry: go back to buffering. If audio is still queued, fade it
@@ -253,6 +264,8 @@ proc endPass(p: var Player) =
   let queued = p.ring.queuedFrames
   let overtaken = p.ring.resyncIfUnderrun(p.output.readPos(), ResyncLeadFrames)
   if overtaken or (starved and queued < StarvedQueueFrames):
+    when defined(bl808m0) and defined(radioProfiler):
+      profileAudioQueue(if overtaken: 0'u32 else: queued.uint32, underrun = true)
     stats.underrunInfo = [satU32((nowUs() - p.playStartedUs) div 1000),
                           (if overtaken: 1'u32 else: 2'u32), buffered.uint32, queued.uint32]
     st.underruns += 1
@@ -262,15 +275,18 @@ proc endPass(p: var Player) =
 
 proc step*(p: var Player): StepResult =
   ## Run the player a little; see `StepResult` for what to do next.
+  if p.waitingForDecode and
+      (p.generation != st.generation or st.phase notin {phBuffering, phPlaying}):
+    p.inPass = false
+    p.waitingForDecode = false
   if not p.inPass:
     if not p.beginPass():
       p.output.commit(p.ring)
       return srIdle
     p.inPass = true
-  if p.decodeOne():
-    result = srYield
-  else:
+  result = p.decodeOne()
+  p.waitingForDecode = result == srDecodePending
+  if result == srWait:
     p.inPass = false
     p.endPass()
-    result = srWait
   p.output.commit(p.ring)

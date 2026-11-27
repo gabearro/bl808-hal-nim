@@ -701,7 +701,7 @@ proc sendResponse(status, value, counter: uint32) =
     for j in 0 ..< 4:
       bytes[i * 4 + j] = ((word shr (j * 8)) and 0xFF).uint8
   if activeTransport == viaUart:
-    discard console.send(bytes)
+    for b in bytes: discard console.sendByte(b)
     console.flushTx()
   else:
     discard sendMuxControl(MuxData, 0, bytes)

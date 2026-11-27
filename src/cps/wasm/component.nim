@@ -1,11 +1,26 @@
 ## Bounded Component Model 0.2 canonical lift/lower path.
 ##
-## This decoder intentionally accepts only the synchronous subset it
-## can execute. Every other section/definition is rejected before core module
+## This decoder accepts a bounded execution profile, including opt-in
+## callback tasks. Unsupported definitions are rejected before core module
 ## instantiation. In particular, accepting a component header alone must never
 ## be mistaken for component validation.
 
 import types, binary, validate, runtime, utf8_names, component_resources
+
+when defined(wasmComponentStackful) and not defined(wasmComponentAsyncCallbacks):
+  {.error: "wasmComponentStackful requires wasmComponentAsyncCallbacks".}
+const ComponentEndpointsEnabled = defined(wasmComponentFutures) or defined(wasmComponentStreams)
+when ComponentEndpointsEnabled and not defined(wasmComponentAsyncCallbacks):
+  {.error: "wasmComponentFutures and wasmComponentStreams require wasmComponentAsyncCallbacks".}
+when defined(wasmComponentHostEndpoints) and not ComponentEndpointsEnabled:
+  {.error: "wasmComponentHostEndpoints requires wasmComponentFutures or wasmComponentStreams".}
+when defined(wasmComponentThreads) and not defined(wasmComponentStackful):
+  {.error: "wasmComponentThreads requires wasmComponentStackful".}
+when defined(wasmComponentThreadSpawn) and not
+    (defined(wasmComponentThreads) and defined(wasmFunctionReferences)):
+  {.error: "wasmComponentThreadSpawn requires wasmComponentThreads and wasmFunctionReferences".}
+when defined(wasmComponentStackful) and defined(wasmChunkedMemory):
+  import linear_memory
 
 const
   ComponentVersion* = "0.2.0"
@@ -15,9 +30,12 @@ const
     elif defined(bl808d0): 64 * 1024
     else: 1024 * 1024
   MaxComponentTypes = when defined(bl808lp): 8 else: 128
+  MaxComponentGuestThreads = when defined(bl808lp): 3 else: 32
   MaxComponentFunctions = when defined(bl808lp): 8 else: 128
   MaxComponentCoreModules = when defined(bl808lp): 4 else: 32
   MaxFlatParams = 16
+  MaxFlatAsyncParams = 4
+  MaxComponentAsyncTasks = when defined(bl808lp): 4 else: 32
   MaxComponentParams = 32
   MaxComponentStringBytes = 4096
   MaxComponentByteListBytes = 4096
@@ -27,9 +45,10 @@ const
   MaxComponentVariantCases = 16
   MaxComponentFlags = 32
   MaxIndirectParamBytes = 4096
+  MaxCanonicalValueBytes = 1 shl 28
   MaxComponentNesting = when defined(bl808lp): 1
     elif defined(bl808m0) or defined(bl808d0): 2
-    else: 4
+    else: 8
   MaxComponentContractNesting = when defined(bl808lp): 2 else: 8
   MaxComponentContractComparisons = when defined(bl808lp): 32 else: 1024
   MaxInstanceNesting = when defined(bl808lp): 2 else: 8
@@ -50,6 +69,13 @@ static:
 
 type
   ComponentError* = object of CatchableError
+
+  ComponentNameAttributes* = object
+    ## Optional host metadata. The declared name is the linker key.
+    implements*, versionSuffix*, externalId*: string
+    hasExternalId*: bool
+
+  ExternalName = tuple[name: string, sort: byte, attributes: ComponentNameAttributes]
 
   ComponentPrim* = enum
     cpBool = 0x7f
@@ -78,6 +104,11 @@ type
     cpOwnedResource = 0x66
     cpBorrowedResource = 0x65
     cpList = 0x64
+    cpMap = 0x63
+    cpFixedList = 0x62
+    cpFuture = 0x61
+    cpStream = 0x60
+    cpErrorContext = 0x5f
     cpInterfaceType = 0x42  # an instance type, never a ComponentValue
     cpFunctionType = 0x41
     cpComponentType = 0x40
@@ -87,7 +118,7 @@ type
     name*: string
     kind*: ComponentPrim
     shape: ref CanonicalSlot
-    offset: uint16
+    offset: uint32
 
   ComponentVariantCase* = object
     name*: string
@@ -106,12 +137,18 @@ type
     caseIndex*: uint32
     ownsResource: bool
     resource: ComponentOwnedValue
+    when ComponentEndpointsEnabled:
+      endpoint: ComponentEndpointValue
+    when defined(wasmComponentErrorContext):
+      errorContext: ComponentErrorContextValue
 
   ComponentFuncType* = object
     params*: seq[ComponentPrim]
     paramNames: seq[string]
     paramTypeIndices*: seq[int32]
     hasResult*: bool
+    when defined(wasmComponentAsyncCallbacks):
+      isAsync*: bool
     resultType*: ComponentPrim
     resultTypeIndex*: int32
     paramArea: CanonicalParams
@@ -119,7 +156,7 @@ type
 
   AbiLayout = tuple[size, alignment: int]
 
-  ResourceUse = enum ruOwn, ruBorrow
+  ResourceUse = enum ruOwn, ruBorrow, ruEndpoint, ruErrorContext
   ResourceUses = set[ResourceUse]
 
   RecordShape = ref object
@@ -139,6 +176,7 @@ type
     recordShape: RecordShape
     cases: seq[ComponentVariantCase]
     listElement: ref CanonicalSlot
+    listLength: uint32
 
   CanonicalParams = ref object
     layout: AbiLayout
@@ -154,6 +192,8 @@ type
     handleTypes: ptr seq[ResourceTypeAlias]
     interfaceType: ptr InterfaceType
     rebasedShapes: RebasedShapes
+    publishedResources: seq[ResourceName]
+    importedResources: seq[ResourceName]
     outerValueNames: ref seq[tuple[index, depth: uint16]]
     coreModuleValues: ptr seq[CoreModuleValue]
     corePlan: ptr ComponentPlan
@@ -176,6 +216,17 @@ type
 
   FunctionTypeNames = ref seq[tuple[shape: ref CanonicalSlot, diagnostic: string]]
 
+  # Separate member tables need their declaration order for type visibility.
+  ResourceName = ref object
+    ## Identity of a resource type name, independent of its runtime ordinal.
+
+  ResourceNameBindings = ref seq[tuple[source, target: ResourceName]]
+  ResourceNames = ref seq[ResourceName]
+  ResourceNameProjection = ref seq[tuple[source: ResourceName, ordinal: uint16, target: ResourceName]]
+
+  VisibilityMember = enum vmType, vmResource, vmFunction, vmFunctionType, vmInstance
+  VisibilityOrder = ref seq[tuple[member: VisibilityMember, index: uint8]]
+
   OuterTypeReference = tuple[target: ptr ShapeScope, index, depth: uint32,
                              crossedComponent, crossedNamingScope: bool]
 
@@ -195,10 +246,17 @@ type
     memoryName: string
     reallocName: string
     postReturnName: string
+    when defined(wasmComponentAsyncCallbacks):
+      callbackSource: uint16
+      callbackName: string
+    when defined(wasmComponentStackful):
+      stackful: bool
     coreSources: array[CoreLiftSource, uint16]
     stringEncoding: CanonicalStringEncoding
     target: ComponentTarget
     targetIndex: uint16
+    visibilityNames: FunctionTypeNames
+    resourceNames: ResourceNames
 
   ComponentHostFunc* = proc(args: openArray[ComponentValue]):
     seq[ComponentValue] {.closure.}
@@ -225,6 +283,7 @@ type
     name: string
     signature: ComponentFuncType
     interfaceIndex: uint16  # zero for a function at component scope
+    visibilityNames: FunctionTypeNames
 
   ComponentPlan* = object
     validated: bool
@@ -247,10 +306,160 @@ type
     name*: string
     bytes*: seq[byte]
 
+  CanonicalExecutionState = ref object
+    mayLeave: bool
+    when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+      context: ptr int32
+    when defined(wasmComponentAsyncCallbacks):
+      callbackTask: ptr CanonicalCallbackTask
+      borrowScope: uint32
+    when defined(wasmComponentThreads):
+      thread: ComponentGuestThread
+      contextSecond: ptr int32
+
+  CanonicalCallbackResolution = enum
+    ccrRunning, ccrCancelPending, ccrCancelDelivered, ccrReturned, ccrCancelled
+
+  CanonicalCallbackTask = object
+    when defined(wasmComponentAsyncCallbacks):
+      signature: ptr ComponentFuncType
+      memoryAddress: int
+      encoding: CanonicalStringEncoding
+      resolution: CanonicalCallbackResolution
+      subtask: pointer   # Backpointer to the subtask owning this invocation.
+      values: seq[ComponentValue]
+
+  ComponentCallbackState* = enum
+    ccsReady, ccsYielded, ccsComplete, ccsUnresolved, ccsTrapped, ccsWaiting,
+    ccsCoreWaiting, ccsThreadsWaiting
+
+  ComponentCallback* = ref object
+    graph: ComponentInstance
+    invocation: ComponentInvocation
+
+  ComponentInvocation = ref object
+    owner: pointer # The graph owns internal invocations and threads.
+    entry: ComponentExport
+    args: seq[ComponentValue]
+    context: int32
+    task: CanonicalCallbackTask
+    state: ComponentCallbackState
+    resultTaken: bool
+    waiting: ComponentWaitRegistration
+    when defined(wasmComponentAsyncCallbacks):
+      borrows: TaskBorrowScope
+    when defined(wasmComponentStackful):
+      core: ComponentCoreTurn
+    when defined(wasmComponentThreads):
+      implicitId: uint32
+      explicitThreads: uint8
+
+  ComponentGuestState = enum
+    cgtSuspended, cgtReady, cgtRunning, cgtWaiting, cgtFinished
+
+  ComponentGuestThread = ref object
+    owner: pointer
+    invocation: ComponentInvocation
+    id: uint32
+    state: ComponentGuestState
+    implicit: bool
+    core: ComponentCoreTurn
+    directResults: ptr seq[WasmValue]
+    closure: WasmValue
+    context, contextSecond: int32
+
+  ComponentCoreReservation = object
+    exclusive: ref bool
+
+  ComponentCoreTurn = ref object
+    arena: WasmExecutionArena
+    continuation: WasmContinuation
+    address: int
+    reservation: ComponentCoreReservation
+
+  ComponentWaitSet = ref object
+    members, waiters: int
+
+  ComponentWaitRegistration = object
+    id: uint32
+    waitSet: ComponentWaitSet
+
+  ComponentAsyncSlot = object
+    waitSet: ComponentWaitSet
+    subtask: ComponentSubtask
+    when ComponentEndpointsEnabled:
+      endpoint: ComponentEndpoint
+
+  EndpointCopyState = enum
+    fcIdle, fcCopying, fcCancelling, fcDone
+
+  EndpointGuestBuffer = object
+    memoryAddress, reallocAddress: int
+    encoding: CanonicalStringEncoding
+    offset, count, progress: uint32
+    active: bool
+    when defined(wasmComponentHostEndpoints):
+      host: ComponentHostBuffer
+
+  ComponentHostBuffer = ref object
+    values: seq[ComponentValue]
+
+  ComponentEndpointState = object
+    other: ptr ComponentEndpointState   # Non-owning. Dropping either end detaches the pair.
+    shape: ref CanonicalSlot
+    owner: pointer
+    handle, joined: uint32
+    writable: bool
+    state: EndpointCopyState
+    eventPending: bool
+    eventProgress: uint32
+    buffer: EndpointGuestBuffer
+    when defined(wasmComponentStackful):
+      syncWaiter: ref bool
+
+  ComponentEndpoint = ref ComponentEndpointState
+
+  # Retain the nominal identity without retaining its component graph.
+  EndpointResourceIdentity = tuple[state: LocalResourceState, ordinal: uint32]
+
+  ComponentEndpointValue = ref object
+    endpoint: ComponentEndpoint
+    payloadResources: seq[EndpointResourceIdentity]
+    when defined(wasmComponentHostEndpoints):
+      operation: ComponentHostBuffer
+
+  ComponentSubtaskState = enum
+    cstStarting, cstStarted, cstReturned, cstCancelledBeforeStart, cstCancelledBeforeReturn
+
+  ComponentSubtask = ref object
+    lowering: ComponentScheduledLowering
+    arguments: seq[WasmValue]
+    call: ComponentInvocation
+    returnPointer: uint32
+    handle, joined: uint32
+    state: ComponentSubtaskState
+    eventPending, delivered, cancellationRequested, cancelling: bool
+    when defined(wasmComponentAsyncCallbacks):
+      lenders: ResourceLendBatch
+      unresolvedBorrows: TaskBorrowScope
+    when defined(wasmComponentStackful):
+      cancelWaiter: ref bool
+      flatResults: seq[WasmValue]
+
+  ComponentScheduledLowering = ref object
+    caller: pointer
+    callback: ComponentHostFunc
+    target: ComponentCallTarget
+    signature: ComponentFuncType
+    memoryAddress, reallocAddress: int
+    encoding: CanonicalStringEncoding
+    when defined(wasmComponentStackful):
+      synchronous: bool
+
   ComponentInstance* = ref object
     vm: WasmVM
     exports: seq[ComponentExport]
-    mayLeave: ref bool
+    execution: CanonicalExecutionState
     activeEntries: uint8
     locked: bool
     resources: LocalResourceState
@@ -258,11 +467,17 @@ type
     outstandingOwners: int
     links: ComponentLinkState
     generatedFunctions: ref seq[int]  # store function addresses plus one
+    when defined(wasmComponentAsyncCallbacks):
+      asyncSlots: seq[ComponentAsyncSlot]
+      backpressure: uint16
+    when defined(wasmComponentStackful):
+      pausedExclusive: ref bool
 
   ComponentLinks = ref object
     children: seq[ChildInstantiation]
     aliases: seq[ChildExport]
     interfaceImports: seq[InterfaceImport]
+    nameAttributes: ref seq[tuple[name: string, importing: bool, attributes: ComponentNameAttributes]]
     interfaceExports: ref seq[InterfaceExport]
     nestedInterfaceExports: ref seq[InterfaceExport]
     resourceExports: seq[NamedResourceType]
@@ -270,6 +485,7 @@ type
     valueExports: seq[NamedValueType]
     valueImports: seq[NamedValueType]
     typeExports, typeImports: ExternalTypeSurface
+    visibilityOrder: VisibilityOrder
     componentImports: ref seq[NamedComponentType]
     componentExports: ref seq[NamedComponentDefinition]
     coreModules: CoreModuleExternals
@@ -358,6 +574,7 @@ type
     coreModules: ref seq[NamedCoreModule]
     components: ref seq[NamedComponentDefinition]
     typeExternals: ExternalTypeSurface
+    visibilityOrder: VisibilityOrder
 
   NamedValueType = object
     name: string
@@ -381,16 +598,19 @@ type
   NamedResourceType = object
     name: string
     resourceIndex: uint16
-    exportAlias: uint16  # one-based type index at the declaring scope
+    typeName: ResourceName
 
   ChildInstantiation = object
     plan: ref ComponentPlan
     beforeCore: int
     arguments: seq[ComponentExport]
     resourceArgs: seq[uint16]
+    resourceNameBindings: ResourceNameBindings
     componentArguments: ComponentInstantiation
     resourceReexports: seq[tuple[childType, parentType: uint16]]
     coreModuleArguments: ref seq[CoreModuleValue]
+    valueTypeArguments: RebasedShapes # child import alias to the supplied parent type
+    projectedValueTypes: RebasedShapes
 
   ChildExport = object
     childIndex: uint16
@@ -401,6 +621,15 @@ type
     locked: bool
     callDepth: int
     root: pointer
+    when defined(wasmComponentAsyncCallbacks):
+      pendingSubtasks: seq[ComponentSubtask]
+      nextSubtask, startingSubtasks: int
+      activeCallbackTurns: uint8
+      pumping: bool
+    when defined(wasmComponentThreads):
+      guestThreads: seq[ComponentGuestThread]
+      switchTarget: ComponentGuestThread
+      nextGuestThread: int
 
   ComponentLinkState = ref object
     store: ComponentLinkStore
@@ -417,11 +646,32 @@ type
 
   ComponentOwnedValue = ref object
     owner: ComponentInstance
+    when defined(wasmComponentAsyncCallbacks):
+      borrowOwner: pointer
     graph: ComponentInstance
     resourceIndex: uint32
     representation: uint64
     live: bool
     lends: uint32
+
+  ResourceLend = object
+    handle: uint32
+    token: ComponentOwnedValue
+    when defined(wasmComponentAsyncCallbacks):
+      sourceScope: TaskBorrowScope
+
+  TaskBorrowScopeState = object
+    resources: LocalResourceState
+    id: uint32
+    pins: seq[ComponentOwnedValue]
+
+  TaskBorrowScope = ref TaskBorrowScopeState
+
+  ResourceLendBatchState = object
+    resources: LocalResourceState
+    lends: seq[ResourceLend]
+
+  ResourceLendBatch = ref ResourceLendBatchState
 
   CoreFunctionKind = enum
     cfLower
@@ -450,6 +700,10 @@ type
     memoryAlias: int32
     reallocFunction: int32
     postReturnFunction: int32
+    when defined(wasmComponentAsyncCallbacks):
+      callbackFunction: uint32  # one-based core function index
+    when defined(wasmComponentStackful):
+      stackful: bool
     stringEncoding: CanonicalStringEncoding
 
   NamedComponentMethod = object
@@ -467,6 +721,7 @@ type
     coreModules: ref seq[NamedCoreModule]
     components: ref seq[NamedComponentDefinition]
     typeExternals: ExternalTypeSurface
+    visibilityOrder: VisibilityOrder
 
   NamedInstance = object
     name: string
@@ -483,6 +738,7 @@ type
     coreModules: ref seq[NamedCoreModule]
     components: ref seq[NamedComponentDefinition]
     typeExternals: ExternalTypeSurface
+    visibilityOrder: VisibilityOrder
 
   OuterValueName = tuple[depth: uint16, visibility: TypeVisibility]
   InterfaceTypeMember = object
@@ -530,6 +786,18 @@ type
     memoryInstance: uint8
     reallocSource: uint16
     generatedReference: bool
+    when defined(wasmComponentAsyncCallbacks):
+      asyncLower: bool
+      asyncCancel: bool
+    when ComponentEndpointsEnabled:
+      endpointShape: ref CanonicalSlot
+    when defined(wasmComponentThreads):
+      threadTable: uint8  # one-based core instance source
+      threadTableName: string
+      threadClosure: ValType
+      contextSlot: uint8
+    when defined(wasmComponentThreadSpawn):
+      threadSignature: ref FuncType
     afterCores, afterChildren: uint8
     memoryName: string
     reallocName: string
@@ -538,7 +806,17 @@ type
     localTarget: ref ComponentExport
 
   CoreLoweringKind = enum
-    clHost, clResourceNew, clResourceDrop, clResourceRep, clChild, clLocal
+    clHost, clResourceNew, clResourceDrop, clResourceRep, clChild, clLocal,
+    clContextGet, clContextSet, clTaskReturn,
+    clWaitableSetNew, clWaitableSetDrop, clWaitableSetPoll, clWaitableJoin,
+    clSubtaskDrop, clBackpressureInc, clBackpressureDec, clTaskCancel, clSubtaskCancel,
+    clWaitableSetWait, clThreadYield,
+    clErrorContextNew, clErrorContextDebugMessage, clErrorContextDrop,
+    clThreadIndex, clThreadNewIndirect, clThreadResumeLater, clThreadSuspend,
+    clThreadSuspendResume, clThreadYieldResume, clThreadSuspendPromote, clThreadYieldPromote,
+    clThreadSpawnRef, clThreadAvailableParallelism,
+    clEndpointNew, clEndpointRead, clEndpointWrite, clEndpointCancelRead, clEndpointCancelWrite,
+    clEndpointDropReadable, clEndpointDropWritable, clEndpointForward
 
   CanonicalInstantiations = object
     plan: ptr ComponentPlan
@@ -551,22 +829,30 @@ type
     importName: string
     importInterface: uint16
     sourceChild: uint16  # one-based index of an instantiated child
-    sourceType: uint16
+    ascribedFrom: uint16 # one-based implementation of an abstract resource export
+    importedTypeName: ResourceName
 
   ResourceTypeAlias = object
     typeIndex: uint16
     resourceIndex: uint16
     visible: bool
     imported: bool
-    exportAlias: uint16
+    typeName: ResourceName
 
   ResourceDestructorContext = ref object
     vm: ptr WasmVM
     address: int
+    when defined(wasmComponentThreads):
+      owner: pointer
+    when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+      execution: CanonicalExecutionState
 
   LocalResourceState = ref object
     table: ComponentResourceTable
     destructors: seq[ResourceDestructorContext]
+    when defined(wasmComponentAsyncCallbacks):
+      nextBorrowScope: uint32
+      taskBorrowScopes, lendBatches: seq[pointer]  # Weak registrations for graph cleanup.
 
   CoreInstantiation = object
     moduleIndex: uint8
@@ -622,8 +908,99 @@ when defined(wasmChunkedMemory):
 else:
   type ComponentMemoryFactory* = pointer
 
+when defined(wasmComponentStackful):
+  proc `=destroy`(reservation: var ComponentCoreReservation) =
+    if reservation.exclusive != nil: reservation.exclusive[] = false
+    `=destroy`(reservation.exclusive)
+
+when defined(wasmComponentHostEndpoints):
+  type
+    ComponentHostEndpoint* = ComponentEndpointValue
+    ComponentEndpointStatus* = enum
+      cesIdle, cesPending, cesCompleted, cesDropped, cesCancelled
+    ComponentEndpointResult* = object
+      status*: ComponentEndpointStatus
+      count*: uint32
+      values*: seq[ComponentValue] # Received values or the unsent suffix of a write.
+
+when defined(wasmComponentAsyncCallbacks):
+  proc `=destroy`(scope: var TaskBorrowScopeState)
+  proc `=destroy`(batch: var ResourceLendBatchState)
+
+when ComponentEndpointsEnabled:
+  proc detachEndpoint(endpoint: var ComponentEndpointState) =
+    let other = endpoint.other
+    endpoint.other = nil
+    if other == nil: return
+    other.other = nil
+    if other.state != fcDone and not other.eventPending:
+      other.eventPending = true
+      other.eventProgress = 0
+
+  proc `=destroy`(endpoint: var ComponentEndpointState) =
+    endpoint.detachEndpoint()
+    `=destroy`(endpoint.shape)
+    when defined(wasmComponentHostEndpoints): `=destroy`(endpoint.buffer.host)
+    when defined(wasmComponentStackful): `=destroy`(endpoint.syncWaiter)
+
+when defined(wasmComponentAsyncCallbacks):
+  proc `=destroy`(registration: var ComponentWaitRegistration) =
+    if registration.waitSet != nil: dec registration.waitSet.waiters
+    `=destroy`(registration.waitSet)
+
+  proc unregister(registrations: var seq[pointer], item: pointer) =
+    for i, registration in registrations:
+      if registration == item:
+        registrations.del(i)
+        return
+
+  proc findBorrowScope(resources: LocalResourceState, id: uint32): TaskBorrowScope =
+    if id == 0: return nil
+    for registration in resources.taskBorrowScopes:
+      if cast[ptr TaskBorrowScopeState](registration).id == id:
+        return cast[TaskBorrowScope](registration)
+
+  proc releaseTaskBorrows(scope: var TaskBorrowScopeState) =
+    if scope.resources == nil: return
+    if scope.id != 0: discard scope.resources.table.endBorrowScope(scope.id)
+    for pin in scope.pins: dec pin.lends
+    scope.resources.taskBorrowScopes.unregister(addr scope)
+    scope.pins = @[]
+    scope.resources = nil
+    scope.id = 0
+
+  proc `=destroy`(scope: var TaskBorrowScopeState) =
+    scope.releaseTaskBorrows()
+
+proc releaseLends(resources: LocalResourceState, lends: openArray[ResourceLend]) =
+  for lent in lends:
+    lent.token.live = false
+    lent.token.owner = nil
+    when defined(wasmComponentAsyncCallbacks): lent.token.borrowOwner = nil
+    resources.table.releaseLend(lent.handle)
+
+when defined(wasmComponentAsyncCallbacks):
+  proc releaseLendBatch(batch: var ResourceLendBatchState) =
+    if batch.resources == nil: return
+    batch.resources.releaseLends(batch.lends)
+    batch.resources.lendBatches.unregister(addr batch)
+    batch.resources = nil
+    batch.lends = @[]
+
+  proc `=destroy`(batch: var ResourceLendBatchState) =
+    batch.releaseLendBatch()
+
 proc componentFail(message: string) {.noreturn.} =
   raise newException(ComponentError, message)
+
+func endpointName(kind: ComponentPrim): string =
+  if kind == cpStream: "stream" else: "future"
+
+func endpointEnabled(kind: ComponentPrim): bool =
+  case kind
+  of cpFuture: defined(wasmComponentFutures)
+  of cpStream: defined(wasmComponentStreams)
+  else: false
 
 proc visibilityIssue(message: string, deferred: ptr string) {.noinline.} =
   if deferred == nil: componentFail(message)
@@ -633,6 +1010,10 @@ template boundedAdd(target, value, maximum: untyped) =
   if target.len >= maximum:
     componentFail("component index-space limit")
   target.add(value)
+
+proc addMember(order: var VisibilityOrder, member: VisibilityMember, index: int) =
+  if order == nil: new(order)
+  order[].add((member, index.uint8))
 
 proc take(data: openArray[byte], pos: var int, limit: int): byte =
   if pos >= limit or pos < 0: componentFail("truncated component")
@@ -662,9 +1043,9 @@ proc takeCount(data: openArray[byte], pos: var int, limit, maximum: int): int =
   value.int
 
 proc takeName(data: openArray[byte], pos: var int, limit: int,
-              allowEmpty = false): string =
+              allowEmpty = false, maxLength = 255): string =
   let n = takeU32(data, pos, limit)
-  if (n == 0 and not allowEmpty) or n > 255 or n.uint64 > uint64(limit - pos):
+  if (n == 0 and not allowEmpty) or n > maxLength.uint32 or n.uint64 > uint64(limit - pos):
     componentFail("invalid component name")
   result = newString(n.int)
   for i in 0 ..< n.int:
@@ -769,49 +1150,132 @@ func scanVersionIdentifiers(name: string, pos: var int,
     if pos == name.len or name[pos] != '.': return true
     inc pos
 
-func validInterfaceVersion(name: string, start: int): bool =
+func canonicalVersionEnd(name: string, start: int): int =
+  ## Validate the full SemVer and return the end of its canonical prefix.
   var pos = start
+  var split = -1
   for part in 0 ..< 3:
     let first = pos
     while pos < name.len and name[pos] in '0'..'9':
       inc pos
-    if pos == first or (pos - first > 1 and name[first] == '0'): return false
+    if pos == first or (pos - first > 1 and name[first] == '0'): return -1
+    if part < 2 and split < 0 and name[first] != '0': split = pos
     if part < 2:
-      if pos == name.len or name[pos] != '.': return false
+      if pos == name.len or name[pos] != '.': return -1
       inc pos
   if pos < name.len and name[pos] == '-':
     inc pos
-    if not scanVersionIdentifiers(name, pos, preRelease = true): return false
+    if not scanVersionIdentifiers(name, pos, preRelease = true): return -1
+    split = pos
+  if split < 0: split = pos
   if pos < name.len and name[pos] == '+':
     inc pos
-    if not scanVersionIdentifiers(name, pos, preRelease = false): return false
-  pos == name.len
+    if not scanVersionIdentifiers(name, pos, preRelease = false): return -1
+  if pos == name.len: split else: -1
 
-proc takeExternName(data: openArray[byte], pos: var int, limit: int,
-                    allowResourceMembers = false): string =
-  result = takeName(data, pos, limit, allowEmpty = true)
-  if allowResourceMembers and resourceMember(result).kind != rmNone: return
+func interfaceVersionMarker(name: string): int =
+  ## Return -1 for a non-interface name or the end of the path for an interface.
   var colon = -1
   var slash = -1
-  var version = result.len
-  for i, c in result:
+  var version = name.len
+  for i, c in name:
     case c
-    of ':': colon = i
-    of '/': slash = i
+    of ':':
+      if colon >= 0: return -1
+      colon = i
+    of '/':
+      if slash >= 0: return -1
+      slash = i
     of '@':
       version = i
       break
     else: discard
-  let valid = if colon < 0 and slash < 0:
-      validLabel(result, 0, result.len)
+  if colon >= 0 and slash > colon and slash < version and
+      validLabel(name, 0, colon, lowerOnly = true) and
+      validLabel(name, colon + 1, slash, lowerOnly = true) and
+      validLabel(name, slash + 1, version):
+    return version
+  -1
+
+proc requireInterfaceVersion(name, suffix: string, marker: int) {.noinline.} =
+  if marker == name.len:
+    if suffix.len != 0: componentFail("a version suffix requires the name to have a version")
+    return
+  if suffix.len == 0:
+    if canonicalVersionEnd(name, marker + 1) < 0:
+      componentFail("invalid Component Model name: invalid interface version")
+  else:
+    let versionEnd = canonicalVersionEnd(name & suffix, marker + 1)
+    if versionEnd < 0: componentFail("invalid interface version")
+    if versionEnd != name.len: componentFail("invalid canonical interface version split")
+
+proc readNameAttributes(data: openArray[byte], pos: var int, limit: int):
+    ComponentNameAttributes {.noinline.} =
+  let count = takeCount(data, pos, limit, 3)
+  var seen: set[0..2]
+  for _ in 0 ..< count:
+    let tag = take(data, pos, limit)
+    if tag > 2: componentFail("unknown component name attribute")
+    if tag.int in seen: componentFail("duplicate component name attribute")
+    seen.incl(tag.int)
+    case tag
+    of 0:
+      result.implements = takeName(data, pos, limit, allowEmpty = true)
+      if result.implements.len == 0: componentFail("implements requires an interface name")
+    of 1:
+      when defined(wasmComponentCanonicalNames):
+        result.versionSuffix = takeName(data, pos, limit, allowEmpty = true)
+        if result.versionSuffix.len == 0: componentFail("version suffix cannot be empty")
+      else:
+        componentFail("component canonical names are disabled")
     else:
-      colon >= 0 and slash > colon and slash < version and
-        validLabel(result, 0, colon, lowerOnly = true) and
-        validLabel(result, colon + 1, slash, lowerOnly = true) and
-        validLabel(result, slash + 1, version) and
-        (version == result.len or validInterfaceVersion(result, version + 1))
-  if not valid:
+      result.hasExternalId = true
+      result.externalId = takeName(data, pos, limit, allowEmpty = true,
+        maxLength = MaxComponentBytes)
+
+proc takeExternalName(data: openArray[byte], pos: var int, limit: int): ExternalName {.noinline.} =
+  let tag = take(data, pos, limit)
+  if tag > 2: componentFail("unsupported component name attributes")
+  result.name = takeName(data, pos, limit, allowEmpty = true)
+  if tag == 2: result.attributes = readNameAttributes(data, pos, limit)
+  result.sort = take(data, pos, limit)
+  let name = result.name
+  let plain = validLabel(name, 0, name.len)
+  let marker = interfaceVersionMarker(name)
+  let member = resourceMember(name).kind != rmNone
+  if not plain and marker < 0 and not member:
     componentFail("invalid Component Model name")
+  if member and result.sort != 1:
+    componentFail("resource member name requires a function")
+  let attrs = unsafeAddr result.attributes
+  if attrs.implements.len != 0:
+    if result.sort != 5: componentFail("only instances can have an implements attribute")
+    if not plain: componentFail("implements requires a plain external name")
+    let implemented = interfaceVersionMarker(attrs.implements)
+    if implemented < 0: componentFail("implements requires an interface name")
+    requireInterfaceVersion(attrs.implements, attrs.versionSuffix, implemented)
+  elif marker >= 0:
+    if attrs.versionSuffix.len != 0 and result.sort != 5:
+      componentFail("only instances can have a version-suffix attribute")
+    requireInterfaceVersion(name, attrs.versionSuffix, marker)
+  elif attrs.versionSuffix.len != 0:
+    componentFail("version-suffix requires an interface name or implements")
+
+proc rememberNameAttributes(plan: var ComponentPlan, external: ExternalName,
+                            importing: bool) {.noinline.} =
+  let attrs = unsafeAddr external.attributes
+  if attrs.implements.len == 0 and attrs.versionSuffix.len == 0 and not attrs.hasExternalId:
+    return
+  if plan.links == nil: new(plan.links)
+  if plan.links.nameAttributes == nil: new(plan.links.nameAttributes)
+  plan.links.nameAttributes[].add((external.name, importing, attrs[]))
+
+proc componentNameAttributes*(plan: ComponentPlan, name: string,
+                              importing: bool): ComponentNameAttributes =
+  ## Look up metadata on an import or export of this component.
+  if plan.links != nil and plan.links.nameAttributes != nil:
+    for entry in plan.links.nameAttributes[]:
+      if entry.name == name and entry.importing == importing: return entry.attributes
 
 proc takePrim(data: openArray[byte], pos: var int, limit: int): ComponentPrim =
   let b = take(data, pos, limit)
@@ -829,30 +1293,63 @@ proc takePrim(data: openArray[byte], pos: var int, limit: int): ComponentPrim =
   of 0x75'u8: cpF64
   of 0x74'u8: cpChar
   of 0x73'u8: cpString
+  of 0x64'u8:
+    when defined(wasmComponentErrorContext): cpErrorContext
+    else: componentFail("component error-context is disabled")
   else: componentFail("unsupported component value type")
 
 const PrimitiveValues = {cpBool, cpS8, cpU8, cpS16, cpU16, cpS32, cpU32,
-  cpS64, cpU64, cpF32, cpF64, cpChar, cpString}
+  cpS64, cpU64, cpF32, cpF64, cpChar, cpString, cpErrorContext}
+const MapKeyTypes = PrimitiveValues - {cpF32, cpF64, cpErrorContext}
 
 proc takeValType(data: openArray[byte], pos: var int, limit: int,
                  valueKinds: openArray[ComponentPrim]): tuple[kind: ComponentPrim,
                                                               index: int32] =
   if pos >= limit: componentFail("truncated component value type")
-  if data[pos] in 0x73'u8 .. 0x7f'u8:
+  if data[pos] in 0x73'u8 .. 0x7f'u8 or data[pos] == 0x64'u8:
     return (takePrim(data, pos, limit), -1'i32)
   let index = takeU32(data, pos, limit, signedTypeIndex = true)
+  when ComponentEndpointsEnabled:
+    if index < valueKinds.len.uint32 and endpointEnabled(valueKinds[index.int]):
+      return (valueKinds[index.int], index.int32)
   if index >= valueKinds.len.uint32 or
-      valueKinds[index.int] notin PrimitiveValues + {cpBytes, cpU32List, cpU64List, cpList,
+      valueKinds[index.int] notin PrimitiveValues + {cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFixedList,
                                    cpRecord, cpTuple, cpFlags,
                                    cpOption, cpVariant, cpEnum, cpResult,
                                    cpOwnedResource, cpBorrowedResource}:
     componentFail("unsupported component value type index")
   (valueKinds[index.int], index.int32)
 
+proc readComponentResult(data: openArray[byte], pos: var int, limit: int,
+    valueKinds: openArray[ComponentPrim], signature: var ComponentFuncType) =
+  case take(data, pos, limit)
+  of 0x00'u8:
+    signature.hasResult = true
+    let valueType = takeValType(data, pos, limit, valueKinds)
+    if valueType.kind == cpBorrowedResource:
+      componentFail("component function result contains a borrowed resource")
+    signature.resultType = valueType.kind
+    signature.resultTypeIndex = if valueType.kind in
+        {cpRecord, cpTuple, cpFlags, cpOption, cpVariant, cpEnum,
+         cpResult, cpList, cpMap, cpFixedList, cpOwnedResource, cpFuture, cpStream}:
+      valueType.index else: -1'i32
+  of 0x01'u8:
+    if take(data, pos, limit) != 0x00'u8:
+      componentFail("unsupported component result list")
+  else: componentFail("unsupported component result list")
+
+func asyncSignature(signature: ComponentFuncType): bool {.inline.} =
+  when defined(wasmComponentAsyncCallbacks): signature.isAsync
+  else: false
+
 proc readFuncType(data: openArray[byte], pos: var int,
                   limit: int, valueKinds: openArray[ComponentPrim]): ComponentFuncType =
-  if take(data, pos, limit) != 0x40'u8:
-    componentFail("unsupported component type")
+  case take(data, pos, limit)
+  of 0x40'u8: discard
+  of 0x43'u8:
+    when defined(wasmComponentAsyncCallbacks): result.isAsync = true
+    else: componentFail("async component function types are disabled")
+  else: componentFail("unsupported component type")
   let count = takeCount(data, pos, limit, MaxComponentParams)
   for _ in 0 ..< count:
     let label = takeLabel(data, pos, limit)
@@ -863,72 +1360,64 @@ proc readFuncType(data: openArray[byte], pos: var int,
     let valueType = takeValType(data, pos, limit, valueKinds)
     result.params.add(valueType.kind)
     if valueType.kind in {cpRecord, cpTuple, cpFlags, cpOption, cpVariant,
-                          cpEnum, cpResult, cpList, cpOwnedResource, cpBorrowedResource}:
+                          cpEnum, cpResult, cpList, cpMap, cpFixedList,
+                          cpOwnedResource, cpBorrowedResource, cpFuture, cpStream}:
       if result.paramTypeIndices.len == 0:
         for _ in 0 ..< result.params.len - 1:
           result.paramTypeIndices.add(-1'i32)
       result.paramTypeIndices.add(valueType.index)
     elif result.paramTypeIndices.len > 0:
       result.paramTypeIndices.add(-1'i32)
-  case take(data, pos, limit)
-  of 0x00'u8:
-    result.hasResult = true
-    let valueType = takeValType(data, pos, limit, valueKinds)
-    if valueType.kind == cpBorrowedResource:
-      componentFail("component function result contains a borrowed resource")
-    result.resultType = valueType.kind
-    result.resultTypeIndex = if valueType.kind in
-        {cpRecord, cpTuple, cpFlags, cpOption, cpVariant, cpEnum,
-         cpResult, cpList, cpOwnedResource}:
-      valueType.index else: -1'i32
-  of 0x01'u8:
-    if take(data, pos, limit) != 0x00'u8:
-      componentFail("unsupported component result list")
-  else: componentFail("unsupported component result list")
+  readComponentResult(data, pos, limit, valueKinds, result)
 
 proc coreType(t: ComponentPrim): ValType =
   case t
   of cpBool, cpS8, cpU8, cpS16, cpU16, cpS32, cpU32, cpChar,
-     cpOwnedResource, cpBorrowedResource: vtI32
+     cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext: vtI32
   of cpS64, cpU64: vtI64
   of cpF32: vtF32
   of cpF64: vtF64
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpRecord, cpTuple, cpFlags, cpOption,
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFixedList, cpRecord, cpTuple, cpFlags, cpOption,
      cpVariant, cpEnum, cpResult, cpResourceType, cpInterfaceType, cpFunctionType, cpComponentType:
     componentFail("composite value needs canonical lowering")
 
 const
-  CanonicalPairs = {cpString, cpBytes, cpU32List, cpU64List, cpList}
+  CanonicalPairs = {cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap}
   CanonicalVariants = {cpOption, cpVariant, cpEnum, cpResult}
-  ShapedValues = {cpRecord, cpTuple, cpFlags, cpList} + CanonicalVariants
+  ShapedValues = {cpRecord, cpTuple, cpFlags, cpList, cpMap, cpFixedList, cpFuture, cpStream} + CanonicalVariants
   ResourceValues = {cpOwnedResource, cpBorrowedResource}
 
 proc handleSlot(kind: ComponentPrim, typeIndex: int32): CanonicalSlot =
   let use = if kind == cpOwnedResource: ruOwn else: ruBorrow
   CanonicalSlot(kind: kind, resourceType: typeIndex.uint16, resources: {use})
 
+proc plainValueSlot(kind: ComponentPrim): CanonicalSlot =
+  result.kind = kind
+  if kind == cpErrorContext: result.resources = {ruErrorContext}
+
 proc parameterSlot(sig: ComponentFuncType, i: int): CanonicalSlot =
   if sig.paramArea != nil: return sig.paramArea.slots[i]
   let kind = sig.params[i]
   if kind in ResourceValues: handleSlot(kind, sig.paramTypeIndices[i])
-  else: CanonicalSlot(kind: kind)
+  else: plainValueSlot(kind)
 
 proc resultSlot(sig: ComponentFuncType): CanonicalSlot =
   if sig.resultShape != nil: return sig.resultShape[]
   if sig.resultType in ResourceValues: handleSlot(sig.resultType, sig.resultTypeIndex)
-  else: CanonicalSlot(kind: sig.resultType)
+  else: plainValueSlot(sig.resultType)
 
 proc parameterResources(sig: ComponentFuncType): ResourceUses =
   for i, kind in sig.params:
     case kind
     of cpOwnedResource: result.incl(ruOwn)
     of cpBorrowedResource: result.incl(ruBorrow)
+    of cpErrorContext: result.incl(ruErrorContext)
     else:
       if kind in ShapedValues:
         result = result + sig.paramArea.slots[i].resources
 
 proc hasResourceResult(sig: ComponentFuncType): bool =
-  sig.hasResult and (sig.resultType == cpOwnedResource or
+  sig.hasResult and (sig.resultType in {cpOwnedResource, cpErrorContext} or
     (sig.resultShape != nil and sig.resultShape.resources != {}))
 
 template fieldSlot(field: ComponentRecordField): CanonicalSlot =
@@ -941,21 +1430,29 @@ proc singleLaneType(slot: CanonicalSlot): ValType =
   case slot.kind
   of cpRecord, cpTuple:
     singleLaneType(fieldSlot(slot.recordShape.fields[0]))
+  of cpFixedList:
+    singleLaneType(slot.listElement[])
   of cpFlags, cpOption, cpVariant, cpResult, cpEnum: vtI32
   else: coreType(slot.kind)
 
+proc flatSlotWidth(slot: CanonicalSlot): int
+
 proc coreResultType(sig: ComponentFuncType): ValType =
   case sig.resultType
-  of cpRecord, cpTuple:
-    if sig.resultShape.recordShape.flatWidth == 1:
+  of cpRecord, cpTuple, cpFixedList:
+    if flatSlotWidth(sig.resultShape[]) == 1:
       singleLaneType(sig.resultShape[])
     else: vtI32
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpOption, cpVariant, cpEnum,
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpOption, cpVariant, cpEnum,
      cpResult, cpFlags: vtI32
   else: coreType(sig.resultType)
 
 proc flatSlotWidth(slot: CanonicalSlot): int =
   if slot.kind in {cpRecord, cpTuple}: return slot.recordShape.flatWidth.int
+  if slot.kind == cpFixedList:
+    # Larger values are passed indirectly. Do not expand their lane arrays.
+    return min((MaxFlatParams + 1).uint64,
+      slot.listLength.uint64 * flatSlotWidth(slot.listElement[]).uint64).int
   if slot.kind in CanonicalVariants:
     result = 1
     for item in slot.cases:
@@ -971,6 +1468,8 @@ proc joinLane(left, right: ValType): ValType =
 
 proc flatLaneType(slot: CanonicalSlot, index: int): ValType =
   case slot.kind
+  of cpFixedList:
+    return flatLaneType(slot.listElement[], index mod flatSlotWidth(slot.listElement[]))
   of cpRecord, cpTuple:
     var remaining = index
     for field in slot.recordShape.fields:
@@ -990,7 +1489,7 @@ proc flatLaneType(slot: CanonicalSlot, index: int): ValType =
       result = if found: joinLane(result, lane) else: lane
       found = true
     if found: return
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpFlags:
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFlags:
     return vtI32
   else: return coreType(slot.kind)
   componentFail("invalid canonical flat lane index")
@@ -1008,7 +1507,7 @@ func paramsUseMemoryArea(sig: ComponentFuncType): bool =
   sig.paramArea != nil and sig.paramArea.layout.size > 0
 
 proc recordScalarBytes(kind: ComponentPrim): int
-proc variantLayout(cases: openArray[ComponentVariantCase]):
+proc variantLayout(cases: openArray[ComponentVariantCase], pointerBytes = 4):
     tuple[size, alignment, payloadOffset: int]
 
 func abiAlign(offset, alignment: int): int =
@@ -1023,21 +1522,39 @@ proc flagMask(count: int): uint32 =
   if count == 32: uint32.high
   else: (1'u32 shl count) - 1
 
-proc canonicalSlotLayout(slot: CanonicalSlot): AbiLayout =
+proc canonicalSlotLayout(slot: CanonicalSlot, pointerBytes = 4): AbiLayout =
   case slot.kind
   of cpRecord, cpTuple:
-    slot.recordShape.layout
+    if pointerBytes == 4: return slot.recordShape.layout
+    result.alignment = 1
+    for field in slot.recordShape.fields:
+      let layout = canonicalSlotLayout(fieldSlot(field), pointerBytes)
+      result.size = abiAlign(result.size, layout.alignment) + layout.size
+      result.alignment = max(result.alignment, layout.alignment)
+      if result.size >= MaxCanonicalValueBytes: return
+    result.size = abiAlign(result.size, result.alignment)
   of cpOption, cpVariant, cpEnum, cpResult:
-    let variant = variantLayout(slot.cases)
-    (variant.size, variant.alignment)
-  of cpString, cpBytes, cpU32List, cpU64List, cpList: (8, 4)
-  of cpOwnedResource, cpBorrowedResource: (4, 4)
+    let variant = variantLayout(slot.cases, pointerBytes)
+    return (variant.size, variant.alignment)
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap:
+    return (2 * pointerBytes, pointerBytes)
+  of cpFixedList:
+    let element = canonicalSlotLayout(slot.listElement[], pointerBytes)
+    let size = slot.listLength.uint64 * element.size.uint64
+    return (min(size, MaxCanonicalValueBytes.uint64).int, element.alignment)
+  of cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext: return (4, 4)
   of cpFlags:
     let width = flagBytes(slot.cases.len)
-    (width, width)
+    return (width, width)
   else:
     let width = recordScalarBytes(slot.kind)
-    (width, width)
+    return (width, width)
+
+proc validateCanonicalTypeSize(slot: CanonicalSlot) =
+  # The binary validity limit applies to both pointer widths, even when
+  # this execution profile only exposes memory32.
+  if canonicalSlotLayout(slot, 8).size >= MaxCanonicalValueBytes:
+    componentFail("component type exceeds maximum byte size")
 
 proc newSlot(slot: sink CanonicalSlot): ref CanonicalSlot =
   new(result)
@@ -1061,7 +1578,21 @@ proc canonicalSlot(kind: ComponentPrim, typeIndex: int32,
                    shapes: openArray[ref CanonicalSlot]): CanonicalSlot =
   if kind in ShapedValues: canonicalShape(typeIndex, shapes)[]
   elif kind in ResourceValues: handleSlot(kind, typeIndex)
-  else: CanonicalSlot(kind: kind)
+  else: plainValueSlot(kind)
+
+proc layoutCanonicalParams(area: CanonicalParams) =
+  area.layout.alignment = 1
+  for slot in area.slots.mitems:
+    let layout = canonicalSlotLayout(slot)
+    let offset = abiAlign(area.layout.size, layout.alignment)
+    if offset + layout.size > MaxIndirectParamBytes:
+      componentFail("canonical parameter area exceeds profile limit")
+    slot.offset = offset.uint16
+    area.layout.size = offset + layout.size
+    area.layout.alignment = max(area.layout.alignment, layout.alignment)
+  area.layout.size = abiAlign(area.layout.size, area.layout.alignment)
+  if area.layout.size > MaxIndirectParamBytes:
+    componentFail("canonical parameter area exceeds profile limit")
 
 proc configureCanonicalType(sig: var ComponentFuncType, shapes: openArray[ref CanonicalSlot]) =
   if sig.hasResult and sig.resultType in ShapedValues:
@@ -1079,32 +1610,33 @@ proc configureCanonicalType(sig: var ComponentFuncType, shapes: openArray[ref Ca
     let typeIndex = if i < sig.paramTypeIndices.len: sig.paramTypeIndices[i] else: -1'i32
     area.slots.add(canonicalSlot(kind, typeIndex, shapes))
   sig.paramArea = area
-  if flatParamCount(sig) <= MaxFlatParams: return
-  area.layout.alignment = 1
-  for slot in area.slots.mitems:
-    let layout = canonicalSlotLayout(slot)
-    let offset = abiAlign(area.layout.size, layout.alignment)
-    if offset + layout.size > MaxIndirectParamBytes:
-      componentFail("canonical parameter area exceeds profile limit")
-    slot.offset = offset.uint16
-    area.layout.size = offset + layout.size
-    area.layout.alignment = max(area.layout.alignment, layout.alignment)
-  area.layout.size = abiAlign(area.layout.size, area.layout.alignment)
-  if area.layout.size > MaxIndirectParamBytes:
-    componentFail("canonical parameter area exceeds profile limit")
+  if flatParamCount(sig) > MaxFlatParams: layoutCanonicalParams(area)
+
+when defined(wasmComponentAsyncCallbacks):
+  proc configureAsyncParams(sig: var ComponentFuncType) =
+    if sig.flatParamCount() <= MaxFlatAsyncParams: return
+    if sig.paramArea != nil and sig.paramArea.layout.alignment != 0: return
+    let area = CanonicalParams(slots: newSeqOfCap[CanonicalSlot](sig.params.len))
+    for i in 0 ..< sig.params.len: area.slots.add(parameterSlot(sig, i))
+    sig.paramArea = area
+    layoutCanonicalParams(area)
+
+  proc asyncResultArea(sig: ComponentFuncType): bool =
+    sig.hasResult and flatSlotWidth(resultSlot(sig)) > 0
 
 proc resultUsesMemory(sig: ComponentFuncType): bool =
   if not sig.hasResult: return false
   case sig.resultType
-  of cpString, cpBytes, cpU32List, cpU64List, cpList: true
-  of cpRecord, cpTuple: sig.resultShape.recordShape.flatWidth > 1
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap: true
+  of cpRecord, cpTuple, cpFixedList: flatSlotWidth(sig.resultShape[]) > 1
   of cpOption, cpVariant, cpResult: flatSlotWidth(sig.resultShape[]) > 1
   else: false
 
 proc hasPointerPayload(slot: CanonicalSlot): bool =
   case slot.kind
-  of cpString, cpBytes, cpU32List, cpU64List, cpList: true
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap: true
   of cpRecord, cpTuple: slot.recordShape.hasPointers
+  of cpFixedList: hasPointerPayload(slot.listElement[])
   of cpOption, cpVariant, cpResult:
     for item in slot.cases:
       if item.hasPayload and hasPointerPayload(caseSlot(item)): return true
@@ -1121,10 +1653,10 @@ proc matchFlatType(slot: CanonicalSlot, lanes: openArray[ValType], offset: var i
   of cpRecord, cpTuple:
     for field in slot.recordShape.fields:
       if not matchFlatType(fieldSlot(field), lanes, offset): return false
-  of cpString, cpBytes, cpU32List, cpU64List, cpList:
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap:
     if lanes[offset] != vtI32 or lanes[offset + 1] != vtI32: return false
     offset += 2
-  of cpOption, cpVariant, cpEnum, cpResult:
+  of cpOption, cpVariant, cpEnum, cpResult, cpFixedList:
     for i in 0 ..< flatSlotWidth(slot):
       if lanes[offset] != flatLaneType(slot, i): return false
       inc offset
@@ -1135,24 +1667,27 @@ proc matchFlatType(slot: CanonicalSlot, lanes: openArray[ValType], offset: var i
   true
 
 proc signatureMatchesCore(sig: ComponentFuncType, ft: FuncType,
-                          forLower = false): bool =
+                          forLower = false, callback = false, stackful = false): bool =
+  if not ft.isPlainCoreFunction(): return false  # Canonical ABI uses a final singleton type.
   let indirect = sig.paramsUseMemoryArea()
   let expectedParams = if indirect: 1 else: flatParamCount(sig)
   let resultPointer = forLower and sig.resultUsesMemory()
+  let hasResult = (sig.hasResult or callback) and not stackful
+  let resultKind = if callback: vtI32 elif sig.hasResult: coreResultType(sig) else: vtI32
   if ft.params.len != expectedParams + resultPointer.int or
-      ft.results.len != (sig.hasResult and not resultPointer).int:
+      ft.results.len != (hasResult and not resultPointer).int:
     return false
   if indirect:
     if ft.params[0] != vtI32: return false
     if resultPointer: return ft.params[1] == vtI32
-    return not sig.hasResult or ft.results[0] == coreResultType(sig)
+    return not hasResult or ft.results[0] == resultKind
   var offset = 0
   for i, p in sig.params:
     let slot = if p in ShapedValues: sig.paramArea.slots[i] else: CanonicalSlot(kind: p)
     if not matchFlatType(slot, ft.params, offset): return false
-  if sig.hasResult:
+  if hasResult:
     if resultPointer: return ft.params[offset] == vtI32
-    if ft.results[0] != coreResultType(sig):
+    if ft.results[0] != resultKind:
       return false
   true
 
@@ -1179,7 +1714,10 @@ proc validateCoreExport(module: WasmModule, exp: ComponentExport) =
     if item.name != exp.coreName: continue
     if found or item.kind != ekFunc:
       componentFail("invalid core function alias")
-    if not signatureMatchesCore(exp.signature, coreFuncType(module, item.idx)):
+    let callback = when defined(wasmComponentAsyncCallbacks): exp.callbackSource != 0 else: false
+    let stackful = when defined(wasmComponentStackful): exp.stackful else: false
+    if not signatureMatchesCore(exp.signature, coreFuncType(module, item.idx),
+                                callback = callback, stackful = stackful):
       componentFail("canonical function type mismatch")
     found = true
   if not found: componentFail("missing core function export")
@@ -1240,16 +1778,16 @@ proc coreImportMatches(module: WasmModule, imp: Import,
                        actual: CoreExportType): bool =
   if ord(imp.kind) != ord(actual.kind): return false
   case imp.kind
-  of ikFunc: actual.funcType == module.types[imp.funcTypeIdx.int]
+  of ikFunc: actual.funcType.matchesCoreFunctionType(module.types[imp.funcTypeIdx.int])
   of ikTable:
-    actual.tableType.elemType == imp.tableType.elemType and
-      importLimitsMatch(actual.tableType.limits, imp.tableType.limits)
+    importTableTypeMatch(actual.tableType, imp.tableType)
   of ikMemory: importLimitsMatch(actual.memType.limits, imp.memType.limits)
-  of ikGlobal: actual.globalType == imp.globalType
+  of ikGlobal: importGlobalTypeMatch(actual.globalType, imp.globalType)
   of ikTag: actual.funcType == module.types[imp.tagTypeIdx.int]
 
 proc decodeCoreModule(image: CoreModuleImage): WasmModule =
-  decodeModule(image.bytes, optimize = false, retainCustomSections = false)
+  decodeModule(image.bytes, optimize = false, retainCustomSections = false,
+    allowFunctionSubtyping = true)
 
 proc embeddedCount(plan: ComponentPlan): int =
   if plan.coreBytes.len == 0: 0 else: 1 + plan.extraCoreBytes.len
@@ -1260,8 +1798,9 @@ proc embeddedCoreBytes(plan: ComponentPlan, index: int): lent seq[byte] =
 
 proc validatedCoreModule(bytes: openArray[byte]): WasmModule =
   try:
-    result = decodeModule(bytes, optimize = false, retainCustomSections = false)
-    validateModule(result)
+    result = decodeModule(bytes, optimize = false, retainCustomSections = false,
+      allowFunctionSubtyping = true)
+    validateModule(result, allowMultipleMemories = true, allowFunctionSubtyping = true)
   except CatchableError as e:
     componentFail("invalid embedded core module: " & e.msg)
   if result.imports.len > MaxComponentFunctions or
@@ -1318,12 +1857,12 @@ proc requireModuleSubtype(actual, expected: CoreModuleShape) =
       var matches = false
       if have.kind == need.kind:
         case need.kind
-        of ekFunc, ekTag: matches = have.funcType == need.funcType
+        of ekFunc: matches = have.funcType.matchesCoreFunctionType(need.funcType)
+        of ekTag: matches = have.funcType == need.funcType
         of ekTable:
-          matches = have.tableType.elemType == need.tableType.elemType and
-            importLimitsMatch(have.tableType.limits, need.tableType.limits)
+          matches = importTableTypeMatch(have.tableType, need.tableType)
         of ekMemory: matches = importLimitsMatch(have.memType.limits, need.memType.limits)
-        of ekGlobal: matches = have.globalType == need.globalType
+        of ekGlobal: matches = importGlobalTypeMatch(have.globalType, need.globalType)
       if not matches:
         componentFail("core module export type mismatch: " & item.name)
       break
@@ -1338,7 +1877,15 @@ proc readCoreModuleSurface(reader: var BinaryReader, parent: ptr ShapeScope): Co
     let tag = reader.readByte()
     case tag
     of 1:
-      boundedAdd(result.types, reader.readFuncType(), MaxComponentTypes)
+      when defined(wasmFunctionReferences):
+        let group = reader.readCoreFunctionGroup(result.types, MaxComponentTypes - result.types.len)
+        result.types.add(group)
+      else:
+        if reader.peekByte() == 0x60:
+          boundedAdd(result.types, reader.readFuncType(), MaxComponentTypes)
+        else:
+          let group = reader.readCoreFunctionGroup(result.types, MaxComponentTypes - result.types.len)
+          result.types.add(group)
     of 2:
       if reader.readByte() != 0x10 or reader.readByte() != 1:
         componentFail("unsupported core module type alias")
@@ -1380,10 +1927,13 @@ proc readCoreModuleSurface(reader: var BinaryReader, parent: ptr ShapeScope): Co
           item = Export(name: name, kind: ekFunc, idx: result.funcTypeIdxs.len.uint32)
           result.funcTypeIdxs.add(index)
       of 1:
-        let table = reader.readTableType()
+        let table = reader.readTableType(result.types)
         if table.elemType notin {vtFuncRef, vtExternRef} or
             (table.limits.hasMax and table.limits.min > table.limits.max):
           componentFail("invalid core module table type")
+        when defined(wasmSharedCoreTypes):
+          if table.limits.shared and not table.elementReference.isSharedCoreReference():
+            componentFail("shared core module table requires a shared reference type")
         if importing:
           result.imports.add(Import(module: namespace, name: name, kind: ikTable, tableType: table))
         else:
@@ -1391,8 +1941,7 @@ proc readCoreModuleSurface(reader: var BinaryReader, parent: ptr ShapeScope): Co
           result.tables.add(table)
       of 2:
         let memory = reader.readMemType()
-        let limits = memory.limits
-        if limits.min > 65536 or (limits.hasMax and (limits.max > 65536 or limits.min > limits.max)):
+        if not memory.limits.validMemoryLimits():
           componentFail("invalid core module memory limits")
         if importing:
           result.imports.add(Import(module: namespace, name: name, kind: ikMemory, memType: memory))
@@ -1400,7 +1949,10 @@ proc readCoreModuleSurface(reader: var BinaryReader, parent: ptr ShapeScope): Co
           item = Export(name: name, kind: ekMemory, idx: result.memories.len.uint32)
           result.memories.add(memory)
       of 3:
-        let global = reader.readGlobalType()
+        let global = reader.readGlobalType(result.types)
+        when defined(wasmSharedCoreTypes):
+          if not global.hasValidGlobalSharing():
+            componentFail("shared core module global requires a shared reference type")
         if importing:
           result.imports.add(Import(module: namespace, name: name, kind: ikGlobal, globalType: global))
         else:
@@ -1424,20 +1976,31 @@ proc readCoreModuleSurface(reader: var BinaryReader, parent: ptr ShapeScope): Co
 
 proc readCoreType(data: openArray[byte], pos: var int, stop: int, scope: var ShapeScope) =
   if pos >= stop: componentFail("missing core type")
-  var reader = initBinaryReader(data.toOpenArray(pos, stop - 1))
-  var ty: CoreTypeDeclaration
+  var reader = viewBinaryReader(data.toOpenArray(pos, stop - 1))
   try:
     case data[pos]
     of 0x50:
       discard reader.readByte()
-      ty.module = readCoreModuleSurface(reader, addr scope)
-    of 0x60:
-      ty.function = reader.readFuncType()
-    else: componentFail("unsupported core type definition")
+      let ty = CoreTypeDeclaration(module: readCoreModuleSurface(reader, addr scope))
+      boundedAdd(scope.coreTypes, ty, MaxComponentTypes)
+    of 0x00, 0x4e, 0x4f, 0x60, 0x65:
+      when not defined(wasmFunctionReferences):
+        if data[pos] == 0x60:
+          let ty = CoreTypeDeclaration(function: reader.readFuncType())
+          boundedAdd(scope.coreTypes, ty, MaxComponentTypes)
+          pos = stop - reader.remaining()
+          return
+      var prior = newSeqOfCap[FuncType](scope.coreTypes.len)
+      for entry in scope.coreTypes: prior.add(entry.function)
+      let group = reader.readCoreFunctionGroup(prior,
+        MaxComponentTypes - scope.coreTypes.len, componentTopLevel = true)
+      for signature in group:
+        scope.coreTypes.add(CoreTypeDeclaration(function: signature))
+    else:
+      componentFail("unsupported core type definition")
   except WasmDecodeError as error:
     componentFail("invalid core type: " & error.msg)
   pos = stop - reader.remaining()
-  boundedAdd(scope.coreTypes, move ty, MaxComponentTypes)
 
 proc readModuleTypeRef(data: openArray[byte], pos: var int, stop: int,
                        scope: ShapeScope): CoreModuleShape =
@@ -1516,7 +2079,8 @@ proc collectResourceTypes(slot: CanonicalSlot, handles: var seq[uint16]) =
   case slot.kind
   of cpOwnedResource, cpBorrowedResource:
     handles.add(slot.resourceType)
-  of cpList:
+  of cpList, cpFixedList, cpFuture, cpStream:
+    if slot.listElement == nil: return
     collectResourceTypes(slot.listElement[], handles)
   of cpRecord, cpTuple:
     for field in slot.recordShape.fields:
@@ -1532,26 +2096,55 @@ proc signatureResourceTypes(sig: ComponentFuncType): seq[uint16] =
   if sig.hasResult: collectResourceTypes(resultSlot(sig), result)
 
 proc requireVisibleResourceSlot(aliases: openArray[ResourceTypeAlias], slot: CanonicalSlot,
-                                forImport: bool, diagnostic: string, deferred: ptr string = nil) =
+    forImport: bool, diagnostic: string, deferred: ptr string = nil,
+    scope: ptr ShapeScope = nil) =
   var handles: seq[uint16]
   collectResourceTypes(slot, handles)
   for handle in handles:
     let index = lookupResourceType(aliases, handle.uint32)
-    if index < 0 or not aliases[index].visible or
-        (forImport and not aliases[index].imported):
+    if index < 0:
+      visibilityIssue(diagnostic, deferred)
+      return
+    let alias = unsafeAddr aliases[index]
+    let visible = if scope != nil and scope.corePlan != nil and alias.typeName != nil:
+        if forImport: alias.typeName in scope.importedResources
+        else: alias.typeName in scope.publishedResources
+      else: alias.visible and (not forImport or alias.imported)
+    if not visible:
       visibilityIssue(diagnostic, deferred)
       return
 
 proc requireVisibleResources(plan: ComponentPlan, signature: ComponentFuncType,
-                             forImport = false, deferred: ptr string = nil) =
+    forImport = false, deferred: ptr string = nil, scope: ptr ShapeScope = nil) =
   for i in 0 ..< signature.params.len:
     requireVisibleResourceSlot(plan.handleTypes, parameterSlot(signature, i), forImport,
       (if forImport: "resource parameter type is not imported"
-       else: "resource parameter type is not exported"), deferred)
+       else: "resource parameter type is not exported"), deferred, scope)
   if signature.hasResult:
     requireVisibleResourceSlot(plan.handleTypes, resultSlot(signature), forImport,
       (if forImport: "resource result type is not imported"
-       else: "resource result type is not exported"), deferred)
+       else: "resource result type is not exported"), deferred, scope)
+
+proc publishResourceName(scope: ptr ShapeScope, name: ResourceName, importing = false) =
+  if name == nil: return
+  if name notin scope.publishedResources: scope.publishedResources.add(name)
+  if importing and name notin scope.importedResources: scope.importedResources.add(name)
+  for alias in scope.resourceAliases[].mitems:
+    if alias.typeName == name:
+      alias.visible = true
+      alias.imported = alias.imported or importing
+  if scope.handleTypes != nil:
+    for handle in scope.handleTypes[].mitems:
+      if handle.typeName == name:
+        handle.visible = true
+        handle.imported = handle.imported or importing
+
+proc newResourceName(): ResourceName =
+  new(result)
+
+proc requireImportedResourceName(scope: ShapeScope, alias: ResourceTypeAlias) =
+  if alias.typeName in scope.publishedResources and alias.typeName notin scope.importedResources:
+    componentFail("resource type import refers to an exported name")
 
 const NamedValueTypes = {cpRecord, cpVariant, cpEnum, cpFlags}
 
@@ -1671,9 +2264,15 @@ proc requireVisibleReference(shape: ref CanonicalSlot, scope: ptr ShapeScope,
 
 proc requireVisibleChildren(slot: CanonicalSlot, scope: ptr ShapeScope, forImport: bool) =
   case slot.kind
-  of cpList:
+  of cpList, cpFixedList:
     requireVisibleReference(slot.listElement, scope, forImport,
       "named component list element type is not externally visible")
+  of cpFuture, cpStream:
+    if slot.listElement != nil:
+      requireVisibleReference(slot.listElement, scope, forImport,
+        "named component " & endpointName(slot.kind) & " payload type is not externally visible")
+  of cpMap:
+    requireVisibleChildren(slot.listElement[], scope, forImport)
   of cpRecord, cpTuple:
     for field in slot.recordShape.fields:
       if field.shape != nil:
@@ -1732,9 +2331,11 @@ proc collectFunctionTypeName(shape: ref CanonicalSlot, scope: ptr ShapeScope,
 proc collectFunctionTypeNames(slot: CanonicalSlot, scope: ptr ShapeScope,
                               names: var FunctionTypeNames) =
   case slot.kind
-  of cpList:
+  of cpList, cpFixedList:
     collectFunctionTypeName(slot.listElement, scope,
       "named component list element type is not externally visible", names)
+  of cpMap:
+    collectFunctionTypeNames(slot.listElement[], scope, names)
   of cpRecord, cpTuple:
     for field in slot.recordShape.fields:
       if field.shape != nil:
@@ -1791,6 +2392,13 @@ template functionTypeImports(links: ComponentLinks): ref seq[NamedFunctionType] 
 template functionTypeExports(links: ComponentLinks): ref seq[NamedFunctionType] =
   functionsIn(links.typeExports)
 
+proc addExportedFunctionType(types: var ExternalTypeSurface, order: var VisibilityOrder,
+                             item: sink NamedFunctionType) =
+  if item.names != nil or signatureResourceTypes(item.signature).len != 0:
+    let existing = functionsIn(types)
+    order.addMember(vmFunctionType, if existing == nil: 0 else: existing[].len)
+  types.addNamedFunctionType(move item)
+
 proc addFunctionAlias(scope: var ShapeScope, signature: ComponentFuncType,
                       origin: FunctionTypeOrigin) =
   if scope.kinds.len >= MaxComponentTypes: componentFail("component type index-space limit")
@@ -1811,7 +2419,7 @@ proc externFunctionType(scope: var ShapeScope, index: uint32, name: string,
   result = namedFunctionType(addr scope, index, name)
   if scope.handleTypes != nil:
     ComponentPlan(handleTypes: scope.handleTypes[]).requireVisibleResources(result.signature,
-      forImport = importing, deferred = deferredVisibility(addr scope))
+      forImport = importing, deferred = deferredVisibility(addr scope), scope = addr scope)
   scope.addFunctionAlias(result.signature, functionTypeOrigin(addr scope, index))
 
 proc addPlanFunctionType(plan: var ComponentPlan, scope: var ShapeScope, index: uint32,
@@ -1819,7 +2427,7 @@ proc addPlanFunctionType(plan: var ComponentPlan, scope: var ShapeScope, index: 
   let declaration = externFunctionType(scope, index, name, importing)
   if plan.links == nil: new(plan.links)
   if importing: plan.links.typeImports.addNamedFunctionType(declaration)
-  else: plan.links.typeExports.addNamedFunctionType(declaration)
+  else: plan.links.typeExports.addExportedFunctionType(plan.links.visibilityOrder, declaration)
 
 proc coreFunctionSource(fn: CoreFunction, instances: openArray[CoreInstance]): uint16 =
   case fn.kind
@@ -1845,6 +2453,13 @@ proc describeLift(lifted: ComponentFunction,
   result.signature = types[lifted.typeIndex.int]
   result.stringEncoding = lifted.stringEncoding
   result.coreSources[clsFunction] = coreFunctionSource(target[], instances)
+  when defined(wasmComponentAsyncCallbacks):
+    if lifted.callbackFunction != 0:
+      let callback = unsafeAddr coreFunctions[lifted.callbackFunction.int - 1]
+      result.callbackSource = coreFunctionSource(callback[], instances)
+      result.callbackName = callback.name
+  when defined(wasmComponentStackful):
+    result.stackful = lifted.stackful
   if lifted.memoryAlias >= 0:
     let source = unsafeAddr memories[lifted.memoryAlias.int]
     result.memoryName = source.name
@@ -1878,14 +2493,13 @@ proc appendNestedExport(links: ComponentLinks, surface: sink InterfaceExport): u
   result = NestedInterfaceIndex or links.nestedInterfaceExports[].len.uint16
   boundedAdd(links.nestedInterfaceExports[], move surface, MaxComponentFunctions)
 
-proc childSignature(links: ComponentLinks, index: int): ComponentFuncType =
+proc childFunctionExport(links: ComponentLinks, index: int): ptr ComponentExport =
   let alias = links.aliases[index]
   let child = links.children[alias.childIndex.int].plan
   if alias.interfaceIndex == 0:
-    child.exports[alias.exportIndex.int].signature
+    addr child.exports[alias.exportIndex.int]
   else:
-    child.links.exportedInterface(alias.interfaceIndex)
-      .methods[alias.exportIndex.int].signature
+    addr child.links.exportedInterface(alias.interfaceIndex).methods[alias.exportIndex.int]
 
 proc describeFunction(fn: ComponentFunction, plan: ComponentPlan,
     types: openArray[ComponentFuncType], instances: openArray[CoreInstance],
@@ -1901,23 +2515,78 @@ proc describeFunction(fn: ComponentFunction, plan: ComponentPlan,
   of fnChild:
     result.target = ctChild
     result.targetIndex = fn.importIndex.uint16
-    result.signature = childSignature(plan.links, fn.importIndex.int)
+    result.signature = childFunctionExport(plan.links, fn.importIndex.int).signature
 
 proc loweringSignature(plan: ComponentPlan, lowering: CoreLowering): ComponentFuncType =
   if lowering.resourceSignature != nil: return lowering.resourceSignature[]
   case lowering.kind
   of clHost: plan.imports[lowering.targetIndex.int].signature
-  of clChild: childSignature(plan.links, lowering.targetIndex.int)
+  of clChild: childFunctionExport(plan.links, lowering.targetIndex.int).signature
   of clLocal: lowering.localTarget.signature
   else: componentFail("canonical lowering has no component signature")
 
 proc generatedCoreType(plan: ComponentPlan, lowering: CoreLowering): FuncType =
+  if lowering.kind == clContextGet: return FuncType(results: @[vtI32])
+  if lowering.kind == clContextSet: return FuncType(params: @[vtI32])
+  if lowering.kind == clTaskReturn:
+    let signature = lowering.resourceSignature
+    if signature.hasResult:
+      let slot = resultSlot(signature[])
+      let width = flatSlotWidth(slot)
+      if width > MaxFlatParams:
+        result.params.add(vtI32)
+      else:
+        for i in 0 ..< width: result.params.add(flatLaneType(slot, i))
+    return
+  case lowering.kind
+  of clErrorContextNew: return FuncType(params: @[vtI32, vtI32], results: @[vtI32])
+  of clErrorContextDebugMessage: return FuncType(params: @[vtI32, vtI32])
+  of clErrorContextDrop: return FuncType(params: @[vtI32])
+  of clWaitableSetNew, clThreadYield, clThreadIndex, clThreadSuspend,
+     clThreadAvailableParallelism:
+    return FuncType(results: @[vtI32])
+  of clWaitableSetDrop, clSubtaskDrop, clThreadResumeLater:
+    return FuncType(params: @[vtI32])
+  of clThreadSuspendResume .. clThreadYieldPromote:
+    return FuncType(params: @[vtI32], results: @[vtI32])
+  of clThreadNewIndirect:
+    when defined(wasmComponentThreads):
+      return FuncType(params: @[vtI32, lowering.threadClosure], results: @[vtI32])
+    else: componentFail("guest thread operations are disabled")
+  of clThreadSpawnRef:
+    when defined(wasmComponentThreadSpawn):
+      result = FuncType(params: @[vtFuncRef, lowering.threadSignature.params[0]],
+        results: @[vtI32])
+      new(result.references)
+      result.references.params = @[lowering.threadSignature[].coreFunctionReference()]
+      return
+    else: componentFail("canonical thread spawning is disabled")
+  of clWaitableSetPoll, clWaitableSetWait:
+    return FuncType(params: @[vtI32, vtI32], results: @[vtI32])
+  of clWaitableJoin: return FuncType(params: @[vtI32, vtI32])
+  of clBackpressureInc, clBackpressureDec, clTaskCancel: return FuncType()
+  of clSubtaskCancel: return FuncType(params: @[vtI32], results: @[vtI32])
+  of clEndpointNew: return FuncType(results: @[vtI64])
+  of clEndpointRead, clEndpointWrite:
+    when ComponentEndpointsEnabled:
+      if lowering.endpointShape.kind == cpStream:
+        return FuncType(params: @[vtI32, vtI32, vtI32], results: @[vtI32])
+    return FuncType(params: @[vtI32, vtI32], results: @[vtI32])
+  of clEndpointCancelRead, clEndpointCancelWrite:
+    return FuncType(params: @[vtI32], results: @[vtI32])
+  of clEndpointDropReadable, clEndpointDropWritable: return FuncType(params: @[vtI32])
+  of clEndpointForward: return FuncType(params: @[vtI32, vtI32])
+  else: discard
   if lowering.kind notin {clHost, clChild, clLocal}:
     result.params = @[vtI32]
     if lowering.kind != clResourceDrop: result.results = @[vtI32]
     return
   let signature = loweringSignature(plan, lowering)
-  if signature.paramsUseMemoryArea():
+  let indirect = when defined(wasmComponentAsyncCallbacks):
+    if lowering.asyncLower: signature.flatParamCount() > MaxFlatAsyncParams
+    else: signature.paramsUseMemoryArea()
+  else: signature.paramsUseMemoryArea()
+  if indirect:
     result.params.add(vtI32)
   else:
     for i, kind in signature.params:
@@ -1925,6 +2594,11 @@ proc generatedCoreType(plan: ComponentPlan, lowering: CoreLowering): FuncType =
         else: CanonicalSlot(kind: kind)
       for lane in 0 ..< flatSlotWidth(slot):
         result.params.add(flatLaneType(slot, lane))
+  when defined(wasmComponentAsyncCallbacks):
+    if lowering.asyncLower:
+      if signature.asyncResultArea(): result.params.add(vtI32)
+      result.results.add(vtI32)
+      return
   if signature.resultUsesMemory():
     result.params.add(vtI32)
   elif signature.hasResult:
@@ -1938,7 +2612,7 @@ proc requireGeneratedCoreType(plan: var ComponentPlan, fn: CoreFunction,
 
 proc `==`(left, right: CanonicalSlot): bool =
   if left.offset != right.offset or left.kind != right.kind or
-      left.cases.len != right.cases.len:
+      left.listLength != right.listLength or left.cases.len != right.cases.len:
     return false
   for i, item in left.cases:
     let other = unsafeAddr right.cases[i]
@@ -1964,6 +2638,7 @@ proc `==`(left, right: CanonicalSlot): bool =
 
 proc matchComponentFunction(actual, expected: ComponentFuncType): bool =
   if actual.params != expected.params or actual.paramNames != expected.paramNames or
+      actual.asyncSignature() != expected.asyncSignature() or
       actual.hasResult != expected.hasResult or
       (expected.hasResult and actual.resultType != expected.resultType):
     return false
@@ -1990,13 +2665,25 @@ proc resourceOfExport(plan: ComponentPlan, exp: ComponentExport, index: int32): 
   node.resourceArgs[index].int - 1
 
 proc bindResourceHandleIndex(plan: var ComponentPlan, resource: uint16,
-                             visibility = tvImported): int32 =
+                             visibility = tvImported, name: ResourceName = nil): int32 =
   # A handle used by a function imported from another scope has no local
   # declaration in the component's own type index space.
   let bank = case visibility
     of tvImported: 0
     of tvExported: 1
     of tvPrivate: 2
+  const NamedHandleStart = MaxComponentTypes + 3 * MaxComponentResourceTypes
+  if name != nil:
+    for alias in plan.handleTypes:
+      if alias.typeIndex.int >= NamedHandleStart and alias.typeName == name and
+          alias.resourceIndex == resource and alias.imported == (visibility == tvImported):
+        return alias.typeIndex.int32
+    let ordinal = NamedHandleStart + plan.handleTypes.len
+    if ordinal > uint16.high.int: componentFail("component resource alias limit")
+    plan.handleTypes.add(ResourceTypeAlias(typeIndex: ordinal.uint16,
+      resourceIndex: resource, visible: visibility != tvPrivate, imported: visibility == tvImported,
+      typeName: name))
+    return ordinal.int32
   let typeIndex = (MaxComponentTypes + bank * MaxComponentResourceTypes + resource.int).uint16
   if lookupResourceType(plan.handleTypes, typeIndex.uint32) < 0:
     plan.handleTypes.add(ResourceTypeAlias(typeIndex: typeIndex,
@@ -2015,7 +2702,7 @@ proc rebaseResourceSlot(slot: CanonicalSlot, mapping: ResourceTypeMapping,
 
 proc rebaseResourceShape(shape: ref CanonicalSlot, mapping: ResourceTypeMapping,
                          origins: RebasedShapes): ref CanonicalSlot =
-  if shape.resources == {}: return shape
+  if shape == nil or shape.resources * {ruOwn, ruBorrow} == {}: return shape
   result = newSlot(rebaseResourceSlot(shape[], mapping, origins))
   if origins != nil and shape.kind in NamedValueTypes:
     origins[].add((result, shape))
@@ -2027,7 +2714,7 @@ proc rebaseResourceSlot(slot: CanonicalSlot, mapping: ResourceTypeMapping,
   case slot.kind
   of cpOwnedResource, cpBorrowedResource:
     result.resourceType = mappedHandle(mapping, slot.resourceType)
-  of cpList:
+  of cpList, cpFixedList, cpFuture, cpStream:
     result.listElement = rebaseResourceShape(slot.listElement, mapping, origins)
   of cpRecord, cpTuple:
     result.recordShape = new(RecordShape)
@@ -2040,6 +2727,51 @@ proc rebaseResourceSlot(slot: CanonicalSlot, mapping: ResourceTypeMapping,
       if item.shape != nil and item.shape.resources != {}:
         item.shape = rebaseResourceShape(item.shape, mapping, origins)
   else: discard
+
+proc projectValueShape(shape: ref CanonicalSlot, node: var ChildInstantiation,
+                       handles: ResourceTypeMapping): ref CanonicalSlot =
+  ## Substitute the actual type names at the child boundary. Structural
+  ## equality alone cannot establish which name an exported field refers to.
+  for binding in node.valueTypeArguments[]:
+    if binding.local == shape: return binding.origin
+  if node.projectedValueTypes != nil:
+    for binding in node.projectedValueTypes[]:
+      if binding.local == shape: return binding.origin
+  var view = shape[]
+  var changed = false
+  case shape.kind
+  of cpOwnedResource, cpBorrowedResource:
+    view.resourceType = mappedHandle(handles, shape.resourceType)
+    changed = view.resourceType != shape.resourceType
+  of cpList, cpMap, cpFixedList:
+    view.listElement = projectValueShape(shape.listElement, node, handles)
+    changed = view.listElement != shape.listElement
+  of cpFuture, cpStream:
+    if shape.listElement != nil:
+      view.listElement = projectValueShape(shape.listElement, node, handles)
+      changed = view.listElement != shape.listElement
+  of cpRecord, cpTuple:
+    for i, field in shape.recordShape.fields:
+      if field.shape == nil: continue
+      let member = projectValueShape(field.shape, node, handles)
+      if member == field.shape: continue
+      if not changed:
+        new(view.recordShape)
+        view.recordShape[] = shape.recordShape[]
+        changed = true
+      view.recordShape.fields[i].shape = member
+  of cpOption, cpVariant, cpResult:
+    for i, item in shape.cases:
+      if item.shape == nil: continue
+      let member = projectValueShape(item.shape, node, handles)
+      if member == item.shape: continue
+      view.cases[i].shape = member
+      changed = true
+  else: discard
+  if not changed: return shape
+  result = newSlot(view)
+  if node.projectedValueTypes == nil: new(node.projectedValueTypes)
+  node.projectedValueTypes[].add((shape, result))
 
 proc rebaseResourceSignature(sig: ComponentFuncType,
                              mapping: ResourceTypeMapping): ComponentFuncType =
@@ -2059,6 +2791,14 @@ proc rebaseResourceSignature(sig: ComponentFuncType,
       result.resultTypeIndex = mappedHandle(mapping, sig.resultTypeIndex.uint16).int32
     elif sig.resultShape != nil and sig.resultShape.resources != {}:
       result.resultShape = newSlot(rebaseResourceSlot(sig.resultShape[], mapping))
+
+proc resourceNames(signature: ComponentFuncType,
+                   handles: openArray[ResourceTypeAlias]): ResourceNames =
+  for index in signatureResourceTypes(signature):
+    let alias = lookupResourceType(handles, index.uint32)
+    if alias < 0: componentFail("unknown component function resource type")
+    if result == nil: new(result)
+    result[].add(handles[alias].typeName)
 
 proc matchResourceBindings(plan: ComponentPlan, exp: ComponentExport,
     expected: ComponentFuncType, expectedTypes: openArray[ResourceTypeAlias],
@@ -2080,31 +2820,40 @@ proc checkResourceMemberName(plan: ComponentPlan, exp: ComponentExport,
   let member = resourceMember(exp.name)
   if member.kind == rmNone: return
   let name = exp.name[member.first ..< member.dot]
+  var handleType = -1'i32
+  case member.kind
+  of rmConstructor:
+    if exp.signature.hasResult:
+      if exp.signature.resultType == cpOwnedResource:
+        handleType = exp.signature.resultTypeIndex
+      elif exp.signature.resultType == cpResult:
+        let ok = exp.signature.resultShape.cases[0]
+        if ok.hasPayload and ok.payloadKind == cpOwnedResource:
+          handleType = ok.shape.resourceType.int32
+    if handleType < 0: componentFail("constructor must return an owned resource")
+  of rmMethod:
+    if exp.signature.params.len == 0 or exp.signature.params[0] != cpBorrowedResource or
+        exp.signature.paramNames[0] != "self":
+      componentFail("resource method requires a self borrow")
+    handleType = exp.signature.paramTypeIndices[0]
+  of rmStatic, rmNone: discard
   for item in visible:
     if item.name != name: continue
-    var handleType = -1'i32
-    case member.kind
-    of rmConstructor:
-      if exp.signature.hasResult:
-        if exp.signature.resultType == cpOwnedResource:
-          handleType = exp.signature.resultTypeIndex
-        elif exp.signature.resultType == cpResult:
-          let ok = exp.signature.resultShape.cases[0]
-          if ok.hasPayload and ok.payloadKind == cpOwnedResource:
-            handleType = ok.shape.resourceType.int32
-      if handleType < 0 or resourceOfExport(plan, exp, handleType) != item.resourceIndex.int:
-        componentFail("constructor does not return its resource type")
-    of rmMethod:
-      if exp.signature.params.len == 0 or exp.signature.params[0] != cpBorrowedResource or
-          exp.signature.paramNames[0] != "self" or
-          resourceOfExport(plan, exp, exp.signature.paramTypeIndices[0]) != item.resourceIndex.int:
-        componentFail("resource method requires a self borrow")
-      handleType = exp.signature.paramTypeIndices[0]
-    of rmStatic, rmNone: discard
-    if handleType >= 0 and exp.target != ctChild:
+    if handleType < 0: return
+    if resourceOfExport(plan, exp, handleType) != item.resourceIndex.int:
+      componentFail("resource member signature must use its named resource")
+    if exp.target == ctChild:
+      var parameters: seq[uint16]
+      if member.kind == rmConstructor:
+        for i in 0 ..< exp.signature.params.len:
+          collectResourceTypes(parameterSlot(exp.signature, i), parameters)
+      if exp.resourceNames == nil or parameters.len >= exp.resourceNames[].len or
+          exp.resourceNames[][parameters.len] != item.typeName:
+        componentFail("resource member signature must use its named resource")
+    else:
       let index = lookupResourceType(plan.handleTypes, handleType.uint32)
-      if index < 0 or plan.handleTypes[index].exportAlias != item.exportAlias:
-        componentFail("resource member signature must use its named type export")
+      if index < 0 or plan.handleTypes[index].typeName != item.typeName:
+        componentFail("resource member signature must use its named resource")
     return
   componentFail("resource member names a type absent from its interface")
 
@@ -2113,7 +2862,9 @@ const StoredValueTypes = PrimitiveValues + ShapedValues + ResourceValues +
 
 proc typeDepth(slot: CanonicalSlot): int =
   case slot.kind
-  of cpList: 1 + typeDepth(slot.listElement[])
+  of cpList, cpFixedList: 1 + typeDepth(slot.listElement[])
+  of cpFuture, cpStream: (if slot.listElement == nil: 1 else: 1 + typeDepth(slot.listElement[]))
+  of cpMap: typeDepth(slot.listElement[])
   of cpRecord, cpTuple: slot.recordShape.depth.int
   of cpOption, cpVariant, cpResult:
     result = 1
@@ -2124,7 +2875,9 @@ proc typeDepth(slot: CanonicalSlot): int =
 
 proc typeNodes(slot: CanonicalSlot): int =
   case slot.kind
-  of cpList: 1 + typeNodes(slot.listElement[])
+  of cpList, cpFixedList: 1 + typeNodes(slot.listElement[])
+  of cpFuture, cpStream: (if slot.listElement == nil: 1 else: 1 + typeNodes(slot.listElement[]))
+  of cpMap: typeNodes(slot.listElement[])
   of cpRecord, cpTuple: slot.recordShape.typeNodes.int
   of cpOption, cpVariant, cpResult:
     result = 1
@@ -2133,44 +2886,62 @@ proc typeNodes(slot: CanonicalSlot): int =
     return
   else: 1
 
+proc newRecordShape(count: int): RecordShape =
+  RecordShape(fields: newSeqOfCap[ComponentRecordField](count),
+    layout: (0, 1), typeNodes: 1, depth: 1)
+
+proc valueField(kind: ComponentPrim, index: int32, scope: ShapeScope): ComponentRecordField =
+  result.kind = kind
+  if kind in ShapedValues:
+    result.shape = canonicalShape(index, scope.shapes)
+  elif kind in ResourceValues:
+    result.shape = newSlot(handleSlot(kind, index))
+  elif kind == cpErrorContext:
+    result.shape = newSlot(plainValueSlot(kind))
+
+proc appendRecordField(record: RecordShape, field: sink ComponentRecordField,
+                       checkSize = true) =
+  let slot = fieldSlot(field)
+  let layout = canonicalSlotLayout(slot)
+  let offset = abiAlign(record.layout.size, layout.alignment)
+  record.layout.size = offset + layout.size
+  record.layout.alignment = max(record.layout.alignment, layout.alignment)
+  let nodes = record.typeNodes.int + typeNodes(slot)
+  if checkSize and record.layout.size >= MaxCanonicalValueBytes:
+    componentFail("component type exceeds maximum byte size")
+  if nodes > MaxIndirectParamBytes:
+    componentFail("component record layout exceeds profile limit")
+  let depth = 1 + typeDepth(slot)
+  if depth > MaxValueTypeNesting:
+    componentFail("component value type nesting exceeds profile limit")
+  field.offset = offset.uint32
+  record.depth = max(record.depth, depth.uint8)
+  record.typeNodes = nodes.uint16
+  record.flatWidth = min(MaxFlatParams + 1, record.flatWidth.int + flatSlotWidth(slot)).uint16
+  record.hasPointers = record.hasPointers or hasPointerPayload(slot)
+  record.resources = record.resources + slot.resources
+  record.fields.add(move field)
+
+proc finishRecordLayout(record: RecordShape) =
+  record.layout.size = abiAlign(record.layout.size, record.layout.alignment)
+
 proc readRecordShape(data: openArray[byte], pos: var int, stop: int,
     scope: var ShapeScope, kind: ComponentPrim): RecordShape =
   let count = takeCount(data, pos, stop, MaxComponentRecordFields)
   if count == 0: componentFail("empty component record or tuple")
-  result = RecordShape(fields: newSeqOfCap[ComponentRecordField](count),
-    layout: (0, 1), typeNodes: 1, depth: 1)
+  result = newRecordShape(count)
   for _ in 0 ..< count:
-    var field: ComponentRecordField
+    var name: string
     if kind == cpRecord:
-      field.name = takeLabel(data, pos, stop)
+      name = takeLabel(data, pos, stop)
       for previous in result.fields:
-        if sameCanonicalName(previous.name, field.name):
+        if sameCanonicalName(previous.name, name):
           componentFail("duplicate component record field")
     let value = takeValType(data, pos, stop, scope.kinds)
-    field.kind = value.kind
-    if field.kind in ShapedValues:
-      field.shape = canonicalShape(value.index, scope.shapes)
-    elif field.kind in ResourceValues:
-      field.shape = newSlot(handleSlot(field.kind, value.index))
-    let slot = fieldSlot(field)
-    let layout = canonicalSlotLayout(slot)
-    let offset = abiAlign(result.layout.size, layout.alignment)
-    result.layout.size = offset + layout.size
-    result.layout.alignment = max(result.layout.alignment, layout.alignment)
-    let nodes = result.typeNodes.int + typeNodes(slot)
-    if result.layout.size > MaxIndirectParamBytes or nodes > MaxIndirectParamBytes:
-      componentFail("component record layout exceeds profile limit")
-    let depth = 1 + typeDepth(slot)
-    if depth > MaxValueTypeNesting:
-      componentFail("component value type nesting exceeds profile limit")
-    field.offset = offset.uint16
-    result.depth = max(result.depth, depth.uint8)
-    result.typeNodes = nodes.uint16
-    result.flatWidth += flatSlotWidth(slot).uint16
-    result.hasPointers = result.hasPointers or hasPointerPayload(slot)
-    result.resources = result.resources + slot.resources
-    result.fields.add(move field)
-  result.layout.size = abiAlign(result.layout.size, result.layout.alignment)
+    var field = valueField(value.kind, value.index, scope)
+    field.name = move name
+    result.appendRecordField(move field)
+  result.finishRecordLayout()
 
 proc readCasePayload(item: var ComponentVariantCase, data: openArray[byte],
                      pos: var int, stop: int, scope: ShapeScope) =
@@ -2181,6 +2952,8 @@ proc readCasePayload(item: var ComponentVariantCase, data: openArray[byte],
     item.shape = canonicalShape(payload.index, scope.shapes)
   elif payload.kind in ResourceValues:
     item.shape = newSlot(handleSlot(payload.kind, payload.index))
+  elif payload.kind == cpErrorContext:
+    item.shape = newSlot(plainValueSlot(payload.kind))
 
 proc saveVariant(scope: var ShapeScope, kind: ComponentPrim,
                  cases: sink seq[ComponentVariantCase]) =
@@ -2190,17 +2963,40 @@ proc saveVariant(scope: var ShapeScope, kind: ComponentPrim,
       shape.resources = shape.resources + item.shape.resources
   if typeDepth(shape) > MaxValueTypeNesting:
     componentFail("component value type nesting exceeds profile limit")
-  if typeNodes(shape) > MaxIndirectParamBytes or
-      canonicalSlotLayout(shape).size > MaxIndirectParamBytes:
+  if typeNodes(shape) > MaxIndirectParamBytes:
     componentFail("component variant layout exceeds profile limit")
+  validateCanonicalTypeSize(shape)
   scope.kinds.add(kind)
   scope.saveShape(shape)
 
 proc readValueDefinition(data: openArray[byte], pos: var int, stop: int,
                          scope: var ShapeScope): bool =
   if pos >= stop: componentFail("truncated component type")
-  if data[pos] in 0x73'u8 .. 0x7f'u8:
+  if data[pos] in 0x73'u8 .. 0x7f'u8 or data[pos] == 0x64'u8:
     scope.kinds.add(takePrim(data, pos, stop))
+  elif (data[pos] == 0x65'u8 and defined(wasmComponentFutures)) or
+       (data[pos] == 0x66'u8 and defined(wasmComponentStreams)):
+    let kind = if data[pos] == 0x66: cpStream else: cpFuture
+    inc pos
+    var shape = CanonicalSlot(kind: kind, resources: {ruEndpoint})
+    case take(data, pos, stop)
+    of 0: discard
+    of 1:
+      let payload = takeValType(data, pos, stop, scope.kinds)
+      if kind == cpStream and payload.kind == cpChar:
+        componentFail("stream element type cannot be char")
+      shape.listElement = if payload.kind in ShapedValues:
+        canonicalShape(payload.index, scope.shapes)
+      else:
+        newSlot(canonicalSlot(payload.kind, payload.index, scope.shapes))
+      shape.resources = shape.resources + shape.listElement.resources
+      if ruBorrow in shape.resources:
+        componentFail(endpointName(kind) & " payload contains a borrowed resource")
+      if typeDepth(shape) > MaxValueTypeNesting or typeNodes(shape) > MaxIndirectParamBytes:
+        componentFail("canonical " & endpointName(kind) & " payload exceeds type shape limits")
+    else: componentFail("invalid canonical " & endpointName(kind) & " payload option")
+    scope.kinds.add(kind)
+    scope.saveShape(move shape)
   elif data[pos] == 0x70'u8:
     inc pos
     let element = takeValType(data, pos, stop, scope.kinds)
@@ -2222,12 +3018,47 @@ proc readValueDefinition(data: openArray[byte], pos: var int, stop: int,
         componentFail("component list layout exceeds profile limit")
     scope.kinds.add(shape.kind)
     scope.saveShape(move shape)
+  elif data[pos] == 0x67'u8 and defined(wasmComponentFixedLists):
+    inc pos
+    let element = takeValType(data, pos, stop, scope.kinds)
+    let count = takeU32(data, pos, stop)
+    if count == 0: componentFail("fixed-length list must have at least one element")
+    let slot = if element.kind in ShapedValues:
+      canonicalShape(element.index, scope.shapes)
+    else:
+      newSlot(canonicalSlot(element.kind, element.index, scope.shapes))
+    let shape = CanonicalSlot(kind: cpFixedList, listLength: count,
+      listElement: slot, resources: slot.resources)
+    if typeDepth(shape) > MaxValueTypeNesting:
+      componentFail("component value type nesting exceeds profile limit")
+    if typeNodes(shape) > MaxIndirectParamBytes:
+      componentFail("component list layout exceeds profile limit")
+    validateCanonicalTypeSize(shape)
+    scope.kinds.add(cpFixedList)
+    scope.saveShape(shape)
+  elif data[pos] == 0x63'u8:
+    inc pos
+    let key = takeValType(data, pos, stop, scope.kinds)
+    if key.kind notin MapKeyTypes: componentFail("invalid map key type")
+    let value = takeValType(data, pos, stop, scope.kinds)
+    let field = valueField(value.kind, value.index, scope)
+    if fieldSlot(field).resources != {}:
+      componentFail("map value type cannot contain a handle")
+    let entry = newRecordShape(2)
+    entry.appendRecordField(ComponentRecordField(kind: key.kind))
+    entry.appendRecordField(field, checkSize = false)
+    entry.finishRecordLayout()
+    scope.kinds.add(cpMap)
+    scope.saveShape(CanonicalSlot(kind: cpMap,
+      listElement: newSlot(CanonicalSlot(kind: cpTuple, recordShape: entry))))
   elif data[pos] in {0x72'u8, 0x6f'u8}:
     let kind = if data[pos] == 0x72'u8: cpRecord else: cpTuple
     inc pos
     let shape = readRecordShape(data, pos, stop, scope, kind)
+    let slot = CanonicalSlot(kind: kind, recordShape: shape, resources: shape.resources)
+    validateCanonicalTypeSize(slot)
     scope.kinds.add(kind)
-    scope.saveShape(CanonicalSlot(kind: kind, recordShape: shape, resources: shape.resources))
+    scope.saveShape(slot)
   elif data[pos] == 0x6e'u8:
     inc pos
     let count = takeCount(data, pos, stop, MaxComponentFlags)
@@ -2636,13 +3467,21 @@ proc readInstanceTypeMember(data: openArray[byte], pos: var int, stop: int,
 proc instanceMemberHandleMapping(parent: var InterfaceType, source: InterfaceTypeMember,
     scope: var ShapeScope, handles: openArray[uint16]): ResourceTypeMapping =
   for index in handles:
-    let ordinal = resourceIndex(source.definition.resources.handleTypes, index.uint32)
-    if ordinal < 0: componentFail("unknown instance value resource")
-    let resource = source.resources[ordinal] - 1
-    let target = (MaxComponentTypes + resource.int).uint16
-    if lookupResourceType(parent.resources.handleTypes, target.uint32) < 0:
+    let alias = lookupResourceType(source.definition.resources.handleTypes, index.uint32)
+    if alias < 0: componentFail("unknown instance value resource")
+    let original = source.definition.resources.handleTypes[alias]
+    let resource = source.resources[original.resourceIndex] - 1
+    var target: uint16
+    const SyntheticHandleStart = MaxComponentTypes + MaxComponentResourceTypes
+    for handle in parent.resources.handleTypes:
+      if handle.typeIndex.int >= SyntheticHandleStart and handle.resourceIndex == resource and
+          handle.typeName == original.typeName and handle.visible and not handle.imported:
+        target = handle.typeIndex
+        break
+    if target == 0:
+      target = (SyntheticHandleStart + parent.resources.handleTypes.len).uint16
       parent.resources.handleTypes.add(ResourceTypeAlias(typeIndex: target,
-        resourceIndex: resource, visible: true))
+        resourceIndex: resource, visible: true, typeName: original.typeName))
     result.add((index, target))
   if result.len != 0: scope.handleTypes = addr parent.resources.handleTypes
 
@@ -2685,7 +3524,7 @@ proc aliasInInterfaceType(data: openArray[byte], pos: var int, stop: int, sort: 
       if resource.name != member.name: continue
       aliases.add(ResourceTypeAlias(typeIndex: scope.kinds.len.uint16,
         resourceIndex: member.source.resources[resource.resourceIndex.int] - 1,
-        visible: true))
+        visible: true, typeName: resource.typeName))
       scope.kinds.add(cpResourceType)
       return
   for field in definition.valueTypes:
@@ -2730,11 +3569,12 @@ proc bindLexicalInterfaceHandle(shape: var InterfaceType, alias: ResourceTypeAli
   const FirstLexicalHandle = MaxComponentTypes + MaxComponentResourceTypes
   for handle in shape.resources.handleTypes:
     if handle.typeIndex.int >= FirstLexicalHandle and handle.resourceIndex == ordinal and
-        handle.visible == alias.visible and handle.imported == alias.imported:
+        handle.visible == alias.visible and handle.imported == alias.imported and
+        handle.typeName == alias.typeName:
       return handle.typeIndex
   result = (FirstLexicalHandle + shape.resources.handleTypes.len).uint16
   shape.resources.handleTypes.add(ResourceTypeAlias(typeIndex: result,
-    resourceIndex: ordinal, visible: alias.visible, imported: alias.imported))
+    resourceIndex: ordinal, visible: alias.visible, imported: alias.imported, typeName: alias.typeName))
 
 proc requireLocalResourceCapture(outer: OuterTypeReference) =
   if outer.crossedComponent: componentFail("outer type alias refers to a resource")
@@ -2756,7 +3596,7 @@ proc bindOuterHandles(outer: OuterTypeReference, handles: openArray[uint16],
       scope.handleTypes = addr scope.interfaceType.resources.handleTypes
     else:
       let ordinal = scope.captureTypeResource(capture)
-      let target = scope.corePlan[].bindResourceHandleIndex(ordinal, tvPrivate)
+      let target = scope.corePlan[].bindResourceHandleIndex(ordinal, tvPrivate, alias.typeName)
       result.add((index, target.uint16))
 
 proc normalizeContractInterfaceCaptures(shape: var InterfaceType, owner: var ShapeScope) =
@@ -2827,7 +3667,6 @@ proc readOuterTypeAlias(data: openArray[byte], pos: var int, stop: int,
     if outer.depth != 0:
       alias.resourceIndex = scope.captureTypeResource(lexicalResource(outer.target,
         (outer.depth.uint16, alias.resourceIndex)))
-      alias.exportAlias = 0
       if outer.crossedNamingScope:
         alias.visible = false
         alias.imported = false
@@ -2879,10 +3718,10 @@ proc declareNestedInstanceType(data: openArray[byte], pos: var int, stop: int,
 proc declareNestedInstanceExport(data: openArray[byte], pos: var int, stop: int, name: string,
     parent: var InterfaceType, nestedTypes: openArray[InterfaceType],
     instances: var seq[InterfaceTypeMember]) {.noinline.} =
-  if resourceMember(name).kind != rmNone: componentFail("invalid nested interface name")
   let index = lookupInterface(nestedTypes, takeU32(data, pos, stop))
   let member = parent.registerInstanceMember(name, nestedTypes[index])
   if parent.children == nil: new(parent.children)
+  parent.visibilityOrder.addMember(vmInstance, parent.children[].len)
   boundedAdd(parent.children[], member, MaxComponentFunctions)
   boundedAdd(instances, member, MaxComponentFunctions)
 
@@ -2954,17 +3793,14 @@ proc readInterfaceType(data: openArray[byte], pos: var int, stop: int,
         componentFail("unsupported interface type alias")
       types.add(readOuterTypeAlias(data, pos, stop, scope))
     of 4'u8:
-      if take(data, pos, stop) notin {0'u8, 1'u8}:
-        componentFail("unsupported interface method name attributes")
-      let name = takeExternName(data, pos, stop, allowResourceMembers = true)
+      let external = takeExternalName(data, pos, stop)
+      let name = external.name
       for previous in names:
         if sameCanonicalName(previous, name):
           componentFail("duplicate interface export")
       names.add(name)
-      case take(data, pos, stop)
+      case external.sort
       of 0'u8:
-        if resourceMember(name).kind != rmNone:
-          componentFail("invalid interface core module export name")
         let shape = readModuleTypeRef(data, pos, stop, scope)
         result.coreModules.addInstanceModule(NamedCoreModule(name: name,
           value: CoreModuleValue(shape: shape)))
@@ -2982,18 +3818,24 @@ proc readInterfaceType(data: openArray[byte], pos: var int, stop: int,
             signature: signature), result.resources.resourceTypes)
         elif resourceMember(name).kind != rmNone:
           componentFail("resource member names a type absent from its interface")
-        result.methods.add(ComponentImport(name: name, signature: types[index.int]))
+        let visibleNames = functionTypeNames(addr scope, index)
+        if visibleNames != nil or signatureResourceTypes(signature).len != 0:
+          result.visibilityOrder.addMember(vmFunction, result.methods.len)
+        result.methods.add(ComponentImport(name: name, signature: types[index.int],
+          visibilityNames: visibleNames))
       of 3'u8:
         if types.len >= MaxComponentTypes:
           componentFail("component type index-space limit")
         let bound = take(data, pos, stop)
         if bound == 1:
           let index = result.addInterfaceResource((0'u16, 0'u16), name)
-          let exportAlias = (types.len + 1).uint16
+          let typeName = newResourceName()
+          result.visibilityOrder.addMember(vmResource, result.resources.resourceTypes.len)
           boundedAdd(result.resources.resourceTypes, NamedResourceType(name: name,
-            resourceIndex: index, exportAlias: exportAlias), MaxComponentResourceTypes)
+            resourceIndex: index, typeName: typeName),
+            MaxComponentResourceTypes)
           resourceTypes.add(ResourceTypeAlias(typeIndex: types.len.uint16,
-            resourceIndex: index, visible: true, exportAlias: exportAlias))
+            resourceIndex: index, visible: true, typeName: typeName))
           scope.kinds.add(cpResourceType)
           types.add(ComponentFuncType())
           continue
@@ -3009,17 +3851,19 @@ proc readInterfaceType(data: openArray[byte], pos: var int, stop: int,
           result.typeExternals.addNamedComponentType(externComponentType(scope, index, name))
           continue
         if scope.isFunctionType(index):
-          result.typeExternals.addNamedFunctionType(externFunctionType(scope, index, name))
+          result.typeExternals.addExportedFunctionType(result.visibilityOrder,
+            externFunctionType(scope, index, name))
           continue
         let resource = lookupResourceType(resourceTypes, index)
         if resource >= 0:
           var alias = resourceTypes[resource]
           alias.typeIndex = types.len.uint16
           alias.visible = true
-          alias.exportAlias = (types.len + 1).uint16
+          alias.typeName = newResourceName()
           resourceTypes.add(alias)
+          result.visibilityOrder.addMember(vmResource, result.resources.resourceTypes.len)
           boundedAdd(result.resources.resourceTypes, NamedResourceType(name: name,
-            resourceIndex: alias.resourceIndex, exportAlias: alias.exportAlias),
+            resourceIndex: alias.resourceIndex, typeName: alias.typeName),
             MaxComponentResourceTypes)
           scope.kinds.add(cpResourceType)
           types.add(ComponentFuncType())
@@ -3032,10 +3876,10 @@ proc readInterfaceType(data: openArray[byte], pos: var int, stop: int,
         let shape = newSlot(value)
         scope.addValueType(shape, tvExported)
         types.add(ComponentFuncType())
+        if shape.kind in ShapedValues or shape.resources != {}:
+          result.visibilityOrder.addMember(vmType, result.valueTypes.len)
         result.valueTypes.add(NamedValueType(name: name, shape: shape))
       of 4'u8:
-        if resourceMember(name).kind != rmNone:
-          componentFail("invalid interface component export name")
         let component = lookupComponentType(componentTypes, takeU32(data, pos, stop))
         result.components.addInstanceComponent(NamedComponentDefinition(name: name,
           value: ComponentArgument(plan: component)))
@@ -3066,9 +3910,9 @@ proc requireInterfaceNames(declared: InterfaceType, scope: ptr ShapeScope,
       componentFail("interface import depends on an exported value type")
 
 proc addInterfaceImport(plan: var ComponentPlan, name: string,
-                        declared: InterfaceType): DeclaredInstance
+                        declared: InterfaceType, scope: ptr ShapeScope): DeclaredInstance
 proc addContractInterfaceExport(plan: var ComponentPlan, name: string,
-                                declared: InterfaceType): DeclaredInstance
+                                declared: InterfaceType, scope: ptr ShapeScope): DeclaredInstance
 proc addInstanceTypeAlias(data: openArray[byte], pos: var int, stop: int,
     plan: var ComponentPlan, scope: var ShapeScope, instances: openArray[DeclaredInstance])
 proc lookupNestedInstance(links: ComponentLinks, source: DeclaredInstance,
@@ -3179,18 +4023,15 @@ proc readComponentContract(data: openArray[byte], pos: var int, stop: int,
       else: componentFail("unsupported component contract type alias")
     of 3'u8, 4'u8:
       let importing = declaration == 3
-      if take(data, pos, stop) notin {0'u8, 1'u8}:
-        componentFail("unsupported component contract external name attributes")
-      let name = takeExternName(data, pos, stop, allowResourceMembers = true)
+      let external = takeExternalName(data, pos, stop)
+      let name = external.name
       template names: untyped = (if importing: addr importNames else: addr exportNames)[]
       for previous in names:
         if sameCanonicalName(previous, name):
           componentFail("duplicate component contract external name")
       names.add(name)
-      case take(data, pos, stop)
+      case external.sort
       of 0'u8:
-        if resourceMember(name).kind != rmNone:
-          componentFail("invalid core module external name")
         let shape = readModuleTypeRef(data, pos, stop, scope)
         if importing:
           discard addCoreModuleImport(result[], name, shape)
@@ -3201,17 +4042,22 @@ proc readComponentContract(data: openArray[byte], pos: var int, stop: int,
         if index >= functions.len.uint32 or scope.kinds[index.int] != cpFunctionType:
           componentFail("unknown component contract function type")
         let signature = functions[index.int]
-        result[].requireVisibleResources(signature, forImport = importing)
+        result[].requireVisibleResources(signature, forImport = importing, scope = addr scope)
         requireVisibleFunctionType(scope, index, forImport = importing)
-        let fn = ComponentExport(name: name, signature: signature)
+        let visibleNames = functionTypeNames(addr scope, index)
+        let fn = ComponentExport(name: name, signature: signature, visibilityNames: visibleNames,
+          resourceNames: resourceNames(signature, result.handleTypes))
         if importing:
           checkResourceMemberName(result[], fn, resourceImports)
-          result.imports.add(ComponentImport(name: name, signature: signature))
+          result.imports.add(ComponentImport(name: name, signature: signature,
+            visibilityNames: visibleNames))
         else:
           checkResourceMemberName(result[], fn, result.links.resourceExports)
+          if visibleNames != nil or fn.resourceNames != nil:
+            result.links.visibilityOrder.addMember(vmFunction, result.exports.len)
           result.exports.add(fn)
       of 3'u8:
-        if resourceMember(name).kind != rmNone or scope.kinds.len >= MaxComponentTypes:
+        if scope.kinds.len >= MaxComponentTypes:
           componentFail("invalid component contract type export")
         let bound = take(data, pos, stop)
         let valueIndex = if bound == 0: takeU32(data, pos, stop) else: 0'u32
@@ -3226,17 +4072,21 @@ proc readComponentContract(data: openArray[byte], pos: var int, stop: int,
           if importing and result.resources[resource].importName.len == 0 and
               result[].contractResourceCapture(resource).depth == 0:
             componentFail("local resource type found in component contract imports")
-          let exportAlias = if importing: 0'u16 else: (scope.kinds.len + 1).uint16
-          let named = NamedResourceType(name: name, resourceIndex: resource.uint16,
-            exportAlias: exportAlias)
+          if importing and bound == 0:
+            requireImportedResourceName(scope, resourceAliases[lookupResourceType(resourceAliases, valueIndex)])
+          let typeName = newResourceName()
+          let named = NamedResourceType(name: name, resourceIndex: resource.uint16, typeName: typeName)
           if importing:
             resourceImports.add(named)
             if bound == 0: result.links.resourceEqualityImports.add(named)
+            else: result.resources[resource].importedTypeName = typeName
           else:
+            result.links.visibilityOrder.addMember(vmResource, result.links.resourceExports.len)
             result.links.resourceExports.add(named)
           resourceAliases.add(ResourceTypeAlias(typeIndex: scope.kinds.len.uint16,
             resourceIndex: resource.uint16, visible: true, imported: importing,
-            exportAlias: exportAlias))
+            typeName: typeName))
+          publishResourceName(addr scope, typeName, importing)
           scope.kinds.add(cpResourceType)
         elif scope.isFunctionType(valueIndex):
           addPlanFunctionType(result[], scope, valueIndex, name, importing)
@@ -3251,30 +4101,30 @@ proc readComponentContract(data: openArray[byte], pos: var int, stop: int,
           let value = shapeAt(scope, valueIndex)
           requireVisibleChildren(value, addr scope, importing)
           requireVisibleResourceSlot(result.handleTypes, value, importing,
-            "component contract value resource type is not visible")
+            "component contract value resource type is not visible", scope = addr scope)
           let shape = newSlot(value)
           let named = NamedValueType(name: name, shape: shape)
           if importing: result.links.valueImports.add(named)
-          else: result.links.valueExports.add(named)
+          else:
+            if shape.kind in ShapedValues:
+              result.links.visibilityOrder.addMember(vmType, result.links.valueExports.len)
+            result.links.valueExports.add(named)
           scope.addValueType(shape, if importing: tvImported else: tvExported)
         functions.add(ComponentFuncType())
       of 4'u8:
-        if resourceMember(name).kind != rmNone:
-          componentFail("invalid component definition external name")
         let contract = lookupComponentType(componentTypes, takeU32(data, pos, stop))
         if importing:
           discard addComponentTypeImport(result[], name, contract)
         else:
           addComponentDefinitionExport(result[], name, ComponentArgument(plan: contract))
       of 5'u8:
-        if resourceMember(name).kind != rmNone:
-          componentFail("invalid component contract interface name")
         let index = lookupInterface(interfaceTypes, takeU32(data, pos, stop))
         requireInterfaceNames(interfaceTypes[index], addr scope, forImport = importing)
         let instance = if importing:
-            addInterfaceImport(result[], name, interfaceTypes[index])
+            addInterfaceImport(result[], name, interfaceTypes[index], addr scope)
           else:
-            addContractInterfaceExport(result[], name, interfaceTypes[index])
+            result.links.visibilityOrder.addMember(vmInstance, result.links.interfaceExportCount())
+            addContractInterfaceExport(result[], name, interfaceTypes[index], addr scope)
         boundedAdd(instances, instance, MaxComponentFunctions)
       else:
         componentFail("unsupported component contract external sort")
@@ -3295,7 +4145,8 @@ proc addChildAlias(links: ComponentLinks, source: DeclaredInstance,
   if not supportedHostSignature(childMethods(links, source)[][exportIndex].signature,
       linkedResources = true):
     componentFail("unsupported linked component signature")
-  result = ComponentFunction(kind: fnChild, importIndex: links.aliases.len.uint32)
+  result = ComponentFunction(kind: fnChild, typeIndex: uint32.high,
+    importIndex: links.aliases.len.uint32)
   boundedAdd(links.aliases, ChildExport(childIndex: source.childIndex.uint16,
     interfaceIndex: source.interfaceIndex, exportIndex: exportIndex.uint16),
     MaxComponentFunctions)
@@ -3398,12 +4249,25 @@ proc lookupInstanceComponent(links: ComponentLinks, source: DeclaredInstance,
     if item.name == name: return item.value
   componentFail("unknown component definition export: " & name)
 
+proc bindResourceName(node: var ChildInstantiation, source, target: ResourceName) =
+  if source == nil or target == nil: return
+  if node.resourceNameBindings == nil: new(node.resourceNameBindings)
+  node.resourceNameBindings[].add((source, target))
+
+proc resourceNameInParent(node: var ChildInstantiation, name: ResourceName): ResourceName =
+  if name == nil: return nil
+  if node.resourceNameBindings != nil:
+    for binding in node.resourceNameBindings[]:
+      if binding.source == name: return binding.target
+  result = newResourceName()
+  node.bindResourceName(name, result)
+
 iterator instanceResourceTypes(links: ComponentLinks,
     source: DeclaredInstance): NamedResourceType =
   if source.childIndex < 0:
     for item in source.resourceTypes: yield item
   else:
-    let node = unsafeAddr links.children[source.childIndex]
+    let node = addr links.children[source.childIndex]
     let child = node.plan
     if child.links != nil:
       let resourceTypes = if source.interfaceIndex == 0:
@@ -3414,7 +4278,8 @@ iterator instanceResourceTypes(links: ComponentLinks,
         let index = item.resourceIndex.int
         if index >= node.resourceArgs.len or node.resourceArgs[index] == 0:
           componentFail("component interface has an unlinked resource type")
-        yield NamedResourceType(name: item.name, resourceIndex: node.resourceArgs[index] - 1)
+        yield NamedResourceType(name: item.name, resourceIndex: node.resourceArgs[index] - 1,
+          typeName: node[].resourceNameInParent(item.typeName))
 
 iterator instanceValueTypes(links: ComponentLinks,
     source: DeclaredInstance): NamedValueType =
@@ -3428,6 +4293,13 @@ iterator instanceValueTypes(links: ComponentLinks,
         else:
           unsafeAddr child.links.exportedInterface(source.interfaceIndex).valueTypes
       for item in types[]: yield item
+
+proc instanceVisibilityOrder(links: ComponentLinks, source: DeclaredInstance): VisibilityOrder =
+  if source.childIndex < 0: return source.visibilityOrder
+  let child = links.children[source.childIndex].plan
+  if child.links == nil: return nil
+  if source.interfaceIndex == 0: child.links.visibilityOrder
+  else: child.links.exportedInterface(source.interfaceIndex).visibilityOrder
 
 proc instanceTypeExternals(links: ComponentLinks, source: DeclaredInstance): ExternalTypeSurface =
   if source.childIndex < 0: return source.typeExternals
@@ -3468,20 +4340,26 @@ proc findInstanceValueType(links: ComponentLinks, source: DeclaredInstance,
 
 proc instanceHandlesInParent(plan: var ComponentPlan, source: DeclaredInstance,
     indices: openArray[uint16], visibility = tvImported): ResourceTypeMapping =
-  let child = unsafeAddr plan.links.children[source.childIndex]
+  let child = addr plan.links.children[source.childIndex]
   for index in indices:
-    let ordinal = resourceIndex(child.plan.handleTypes, index.uint32)
+    let handle = lookupResourceType(child.plan.handleTypes, index.uint32)
+    let ordinal = if handle < 0: -1 else: child.plan.handleTypes[handle].resourceIndex.int
     if ordinal < 0 or ordinal >= child.resourceArgs.len or child.resourceArgs[ordinal] == 0:
       componentFail("unbound component value resource type")
     let local = child.resourceArgs[ordinal] - 1
-    result.add((index, plan.bindResourceHandleIndex(local, visibility).uint16))
+    let name = child[].resourceNameInParent(child.plan.handleTypes[handle].typeName)
+    result.add((index, plan.bindResourceHandleIndex(local, visibility, name).uint16))
 
 proc valueTypeInParent(plan: var ComponentPlan, source: DeclaredInstance,
                        shape: ref CanonicalSlot): ref CanonicalSlot =
-  if source.childIndex < 0 or shape.resources == {}: return shape
+  if source.childIndex < 0: return shape
+  let node = addr plan.links.children[source.childIndex]
   var indices: seq[uint16]
-  collectResourceTypes(shape[], indices)
-  rebaseResourceShape(shape, instanceHandlesInParent(plan, source, indices), nil)
+  if shape.resources != {}: collectResourceTypes(shape[], indices)
+  let handles = instanceHandlesInParent(plan, source, indices, source.visibility)
+  if node.valueTypeArguments != nil:
+    return projectValueShape(shape, node[], handles)
+  rebaseResourceShape(shape, handles, nil)
 
 proc functionTypeInParent(plan: var ComponentPlan, source: DeclaredInstance,
                            signature: ComponentFuncType): ComponentFuncType =
@@ -3490,6 +4368,53 @@ proc functionTypeInParent(plan: var ComponentPlan, source: DeclaredInstance,
   if indices.len == 0: return signature
   rebaseResourceSignature(signature, instanceHandlesInParent(plan, source, indices, source.visibility))
 
+proc functionNamesInParent(plan: var ComponentPlan, source: DeclaredInstance,
+                           names: FunctionTypeNames): FunctionTypeNames =
+  result = names
+  if names == nil or source.childIndex < 0 or
+      plan.links.children[source.childIndex].valueTypeArguments == nil: return
+  for i, name in names[]:
+    let shape = plan.valueTypeInParent(source, name.shape)
+    if shape == name.shape: continue
+    if result == names:
+      new(result)
+      result[] = names[]
+    result[][i].shape = shape
+
+proc componentFunctionNames(plan: var ComponentPlan, fn: ComponentFunction,
+                            scope: ptr ShapeScope): FunctionTypeNames =
+  if fn.typeIndex != uint32.high:
+    return functionTypeNames(scope, fn.typeIndex)
+  if fn.kind == fnChild:
+    let alias = plan.links.aliases[fn.importIndex.int]
+    let child = childFunctionExport(plan.links, fn.importIndex.int)
+    return plan.functionNamesInParent(DeclaredInstance(childIndex: alias.childIndex.int),
+      child.visibilityNames)
+  plan.imports[fn.importIndex.int].visibilityNames
+
+proc componentFunctionResources(plan: var ComponentPlan, fn: ComponentFunction,
+    signature: ComponentFuncType, scope: ptr ShapeScope): ResourceNames =
+  if fn.typeIndex != uint32.high:
+    return resourceNames(scope.functionTypes[][fn.typeIndex.int], plan.handleTypes)
+  if fn.kind == fnImport:
+    return resourceNames(signature, plan.handleTypes)
+  let alias = plan.links.aliases[fn.importIndex.int]
+  let node = addr plan.links.children[alias.childIndex.int]
+  let child = childFunctionExport(plan.links, fn.importIndex.int)
+  if child.resourceNames != nil:
+    new(result)
+    for name in child.resourceNames[]:
+      result[].add(node[].resourceNameInParent(name))
+
+proc namedValueInParent(plan: var ComponentPlan, source: DeclaredInstance,
+                        value: NamedValueType): NamedValueType =
+  result = value
+  result.shape = plan.valueTypeInParent(source, value.shape)
+  if source.childIndex >= 0 and plan.links.children[source.childIndex].valueTypeArguments != nil:
+    result.origin = nil
+  else:
+    result.origin = value.namedOrigin()
+
 proc findInstanceFunctionType(links: ComponentLinks, source: DeclaredInstance,
                                name: string): NamedFunctionType =
   for item in instanceFunctionTypes(links, source):
@@ -3497,22 +4422,25 @@ proc findInstanceFunctionType(links: ComponentLinks, source: DeclaredInstance,
   componentFail("missing component instance function type: " & name)
 
 proc matchTypeResourceBindings(parent: ComponentPlan, childTypes: openArray[ResourceTypeAlias],
-    actualTypes, expectedTypes, resources: openArray[uint16]): bool =
+    actualTypes, expectedTypes, resources: openArray[uint16], substitute = true): bool =
   if actualTypes.len != expectedTypes.len: return false
   for i, index in actualTypes:
     let source = resourceIndex(parent.handleTypes, index.uint32)
     let target = resourceIndex(childTypes, expectedTypes[i].uint32)
-    if source < 0 or target < 0 or target >= resources.len or
-        resources[target].int != source + 1:
+    if source < 0 or target < 0:
+      return false
+    if substitute:
+      if target >= resources.len or resources[target].int != source + 1: return false
+    elif target != source:
       return false
   true
 
 proc matchValueResourceBindings(parent: ComponentPlan, childTypes: openArray[ResourceTypeAlias],
-    actual, expected: CanonicalSlot, resources: openArray[uint16]): bool =
+    actual, expected: CanonicalSlot, resources: openArray[uint16], substitute = true): bool =
   var actualTypes, expectedTypes: seq[uint16]
   collectResourceTypes(actual, actualTypes)
   collectResourceTypes(expected, expectedTypes)
-  matchTypeResourceBindings(parent, childTypes, actualTypes, expectedTypes, resources)
+  matchTypeResourceBindings(parent, childTypes, actualTypes, expectedTypes, resources, substitute)
 
 proc requireInstanceResource(links: ComponentLinks, source: DeclaredInstance,
                              name: string): NamedResourceType =
@@ -4031,9 +4959,11 @@ proc readInlineInstance(data: openArray[byte], pos: var int, stop: int,
   result.childIndex = -1
   let count = takeCount(data, pos, stop, MaxComponentFunctions)
   for _ in 0 ..< count:
-    if take(data, pos, stop) notin {0'u8, 1'u8}:
-      componentFail("unsupported inline instance name attributes")
-    let name = takeExternName(data, pos, stop, allowResourceMembers = true)
+    let external = takeExternalName(data, pos, stop)
+    let name = external.name
+    # Inline instances add no type indices and have no resource-name namespace.
+    if resourceMember(name).kind != rmNone:
+      componentFail("resource member names a type absent from its interface")
     for item in result.methods:
       if sameCanonicalName(item.name, name):
         componentFail("duplicate inline instance export")
@@ -4069,23 +4999,20 @@ proc readInlineInstance(data: openArray[byte], pos: var int, stop: int,
       for item in instanceTypes[]:
         if sameCanonicalName(item.name, name):
           componentFail("duplicate inline instance export")
-    let sort = take(data, pos, stop)
+    let sort = external.sort
     if sort == 0 and take(data, pos, stop) != 0x11:
       componentFail("unsupported inline instance core sort")
     let index = takeU32(data, pos, stop)
     case sort
     of 0'u8:
-      if resourceMember(name).kind != rmNone:
-        componentFail("invalid inline core module export name")
       let value = typedModuleValue(scope.corePlan[], scope.coreModuleValues[], index)
       result.coreModules.addInstanceModule(NamedCoreModule(name: name, value: value))
     of 1'u8:
       if index >= functions.len.uint32:
         componentFail("unknown inline instance function")
+      result.visibilityOrder.addMember(vmFunction, result.methods.len)
       result.methods.add(NamedComponentMethod(name: name, fn: functions[index.int]))
     of 3'u8:
-      if resourceMember(name).kind != rmNone:
-        componentFail("invalid inline instance type export name")
       if scope.isInstanceType(index):
         result.typeExternals.addNamedInstanceType(NamedInstanceType(name: name,
           shape: instanceTypeAt(scope, index)))
@@ -4093,26 +5020,27 @@ proc readInlineInstance(data: openArray[byte], pos: var int, stop: int,
         let contract = lookupComponentType(scope.componentTypes[], index)
         result.typeExternals.addNamedComponentType(NamedComponentType(name: name, plan: contract))
       elif scope.isFunctionType(index):
-        result.typeExternals.addNamedFunctionType(
+        result.typeExternals.addExportedFunctionType(result.visibilityOrder,
           namedFunctionType(unsafeAddr scope, index, name))
       else:
         let alias = lookupResourceType(resourceAliases, index)
         if alias < 0:
           let shape = outerValueShape(unsafeAddr scope, index)
+          if shape.kind in ShapedValues or shape.resources != {}:
+            result.visibilityOrder.addMember(vmType, result.valueTypes.len)
           result.valueTypes.add(NamedValueType(name: name, shape: shape))
         else:
+          result.visibilityOrder.addMember(vmResource, result.resourceTypes.len)
           result.resourceTypes.add(NamedResourceType(name: name,
             resourceIndex: resourceAliases[alias].resourceIndex,
-            exportAlias: resourceAliases[alias].exportAlias))
+            typeName: resourceAliases[alias].typeName))
     of 4'u8:
-      if resourceMember(name).kind != rmNone:
-        componentFail("invalid inline component export name")
       let value = scope.componentDefinitions[].definitionAt(index)
       result.components.addInstanceComponent(NamedComponentDefinition(name: name, value: value))
     of 5'u8:
-      if resourceMember(name).kind != rmNone: componentFail("invalid nested interface name")
       if index >= instances.len.uint32: componentFail("unknown inline instance")
       if result.children == nil: new(result.children)
+      result.visibilityOrder.addMember(vmInstance, result.children[].len)
       boundedAdd(result.children[], NamedInstance(name: name, value: instances[index.int]),
         MaxComponentFunctions)
     else:
@@ -4137,6 +5065,11 @@ proc collectValueBinding(bindings: var seq[InstanceTypeBinding],
   collectResourceTypes(actual, binding.actual)
   collectResourceTypes(expected, binding.expected)
   bindings.add(move binding)
+
+proc bindValueType(node: var ChildInstantiation, expected, actual: ref CanonicalSlot) =
+  if expected.kind notin ShapedValues or expected == actual: return
+  if node.valueTypeArguments == nil: new(node.valueTypeArguments)
+  node.valueTypeArguments[].add((expected, actual))
 
 proc checkFunctionTypeBinding(bindings: var seq[InstanceTypeBinding], actual,
                                expected: ComponentFuncType, name: string) =
@@ -4165,8 +5098,9 @@ proc bindInstanceArgument(plan: var ComponentPlan, node: var ChildInstantiation,
       node.componentArguments.arguments[item.value.importIndex.int - 1] = available
   for item in required.valueTypes:
     let provided = findInstanceValueType(plan.links, source, item)
+    let view = plan.valueTypeInParent(source, provided.shape)
+    node.bindValueType(item.shape, view)
     if item.shape.resources != {}:
-      let view = plan.valueTypeInParent(source, provided.shape)
       typeBindings.valuesAndFunctions.collectValueBinding(view[], item.shape[], item.name)
   if required.functionTypes != nil:
     for item in required.functionTypes[]:
@@ -4186,11 +5120,13 @@ proc bindInstanceArgument(plan: var ComponentPlan, node: var ChildInstantiation,
       let provided = requireExternalInstanceType(providedTypes, item.name)
       typeBindings.instances.add((instanceTypeInParent(plan.links, source, provided), item.shape))
   for item in required.resourceTypes:
-    let parentType = requireInstanceResource(plan.links, source, item.name).resourceIndex + 1
+    let parentResource = requireInstanceResource(plan.links, source, item.name)
+    let parentType = parentResource.resourceIndex + 1
     let previous = node.resourceArgs[item.resourceIndex.int]
     if previous != 0 and previous != parentType:
       componentFail("component instantiation resource equality mismatch")
     node.resourceArgs[item.resourceIndex.int] = parentType
+    node.bindResourceName(item.typeName, parentResource.typeName)
   for i in required.firstBinding ..< required.firstBinding + required.bindingCount:
     let imp = unsafeAddr node.plan.imports[i]
     let fn = lookupMethod(plan.links, source, imp.name)
@@ -4293,16 +5229,19 @@ proc readChildInstantiation(data: openArray[byte], pos: var int, stop: int,
         if sort != 3 or resource < 0:
           componentFail("component instantiation argument sort mismatch")
         equalityBindings[i] = (resource + 1).uint16
+        let alias = lookupResourceType(resourceAliases, index)
+        node.bindResourceName(required.typeName, resourceAliases[alias].typeName)
         break
       for item in child.links.valueImports:
         if item.name != name: continue
         if sort != 3 or resource >= 0:
           componentFail("component instantiation argument sort mismatch")
-        let provided = shapeAt(scope, index)
-        if item.shape[] != provided:
+        let provided = outerValueShape(unsafeAddr scope, index)
+        if item.shape[] != provided[]:
           componentFail("component instantiation value type mismatch: " & name)
+        node.bindValueType(item.shape, provided)
         if item.shape.resources != {}:
-          typeBindings.valuesAndFunctions.collectValueBinding(provided, item.shape[], name)
+          typeBindings.valuesAndFunctions.collectValueBinding(provided[], item.shape[], name)
         break
       if child.links.functionTypeImports != nil:
         for item in child.links.functionTypeImports[]:
@@ -4337,6 +5276,8 @@ proc readChildInstantiation(data: openArray[byte], pos: var int, stop: int,
       if node.resourceArgs[i] != 0 and node.resourceArgs[i].int != resource + 1:
         componentFail("component instantiation resource equality mismatch")
       node.resourceArgs[i] = (resource + 1).uint16
+      let alias = lookupResourceType(resourceAliases, index)
+      node.bindResourceName(required.importedTypeName, resourceAliases[alias].typeName)
       break
   if plan.links == nil: new(plan.links)
   let childIndex = plan.links.children.len
@@ -4351,8 +5292,8 @@ proc readChildInstantiation(data: openArray[byte], pos: var int, stop: int,
       node.resourceArgs[i] = capture.ordinal + 1
     elif resource.importName.len == 0:
       node.resourceArgs[i] = (plan.resources.len + 1).uint16
-      boundedAdd(plan.resources, LocalResourcePlan(sourceChild: (childIndex + 1).uint16,
-        sourceType: i.uint16), MaxComponentResourceTypes)
+      boundedAdd(plan.resources, LocalResourcePlan(sourceChild: (childIndex + 1).uint16),
+        MaxComponentResourceTypes)
     elif node.resourceArgs[i] == 0:
       componentFail("missing component instantiation resource argument")
   for i, actual in equalityBindings:
@@ -4439,22 +5380,23 @@ proc addInstanceTypeAlias(data: openArray[byte], pos: var int, stop: int,
   for resource in instanceResourceTypes(plan.links, source[]):
     if resource.name == name:
       scope.resourceAliases[].add(ResourceTypeAlias(typeIndex: scope.kinds.len.uint16,
-        resourceIndex: resource.resourceIndex, visible: source.visibility != tvPrivate,
-        imported: source.visibility == tvImported))
+        resourceIndex: resource.resourceIndex,
+        visible: source.visibility != tvPrivate or resource.typeName in scope.publishedResources,
+        imported: source.visibility == tvImported, typeName: resource.typeName))
       scope.kinds.add(cpResourceType)
       scope.functionTypes[].add(ComponentFuncType())
       return
   for item in instanceValueTypes(plan.links, source[]):
     if item.name == name:
-      let view = plan.valueTypeInParent(source[], item.shape)
-      scope.rememberShapeOrigin(view, item.namedOrigin())
-      scope.addValueType(view, source.visibility)
+      let view = plan.namedValueInParent(source[], item)
+      scope.rememberShapeOrigin(view.shape, view.namedOrigin())
+      scope.addValueType(view.shape, source.visibility)
       scope.functionTypes[].add(ComponentFuncType())
       return
   for item in instanceFunctionTypes(plan.links, source[]):
     if item.name == name:
       scope.addFunctionAlias(plan.functionTypeInParent(source[], item.signature),
-        FunctionTypeOrigin(names: item.names))
+        FunctionTypeOrigin(names: plan.functionNamesInParent(source[], item.names)))
       return
   let contract = findExternalComponentType(instanceTypeExternals(plan.links, source[]), name)
   if contract != nil:
@@ -4520,19 +5462,55 @@ proc materializeExternalTypes(types: ExternalTypeSurface, handles: ResourceTypeM
         result.components[] = types.components[]
       result.components[][i].plan = contract
 
-proc materializeInterfaceTypes(plan: var ComponentPlan, declared: InterfaceType,
-    instance: var DeclaredInstance, mapping: openArray[uint16],
-    visibility: TypeVisibility): ResourceTypeMapping =
-  instance.childIndex = -1
-  instance.visibility = visibility
+proc projectResourceNames(declared: InterfaceType, mapping: openArray[uint16],
+                          names: var ResourceNameProjection) {.noinline.} =
   if declared.resources != nil:
     for item in declared.resources.resourceTypes:
+      let slot = mapping[item.resourceIndex.int]
+      if slot == 0 or item.typeName == nil: continue
+      let ordinal = slot - 1
+      if names == nil: new(names)
+      var found = false
+      for entry in names[]:
+        if entry.source == item.typeName and entry.ordinal == ordinal:
+          found = true
+          break
+      if not found: names[].add((item.typeName, ordinal, newResourceName()))
+  if declared.children != nil:
+    for child in declared.children[]:
+      projectResourceNames(child.definition[], nestedResources(child.resources, mapping), names)
+
+proc projectedResourceName(names: ResourceNameProjection, name: ResourceName,
+                           ordinal: uint16): ResourceName =
+  if names != nil:
+    for entry in names[]:
+      if entry.source == name and entry.ordinal == ordinal: return entry.target
+  name
+
+proc materializeResourceHandles(plan: var ComponentPlan, resources: InterfaceResourceTypes,
+    mapping: openArray[uint16], visibility: TypeVisibility,
+    names: ResourceNameProjection): ResourceTypeMapping {.noinline.} =
+  if resources == nil: return
+  for handle in resources.handleTypes:
+    if not resources.hasInterfaceResource(handle.resourceIndex.int): continue
+    let slot = mapping[handle.resourceIndex.int]
+    if slot == 0: componentFail("unbound interface resource type")
+    let local = slot - 1
+    let name = projectedResourceName(names, handle.typeName, local)
+    result.add((handle.typeIndex, plan.bindResourceHandleIndex(local, visibility, name).uint16))
+
+proc materializeInterfaceTypes(plan: var ComponentPlan, declared: InterfaceType,
+    instance: var DeclaredInstance, mapping: openArray[uint16],
+    visibility: TypeVisibility, names: ResourceNameProjection): ResourceTypeMapping =
+  instance.childIndex = -1
+  instance.visibility = visibility
+  instance.visibilityOrder = declared.visibilityOrder
+  if declared.resources != nil:
+    for item in declared.resources.resourceTypes:
+      let local = mapping[item.resourceIndex.int] - 1
       instance.resourceTypes.add(NamedResourceType(name: item.name,
-        resourceIndex: mapping[item.resourceIndex.int] - 1))
-    for handle in declared.resources.handleTypes:
-      if not declared.resources.hasInterfaceResource(handle.resourceIndex.int): continue
-      let local = mapping[handle.resourceIndex.int] - 1
-      result.add((handle.typeIndex, plan.bindResourceHandleIndex(local).uint16))
+        resourceIndex: local, typeName: projectedResourceName(names, item.typeName, local)))
+    result = materializeResourceHandles(plan, declared.resources, mapping, visibility, names)
   instance.valueTypes = declared.valueTypes
   if result.len > 0:
     for item in instance.valueTypes.mitems:
@@ -4544,27 +5522,32 @@ proc materializeInterfaceTypes(plan: var ComponentPlan, declared: InterfaceType,
 
 proc materializeInterfaceImport(plan: var ComponentPlan, name: string,
     declared: InterfaceType, mapping: openArray[uint16], index: uint16,
-    instance: var DeclaredInstance, depth: int, remaining: var int): InterfaceImport
+    instance: var DeclaredInstance, depth: int, remaining: var int,
+    names: ResourceNameProjection, scope: ptr ShapeScope): InterfaceImport
 
 proc materializeNestedImports(plan: var ComponentPlan, declared: InterfaceType,
     mapping: openArray[uint16], index: uint16, instance: var DeclaredInstance,
-    surface: var InterfaceImport, depth: int, remaining: var int) {.noinline.} =
+    surface: var InterfaceImport, depth: int, remaining: var int,
+    names: ResourceNameProjection, scope: ptr ShapeScope) {.noinline.} =
   new(instance.children)
   new(surface.children)
   for member in declared.children[]:
     var child = NamedInstance(name: member.name)
     let requirement = materializeInterfaceImport(plan, member.name, member.definition[],
-      nestedResources(member.resources, mapping), index, child.value, depth + 1, remaining)
+      nestedResources(member.resources, mapping), index, child.value, depth + 1, remaining,
+      names, scope)
     surface.children[].add(requirement)
     instance.children[].add(move child)
 
 proc materializeInterfaceImport(plan: var ComponentPlan, name: string,
     declared: InterfaceType, mapping: openArray[uint16], index: uint16,
-    instance: var DeclaredInstance, depth: int, remaining: var int): InterfaceImport =
+    instance: var DeclaredInstance, depth: int, remaining: var int,
+    names: ResourceNameProjection, scope: ptr ShapeScope): InterfaceImport =
   if depth >= MaxInstanceNesting: componentFail("instance import nesting limit")
   if remaining == 0: componentFail("instance import surface limit")
   dec remaining
-  let handles = materializeInterfaceTypes(plan, declared, instance, mapping, tvImported)
+  let handles = materializeInterfaceTypes(plan, declared, instance, mapping, tvImported, names)
+  for item in instance.resourceTypes: publishResourceName(scope, item.typeName, importing = true)
   result = InterfaceImport(name: name,
     firstBinding: plan.imports.len, bindingCount: declared.methods.len,
     valueTypes: instance.valueTypes, resourceTypes: instance.resourceTypes,
@@ -4586,18 +5569,23 @@ proc materializeInterfaceImport(plan: var ComponentPlan, name: string,
       importIndex: plan.imports.len.uint32)
     instance.methods.add(NamedComponentMethod(name: methodImport.name, fn: fn))
     boundedAdd(plan.imports, ComponentImport(name: methodImport.name,
-      signature: move signature, interfaceIndex: index),
+      signature: move signature, interfaceIndex: index,
+      visibilityNames: methodImport.visibilityNames),
       MaxComponentFunctions)
   if declared.children != nil:
-    materializeNestedImports(plan, declared, mapping, index, instance, result, depth, remaining)
+    materializeNestedImports(plan, declared, mapping, index, instance, result, depth, remaining,
+      names, scope)
 
 proc addInterfaceImport(plan: var ComponentPlan, name: string,
-                        declared: InterfaceType): DeclaredInstance =
+                        declared: InterfaceType, scope: ptr ShapeScope): DeclaredInstance =
   if plan.links == nil: new(plan.links)
   let index = (plan.links.interfaceImports.len + 1).uint16
   let bindings = plan.allocateInterfaceResources(declared, index)
+  var names: ResourceNameProjection
+  projectResourceNames(declared, bindings, names)
   var remaining = MaxComponentFunctions
-  let required = materializeInterfaceImport(plan, name, declared, bindings, index, result, 0, remaining)
+  let required = materializeInterfaceImport(plan, name, declared, bindings, index, result, 0,
+    remaining, names, scope)
   boundedAdd(plan.links.interfaceImports, required, MaxComponentFunctions)
 
 proc materializeInterfaceDefinitions(components: ref seq[NamedComponentDefinition],
@@ -4613,32 +5601,38 @@ proc materializeInterfaceDefinitions(components: ref seq[NamedComponentDefinitio
 
 proc materializeContractExport(plan: var ComponentPlan, name: string,
     declared: InterfaceType, mapping: openArray[uint16], instance: var DeclaredInstance,
-    depth: int): InterfaceExport =
+    depth: int, names: ResourceNameProjection, scope: ptr ShapeScope = nil): InterfaceExport =
   if depth >= MaxInstanceNesting: componentFail("instance export nesting limit")
-  let handles = materializeInterfaceTypes(plan, declared, instance, mapping, tvExported)
+  let handles = materializeInterfaceTypes(plan, declared, instance, mapping, tvExported, names)
+  if scope != nil:
+    for item in instance.resourceTypes: publishResourceName(scope, item.typeName)
   instance.coreModules = declared.coreModules
   if declared.components != nil:
     instance.components = materializeInterfaceDefinitions(declared.components, mapping)
   result = InterfaceExport(name: name, resourceTypes: instance.resourceTypes,
     valueTypes: instance.valueTypes, coreModules: declared.coreModules, components: instance.components,
-    typeExternals: instance.typeExternals)
+    typeExternals: instance.typeExternals, visibilityOrder: declared.visibilityOrder)
   for item in declared.methods:
+    let signature = rebaseResourceSignature(item.signature, handles)
     result.methods.add(ComponentExport(name: item.name,
-      signature: rebaseResourceSignature(item.signature, handles)))
+      signature: signature, visibilityNames: item.visibilityNames,
+      resourceNames: resourceNames(signature, plan.handleTypes)))
   if declared.children != nil:
     new(instance.children)
     new(result.children)
     for member in declared.children[]:
       var child = NamedInstance(name: member.name)
       let surface = materializeContractExport(plan, member.name, member.definition[],
-        nestedResources(member.resources, mapping), child.value, depth + 1)
+        nestedResources(member.resources, mapping), child.value, depth + 1, names, scope)
       result.children[].add(plan.links.appendNestedExport(surface))
       instance.children[].add(move child)
 
 proc addContractInterfaceExport(plan: var ComponentPlan, name: string,
-                                declared: InterfaceType): DeclaredInstance =
+                                declared: InterfaceType, scope: ptr ShapeScope): DeclaredInstance =
   let bindings = plan.allocateInterfaceResources(declared, 0)
-  let surface = materializeContractExport(plan, name, declared, bindings, result, 0)
+  var names: ResourceNameProjection
+  projectResourceNames(declared, bindings, names)
+  let surface = materializeContractExport(plan, name, declared, bindings, result, 0, names, scope)
   plan.links.appendInterfaceExport(surface)
 
 proc comparisonInterfacePlan(shape: InterfaceType): ref ComponentPlan {.noinline.} =
@@ -4662,7 +5656,7 @@ proc comparisonInterfacePlan(shape: InterfaceType): ref ComponentPlan {.noinline
             break
       mapping.add(index)
   var unused: DeclaredInstance
-  let surface = materializeContractExport(result[], "", shape, mapping, unused, 0)
+  let surface = materializeContractExport(result[], "", shape, mapping, unused, 0, nil)
   result.links.appendInterfaceExport(surface)
 
 proc sameInstanceTypeResource(provided, required: InterfaceResourceTypes, actual, expected: int,
@@ -4707,19 +5701,20 @@ proc requireInstanceTypeSubtype(provided, required: ref InterfaceType,
 
 proc buildInterfaceExport(plan: var ComponentPlan, name: string, source: DeclaredInstance,
     projection: var DeclaredInstance, annotation: ptr InterfaceType,
-    annotationResources: openArray[uint16], types: openArray[ComponentFuncType],
+    annotationResources: openArray[uint16], names: ResourceNameProjection, scope: ptr ShapeScope,
     coreInstances: openArray[CoreInstance], coreFunctions: openArray[CoreFunction],
     memories: openArray[CoreExportAlias], depth: int): InterfaceExport
 
 proc appendInterfaceChild(plan: var ComponentPlan, name: string, source: DeclaredInstance,
     annotation: ptr InterfaceType, bindings: openArray[uint16],
+    names: ResourceNameProjection,
     parent: var InterfaceExport, projection: var DeclaredInstance,
-    types: openArray[ComponentFuncType], coreInstances: openArray[CoreInstance],
+    scope: ptr ShapeScope, coreInstances: openArray[CoreInstance],
     coreFunctions: openArray[CoreFunction], memories: openArray[CoreExportAlias],
     depth: int) {.noinline.} =
   var child = NamedInstance(name: name)
   let surface = buildInterfaceExport(plan, name, source, child.value,
-    annotation, bindings, types, coreInstances, coreFunctions, memories, depth + 1)
+    annotation, bindings, names, scope, coreInstances, coreFunctions, memories, depth + 1)
   if parent.children == nil:
     new(parent.children)
     new(projection.children)
@@ -4782,7 +5777,8 @@ proc exportInterfaceTypes(plan: var ComponentPlan, source: DeclaredInstance,
         result.addNamedInstanceType(NamedInstanceType(name: item.name, shape: expected))
   if annotation == nil:
     for item in instanceFunctionTypes(plan.links, source):
-      result.addNamedFunctionType(NamedFunctionType(name: item.name, names: item.names,
+      result.addNamedFunctionType(NamedFunctionType(name: item.name,
+        names: plan.functionNamesInParent(source, item.names),
         signature: plan.functionTypeInParent(source, item.signature)))
   elif annotation.functionTypes != nil:
     for expected in annotation.functionTypes[]:
@@ -4794,16 +5790,20 @@ proc exportInterfaceTypes(plan: var ComponentPlan, source: DeclaredInstance,
           ComponentExport(signature: provided.signature), expected.signature,
           annotation.resources.handleTypes, resources, substitute = true):
         componentFail("component interface export function resource type mismatch: " & expected.name)
+      provided.names = expected.names
       result.addNamedFunctionType(move provided)
 
 proc buildInterfaceExport(plan: var ComponentPlan, name: string, source: DeclaredInstance,
     projection: var DeclaredInstance, annotation: ptr InterfaceType,
-    annotationResources: openArray[uint16], types: openArray[ComponentFuncType],
+    annotationResources: openArray[uint16], names: ResourceNameProjection, scope: ptr ShapeScope,
     coreInstances: openArray[CoreInstance], coreFunctions: openArray[CoreFunction],
     memories: openArray[CoreExportAlias], depth: int): InterfaceExport =
   if depth >= MaxInstanceNesting: componentFail("instance export nesting limit")
   projection.childIndex = -1
   projection.visibility = tvExported
+  projection.visibilityOrder = if annotation == nil: instanceVisibilityOrder(plan.links, source)
+    else: annotation.visibilityOrder
+  var annotationHandles: ResourceTypeMapping
   if annotation == nil:
     if source.childIndex < 0:
       projection.methods = source.methods
@@ -4815,23 +5815,27 @@ proc buildInterfaceExport(plan: var ComponentPlan, name: string, source: Declare
     for resource in instanceResourceTypes(plan.links, source):
       projection.resourceTypes.add(resource)
     for item in instanceValueTypes(plan.links, source):
-      projection.valueTypes.add(NamedValueType(name: item.name,
-        shape: plan.valueTypeInParent(source, item.shape), origin: item.namedOrigin()))
+      projection.valueTypes.add(plan.namedValueInParent(source, item))
   else:
     if annotation.resources != nil:
       for item in annotation.resources.resourceTypes:
-        let actual = requireInstanceResource(plan.links, source, item.name)
+        var actual = requireInstanceResource(plan.links, source, item.name)
         if annotationResources[item.resourceIndex.int] != actual.resourceIndex + 1:
           componentFail("component interface export resource type mismatch")
-        projection.resourceTypes.add(actual)
+        actual.typeName = projectedResourceName(names, item.typeName, actual.resourceIndex)
+        projection.resourceTypes.add(move actual)
+      annotationHandles = materializeResourceHandles(plan, annotation.resources,
+        annotationResources, tvExported, names)
     for item in annotation.valueTypes:
       let actual = findInstanceValueType(plan.links, source, item)
-      let view = plan.valueTypeInParent(source, actual.shape)
-      if item.shape.resources != {} and not matchValueResourceBindings(plan,
-          annotation.resources.handleTypes, view[], item.shape[], annotationResources):
-        componentFail("component interface export value resource type mismatch")
-      projection.valueTypes.add(NamedValueType(name: item.name, shape: view,
-        origin: actual.namedOrigin()))
+      if item.shape.resources != {}:
+        let view = plan.valueTypeInParent(source, actual.shape)
+        if not matchValueResourceBindings(plan, annotation.resources.handleTypes,
+            view[], item.shape[], annotationResources):
+          componentFail("component interface export value resource type mismatch")
+      let exposed = rebaseResourceShape(item.shape, annotationHandles, nil)
+      projection.valueTypes.add(NamedValueType(name: item.name, shape: exposed,
+        origin: item.namedOrigin()))
     for item in annotation.methods:
       projection.methods.add(NamedComponentMethod(name: item.name,
         fn: lookupMethod(plan.links, source, item.name)))
@@ -4840,9 +5844,10 @@ proc buildInterfaceExport(plan: var ComponentPlan, name: string, source: Declare
   projection.typeExternals = exportInterfaceTypes(plan, source, annotation, annotationResources)
   result = InterfaceExport(name: name, resourceTypes: projection.resourceTypes,
     valueTypes: projection.valueTypes, coreModules: projection.coreModules,
-    components: projection.components, typeExternals: projection.typeExternals)
+    components: projection.components, typeExternals: projection.typeExternals,
+    visibilityOrder: projection.visibilityOrder)
   for i, item in projection.methods:
-    var methodExport = describeFunction(item.fn, plan, types, coreInstances,
+    var methodExport = describeFunction(item.fn, plan, scope.functionTypes[], coreInstances,
       coreFunctions, memories)
     if not supportedHostSignature(methodExport.signature, linkedResources = true):
       componentFail("unsupported component interface function type")
@@ -4853,55 +5858,78 @@ proc buildInterfaceExport(plan: var ComponentPlan, name: string, source: Declare
       if annotation.resources != nil and not matchResourceBindings(plan, methodExport,
           required[], annotation.resources.handleTypes, annotationResources, substitute = true):
         componentFail("component interface export resource type mismatch")
+      methodExport.visibilityNames = annotation.methods[i].visibilityNames
+      methodExport.resourceNames = resourceNames(
+        rebaseResourceSignature(required[], annotationHandles), plan.handleTypes)
+    else:
+      methodExport.visibilityNames = plan.componentFunctionNames(item.fn, scope)
+      methodExport.resourceNames = plan.componentFunctionResources(item.fn, methodExport.signature, scope)
     methodExport.name = item.name
     if annotation == nil:
-      for typeIndex in signatureResourceTypes(methodExport.signature):
-        let index = resourceOfExport(plan, methodExport, typeIndex.int32)
-        var exposed = false
-        for resource in result.resourceTypes:
-          if resource.resourceIndex.int == index:
-            exposed = true
-            break
-        if not exposed: componentFail("interface method resource type is not exported")
-    checkResourceMemberName(plan, methodExport, result.resourceTypes)
+      checkResourceMemberName(plan, methodExport, result.resourceTypes)
     result.methods.add(move methodExport)
   if annotation == nil:
     for member in nestedInstances(plan.links, source):
-      appendInterfaceChild(plan, member.name, member.value, nil, [], result, projection,
-        types, coreInstances, coreFunctions, memories, depth)
+      appendInterfaceChild(plan, member.name, member.value, nil, [], nil, result, projection,
+        scope, coreInstances, coreFunctions, memories, depth)
   elif annotation.children != nil:
     for member in annotation.children[]:
       let supplied = lookupNestedInstance(plan.links, source, member.name)
       appendInterfaceChild(plan, member.name, supplied, unsafeAddr member.definition[],
-        nestedResources(member.resources, annotationResources), result, projection,
-        types, coreInstances, coreFunctions, memories, depth)
+        nestedResources(member.resources, annotationResources), names, result, projection,
+        scope, coreInstances, coreFunctions, memories, depth)
 
-proc validateExportedTypes(plan: ComponentPlan, surface, root: InterfaceExport,
-                           scope: ptr ShapeScope) {.noinline.} =
+proc requireExportedNames(scope: ptr ShapeScope, visible: openArray[ptr NamedValueType],
+                          names: FunctionTypeNames) =
+  if names == nil: return
+  for name in names[]:
+    var found = false
+    for item in visible:
+      if item.shape == name.shape or originOfShape(item[].namedOrigin(), scope) == name.shape:
+        found = true
+        break
+    if not found:
+      requireVisibleReference(name.shape, scope, false, name.diagnostic)
+
+proc requirePublishedResourceNames(scope: ptr ShapeScope, names: ResourceNames,
+                                   diagnostic: string) =
+  if names != nil:
+    for name in names[]:
+      if name notin scope.publishedResources: componentFail(diagnostic)
+
+proc validateExportedTypes(plan: ComponentPlan, surface: ptr InterfaceExport,
+    scope: ptr ShapeScope, visible: var seq[ptr NamedValueType]) {.noinline.} =
   let instances = instancesIn(surface.typeExternals)
   if instances != nil:
     for item in instances[]:
       requireInterfaceNames(item.shape[], scope, forImport = false)
-  if surface.functionTypes != nil:
-    for item in surface.functionTypes[]:
-      if item.names != nil:
-        for name in item.names[]:
-          if not namesFromExport(plan.links, root, name.shape, scope):
-            requireVisibleReference(name.shape, scope, false, name.diagnostic)
-      for index in signatureResourceTypes(item.signature):
-        let alias = lookupResourceType(plan.handleTypes, index.uint32)
-        if alias < 0: componentFail("unknown interface function type resource")
-        if plan.handleTypes[alias].visible: continue
-        let ordinal = plan.handleTypes[alias].resourceIndex
-        var visible = false
-        for typ in surface.resourceTypes:
-          if typ.resourceIndex == ordinal:
-            visible = true
-            break
-        if not visible: componentFail("interface function type resource is not exported")
-  if surface.children != nil:
-    for child in surface.children[]:
-      validateExportedTypes(plan, plan.links.exportedInterface(child)[], root, scope)
+  if surface.visibilityOrder == nil: return
+  for step in surface.visibilityOrder[]:
+    let index = step.index.int
+    case step.member
+    of vmType:
+      let value = unsafeAddr surface.valueTypes[index]
+      var names: FunctionTypeNames
+      collectFunctionTypeNames(value[].namedOrigin()[], scope, names)
+      requireExportedNames(scope, visible, names)
+      requireVisibleResourceSlot(plan.handleTypes, value.shape[], false,
+        "interface value resource type is not exported", scope = scope)
+      if value.shape.kind in NamedValueTypes: visible.add(value)
+    of vmResource:
+      publishResourceName(scope, surface.resourceTypes[index].typeName)
+    of vmFunction:
+      let fn = unsafeAddr surface.methods[index]
+      requireExportedNames(scope, visible, fn.visibilityNames)
+      requirePublishedResourceNames(scope, fn.resourceNames,
+        "interface method resource type is not exported")
+    of vmFunctionType:
+      let fn = unsafeAddr surface.functionTypes[][index]
+      requireExportedNames(scope, visible, fn.names)
+      requirePublishedResourceNames(scope, resourceNames(fn.signature, plan.handleTypes),
+        "interface function type resource is not exported")
+    of vmInstance:
+      let child = plan.links.exportedInterface(surface.children[][index])
+      validateExportedTypes(plan, child, scope, visible)
 
 proc markNamedResources(resources: openArray[NamedResourceType], visible: var ResourceOrdinals) =
   for item in resources:
@@ -4965,7 +5993,7 @@ proc validateResourceCaptures(plan: ComponentPlan) =
 
 proc readInterfaceExport(data: openArray[byte], pos: var int, stop: int,
     name: string, plan: var ComponentPlan, instances: var seq[DeclaredInstance],
-    interfaceTypes: openArray[InterfaceType], types: openArray[ComponentFuncType],
+    interfaceTypes: openArray[InterfaceType],
     coreInstances: openArray[CoreInstance], coreFunctions: openArray[CoreFunction],
     memories: openArray[CoreExportAlias], scope: ptr ShapeScope) =
   let index = takeU32(data, pos, stop)
@@ -4980,6 +6008,7 @@ proc readInterfaceExport(data: openArray[byte], pos: var int, stop: int,
   else: componentFail("invalid component interface export annotation")
   if plan.links == nil: new(plan.links)
   var bindings: seq[uint16]
+  var names: ResourceNameProjection
   if annotation != nil:
     requireInterfaceNames(annotation[], scope, forImport = false)
     if annotation.resources != nil:
@@ -4989,10 +6018,13 @@ proc readInterfaceExport(data: openArray[byte], pos: var int, stop: int,
           bindings.add(enclosing.ordinal + 1)
         else:
           bindings.add(0)
+    projectResourceNames(annotation[], bindings, names)
   var projection: DeclaredInstance
   let surface = buildInterfaceExport(plan, name, instances[index.int], projection,
-    annotation, bindings, types, coreInstances, coreFunctions, memories, 0)
-  validateExportedTypes(plan, surface, surface, scope)
+    annotation, bindings, names, scope, coreInstances, coreFunctions, memories, 0)
+  var visible: seq[ptr NamedValueType]
+  validateExportedTypes(plan, unsafeAddr surface, scope, visible)
+  plan.links.visibilityOrder.addMember(vmInstance, plan.links.interfaceExportCount())
   plan.links.appendInterfaceExport(surface)
   boundedAdd(instances, move projection, MaxComponentFunctions)
 
@@ -5020,17 +6052,19 @@ proc linkedImport(module: WasmModule, imp: Import,
           if target.kind == cfLower:
             let lowering = unsafeAddr plan.lowerings[target.loweringIndex.int]
             let ft = unsafeAddr module.types[imp.funcTypeIdx.int]
+            let asyncLower = when defined(wasmComponentAsyncCallbacks): lowering.asyncLower
+              else: false
             if lowering.kind in {clHost, clChild, clLocal}:
-              if not signatureMatchesCore(
-                  loweringSignature(plan, lowering[]), ft[],
-                  forLower = true):
+              let matches = if asyncLower:
+                ft[].isPlainCoreFunction() and ft[] == plan.generatedCoreType(lowering[])
+              else:
+                signatureMatchesCore(loweringSignature(plan, lowering[]), ft[], forLower = true)
+              if not matches:
                 componentFail("canonical import type mismatch")
-            else:
-              let hasResult = lowering.kind != clResourceDrop
-              if ft.params != @[vtI32] or
-                  ft.results.len != hasResult.int or
-                  (hasResult and ft.results[0] != vtI32):
-                componentFail("canonical resource function type mismatch")
+            elif ft[] != plan.generatedCoreType(lowering[]):
+              if lowering.kind in {clContextGet, clContextSet}:
+                componentFail("canonical context function type mismatch")
+              componentFail("canonical resource function type mismatch")
             return CoreImportSource(instanceIndex: -1,
               itemIndex: target.loweringIndex.uint16)
           storeIndex = instances[target.coreInstance.int].storeIndex.int
@@ -5066,6 +6100,15 @@ proc validateLift(module: WasmModule, exp: ComponentExport, storeIndex: uint8,
     validateCoreExport(module, exp)
   if exp.coreSources[clsRealloc] == source:
     module.requireCanonicalRealloc(exp.reallocName)
+  when defined(wasmComponentAsyncCallbacks):
+    if exp.callbackSource == source:
+      var found = false
+      for coreExp in module.exports:
+        if coreExp.name != exp.callbackName or coreExp.kind != ekFunc: continue
+        let ft = coreFuncType(module, coreExp.idx)
+        found = ft.isPlainCoreFunction() and ft.params == @[vtI32, vtI32, vtI32] and
+          ft.results == @[vtI32]
+      if not found: componentFail("invalid canonical callback function")
   if exp.coreSources[clsPostReturn] == source:
     var postReturnValid = false
     var postReturnParams: seq[ValType]
@@ -5111,6 +6154,17 @@ proc validateCoreGraph(plan: var ComponentPlan,
     for lowering in plan.lowerings:
       if lowering.reallocSource == instance.storeIndex + 1:
         module.requireCanonicalRealloc(lowering.reallocName)
+      when defined(wasmComponentThreads):
+        if lowering.threadTable == instance.storeIndex + 1:
+          var valid = false
+          for exp in module.exports:
+            if exp.name != lowering.threadTableName or exp.kind != ekTable: continue
+            let table = module.coreExportType(exp).tableType
+            valid = table.elemType == vtFuncRef
+            when defined(wasmFunctionReferences):
+              valid = valid and sameCoreReference(table.elementReference, CoreReferenceType())
+            break
+          if not valid: componentFail("canonical thread table must contain funcref")
     for resource in plan.resources:
       if resource.destructorSource != instance.storeIndex + 1: continue
       var valid = false
@@ -5282,6 +6336,15 @@ proc readBoundInstanceTypeExport(data: openArray[byte], pos: var int, stop: int,
   else: componentFail("invalid instance type export annotation")
   addPlanInstanceType(plan, scope, visible, name, importing = false)
 
+proc requireValueTypeAscription(plan: ComponentPlan, scope: ShapeScope, index: uint32,
+                                expected: CanonicalSlot) {.noinline.} =
+  let actual = shapeAt(scope, index)
+  if actual != expected:
+    componentFail("value type export annotation shape mismatch")
+  if expected.resources != {} and not matchValueResourceBindings(plan, plan.handleTypes,
+      actual, expected, [], substitute = false):
+    componentFail("value type export annotation resource mismatch")
+
 proc readComponentTypeExport(data: openArray[byte], pos: var int, stop: int,
     name: string, plan: var ComponentPlan, scope: var ShapeScope) {.noinline.} =
   template types: untyped = scope.functionTypes[]
@@ -5317,30 +6380,62 @@ proc readComponentTypeExport(data: openArray[byte], pos: var int, stop: int,
     else: componentFail("invalid function type export annotation")
     addPlanFunctionType(plan, scope, visible, name, importing = false)
     return
-  if annotation != 0: componentFail("unsupported component type export")
+  var visible = typeIndex
+  var abstractResource = false
+  case annotation
+  of 0: discard
+  of 1:
+    if take(data, pos, stop) != 3:
+      componentFail("component type export annotation sort mismatch")
+    case take(data, pos, stop)
+    of 0:
+      visible = takeU32(data, pos, stop)
+      if visible >= valueKinds.len.uint32 or valueKinds[visible.int] != kind:
+        componentFail("component type export annotation sort mismatch")
+    of 1:
+      if kind != cpResourceType:
+        componentFail("component type export subtype bound requires a resource")
+      abstractResource = true
+    else: componentFail("invalid component type export bound")
+  else: componentFail("invalid component type export annotation")
   if kind == cpResourceType:
-    let resource = resourceIndex(resourceAliases, typeIndex)
-    let exportAlias = (types.len + 1).uint16
+    var resource = resourceIndex(resourceAliases, typeIndex)
+    if resource < 0 or resource != resourceIndex(resourceAliases, visible):
+      componentFail("resource type export annotation identity mismatch")
+    if abstractResource:
+      let source = resource
+      resource = plan.resources.len
+      boundedAdd(plan.resources, LocalResourcePlan(ascribedFrom: (source + 1).uint16),
+        MaxComponentResourceTypes)
+    let typeName = newResourceName()
     resourceAliases.add(ResourceTypeAlias(typeIndex: types.len.uint16,
-      resourceIndex: resource.uint16, visible: true, exportAlias: exportAlias))
+      resourceIndex: resource.uint16, visible: true, typeName: typeName))
     if plan.links == nil: new(plan.links)
+    plan.links.visibilityOrder.addMember(vmResource, plan.links.resourceExports.len)
     boundedAdd(plan.links.resourceExports, NamedResourceType(name: name,
-      resourceIndex: resource.uint16, exportAlias: exportAlias), MaxComponentFunctions)
+      resourceIndex: resource.uint16, typeName: typeName),
+      MaxComponentFunctions)
+    publishResourceName(addr scope, typeName)
     valueKinds.add(kind)
   else:
-    let value = shapeAt(scope, typeIndex)
+    let value = shapeAt(scope, visible)
+    if visible != typeIndex:
+      requireValueTypeAscription(plan, scope, typeIndex, value)
     requireVisibleChildren(value, addr scope, false)
     requireVisibleResourceSlot(plan.handleTypes, value, false,
-      "component value resource type is not exported")
+      "component value resource type is not exported", scope = addr scope)
     let shape = newSlot(value)
     if plan.links == nil: new(plan.links)
+    if shape.kind in ShapedValues or shape.resources != {}:
+      plan.links.visibilityOrder.addMember(vmType, plan.links.valueExports.len)
     boundedAdd(plan.links.valueExports, NamedValueType(name: name, shape: shape),
       MaxComponentFunctions)
     scope.addValueType(shape, tvExported)
   types.add(ComponentFuncType())
 
 proc readComponentTypeImport(data: openArray[byte], pos: var int, stop: int,
-    name: string, plan: var ComponentPlan, scope: var ShapeScope) {.noinline.} =
+    name: string, plan: var ComponentPlan, scope: var ShapeScope,
+    resourceImports: var seq[NamedResourceType]) {.noinline.} =
   template types: untyped = scope.functionTypes[]
   template resourceAliases: untyped = scope.resourceAliases[]
   template valueKinds: untyped = scope.kinds
@@ -5348,10 +6443,14 @@ proc readComponentTypeImport(data: openArray[byte], pos: var int, stop: int,
   if types.len >= MaxComponentTypes:
     componentFail("component type index-space limit")
   if bound == 1:
+    let typeName = newResourceName()
+    resourceImports.add(NamedResourceType(name: name,
+      resourceIndex: plan.resources.len.uint16, typeName: typeName))
     resourceAliases.add(ResourceTypeAlias(typeIndex: types.len.uint16,
-      resourceIndex: plan.resources.len.uint16, visible: true, imported: true))
-    boundedAdd(plan.resources, LocalResourcePlan(importName: name),
+      resourceIndex: plan.resources.len.uint16, visible: true, imported: true, typeName: typeName))
+    boundedAdd(plan.resources, LocalResourcePlan(importName: name, importedTypeName: typeName),
       MaxComponentResourceTypes)
+    publishResourceName(addr scope, typeName, importing = true)
     types.add(ComponentFuncType())
     valueKinds.add(cpResourceType)
     return
@@ -5372,19 +6471,22 @@ proc readComponentTypeImport(data: openArray[byte], pos: var int, stop: int,
     if plan.resources[resource].importName.len == 0 and
         plan.contractResourceCapture(resource).depth == 0:
       componentFail("local resource type found in imports")
+    requireImportedResourceName(scope, resourceAliases[lookupResourceType(resourceAliases, typeIndex)])
     if plan.links == nil: new(plan.links)
-    boundedAdd(plan.links.resourceEqualityImports,
-      NamedResourceType(name: name, resourceIndex: resource.uint16),
-      MaxComponentFunctions)
+    let typeName = newResourceName()
+    let named = NamedResourceType(name: name, resourceIndex: resource.uint16, typeName: typeName)
+    resourceImports.add(named)
+    boundedAdd(plan.links.resourceEqualityImports, named, MaxComponentFunctions)
     resourceAliases.add(ResourceTypeAlias(typeIndex: types.len.uint16,
-      resourceIndex: resource.uint16, visible: true, imported: true))
+      resourceIndex: resource.uint16, visible: true, imported: true, typeName: typeName))
+    publishResourceName(addr scope, typeName, importing = true)
     types.add(ComponentFuncType())
     valueKinds.add(cpResourceType)
     return
   let value = shapeAt(scope, typeIndex)
   requireVisibleChildren(value, addr scope, true)
   requireVisibleResourceSlot(plan.handleTypes, value, true,
-    "component value resource type is not imported")
+    "component value resource type is not imported", scope = addr scope)
   let shape = newSlot(value)
   if plan.links == nil: new(plan.links)
   boundedAdd(plan.links.valueImports, NamedValueType(name: name, shape: shape),
@@ -5415,6 +6517,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
   template valueKinds: untyped = scope.kinds
   var importNames: seq[string]
   var exportNames: seq[string]
+  var resourceImports: seq[NamedResourceType]
   var resourceAliases: seq[ResourceTypeAlias]
   scope.resourceAliases = addr resourceAliases
   scope.handleTypes = addr result.handleTypes
@@ -5620,7 +6723,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
                 FuncType(params: @[vtI32]), "invalid core resource destructor type")
           else: componentFail("invalid resource destructor option")
           resourceAliases.add(ResourceTypeAlias(typeIndex: types.len.uint16,
-            resourceIndex: result.resources.len.uint16))
+            resourceIndex: result.resources.len.uint16, typeName: newResourceName()))
           boundedAdd(result.resources, move resource, MaxComponentResourceTypes)
           types.add(ComponentFuncType())
           valueKinds.add(cpResourceType)
@@ -5633,7 +6736,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
             resourceIndex: resourceAliases[target].resourceIndex,
             visible: resourceAliases[target].visible,
             imported: resourceAliases[target].imported,
-            exportAlias: resourceAliases[target].exportAlias))
+            typeName: resourceAliases[target].typeName))
           types.add(ComponentFuncType())
           valueKinds.add(kind)
         elif readValueDefinition(data, pos, stop, scope):
@@ -5660,6 +6763,9 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
           var postReturnFunction = -1'i32
           var sawEncoding = false
           var encoding = cseUtf8
+          when defined(wasmComponentAsyncCallbacks):
+            var callbackFunction = 0'u32
+            var asyncLift = false
           for _ in 0 ..< optionCount:
             let option = take(data, pos, stop)
             case option
@@ -5686,13 +6792,47 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
               if index >= coreFunctions.len.uint32:
                 componentFail("unknown canonical post-return")
               postReturnFunction = index.int32
+            of 6'u8, 7'u8:
+              when defined(wasmComponentAsyncCallbacks):
+                if option == 6:
+                  if asyncLift: componentFail("duplicate canonical async option")
+                  asyncLift = true
+                else:
+                  if callbackFunction != 0: componentFail("duplicate canonical callback option")
+                  let index = takeU32(data, pos, stop)
+                  if index >= coreFunctions.len.uint32:
+                    componentFail("unknown canonical callback function")
+                  callbackFunction = index + 1
+              else:
+                componentFail("unsupported canonical option")
             else: componentFail("unsupported canonical option")
           let typeIndex = takeU32(data, pos, stop)
           if typeIndex >= types.len.uint32 or
               valueKinds[typeIndex.int] != cpFunctionType:
             componentFail("unknown component function type")
-          if hasMemoryType(types[typeIndex.int]) and
-              memoryAlias < 0:
+          let signature = unsafeAddr types[typeIndex.int]
+          var needsMemory = signature[].hasMemoryType()
+          when defined(wasmComponentAsyncCallbacks):
+            if callbackFunction != 0 and not asyncLift:
+              componentFail("canonical callback requires async lift")
+            if asyncLift:
+              if not signature[].isAsync:
+                componentFail("canonical async option requires an async function type")
+              if postReturnFunction >= 0:
+                componentFail("canonical async lift forbids post-return")
+              when not defined(wasmComponentStackful):
+                if callbackFunction == 0:
+                  componentFail("stackful canonical async lift is unsupported")
+              needsMemory = signature[].hasMemoryParam() or
+                (signature[].hasResult and (hasPointerPayload(resultSlot(signature[])) or
+                  flatSlotWidth(resultSlot(signature[])) > MaxFlatParams))
+              if callbackFunction != 0:
+                let callback = unsafeAddr coreFunctions[callbackFunction.int - 1]
+                if callback.kind == cfLower:
+                  result.requireGeneratedCoreType(callback[],
+                    FuncType(params: @[vtI32, vtI32, vtI32], results: @[vtI32]),
+                    "invalid canonical callback function")
+          if needsMemory and memoryAlias < 0:
             componentFail("composite signature needs canonical memory")
           if hasMemoryParam(types[typeIndex.int]) and
               reallocFunction < 0:
@@ -5702,7 +6842,11 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
           let callee = unsafeAddr coreFunctions[coreIndex.int]
           if callee.kind == cfLower:
             let ft = result.generatedCoreType(result.lowerings[callee.loweringIndex.int])
-            if not signatureMatchesCore(types[typeIndex.int], ft):
+            let callback = when defined(wasmComponentAsyncCallbacks): callbackFunction != 0
+              else: false
+            let stackful = when defined(wasmComponentStackful): asyncLift and not callback
+              else: false
+            if not signatureMatchesCore(signature[], ft, callback = callback, stackful = stackful):
               componentFail("canonical function type mismatch")
             result.markCoreFunctionReference(callee[])
           if reallocFunction >= 0 and coreFunctions[reallocFunction.int].kind == cfLower:
@@ -5714,11 +6858,15 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
             let expected = FuncType(params: if sig.hasResult: @[coreResultType(sig[])] else: @[])
             result.requireGeneratedCoreType(coreFunctions[postReturnFunction.int],
               expected, "invalid canonical post-return function")
-          boundedAdd(functions, ComponentFunction(kind: fnLift,
+          var lifted = ComponentFunction(kind: fnLift,
             coreFunction: coreIndex, typeIndex: typeIndex,
             memoryAlias: memoryAlias, reallocFunction: reallocFunction,
             postReturnFunction: postReturnFunction,
-            stringEncoding: encoding), MaxComponentFunctions)
+            stringEncoding: encoding)
+          when defined(wasmComponentAsyncCallbacks): lifted.callbackFunction = callbackFunction
+          when defined(wasmComponentStackful):
+            lifted.stackful = asyncLift and callbackFunction == 0
+          boundedAdd(functions, move lifted, MaxComponentFunctions)
         of 1'u8:
           if take(data, pos, stop) != 0:
             componentFail("unsupported canonical lower sort")
@@ -5731,8 +6879,6 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
           of fnImport: lowering.kind = clHost
           of fnChild: lowering.kind = clChild
           of fnLift:
-            when defined(bl808lp) and not defined(wasmComponentLocalReentry):
-              componentFail("local canonical lowering requires an LP stack reservation")
             lowering.kind = clLocal
             new(lowering.localTarget)
             lowering.localTarget[] = describeLift(fn, types, coreInstances,
@@ -5769,8 +6915,21 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
                 result.requireGeneratedCoreType(source,
                   FuncType(params: @[vtI32, vtI32, vtI32, vtI32], results: @[vtI32]),
                   "invalid canonical realloc function")
+            of 6'u8:
+              when defined(wasmComponentAsyncCallbacks):
+                if lowering.asyncLower: componentFail("duplicate canonical async option")
+                if not loweringSignature(result, lowering).asyncSignature():
+                  componentFail("canonical async option requires an async function type")
+                lowering.asyncLower = true
+              else:
+                componentFail("unsupported canonical lower option")
             else:
               componentFail("unsupported canonical lower option")
+          when defined(bl808lp) and not defined(wasmComponentLocalReentry):
+            let asyncLocal = when defined(wasmComponentAsyncCallbacks): lowering.asyncLower
+              else: false
+            if lowering.kind == clLocal and not asyncLocal:
+              componentFail("local canonical lowering requires an LP stack reservation")
           let signature = loweringSignature(result, lowering)
           if not supportedHostSignature(signature, linkedResources = true):
             componentFail("unsupported canonical lower signature")
@@ -5786,12 +6945,21 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
                 mapping.add((index, result.bindResourceHandleIndex(local.uint16).uint16))
               lowering.resourceSignature = new(ComponentFuncType)
               lowering.resourceSignature[] = rebaseResourceSignature(signature, mapping)
-          let indirectResult = signature.resultUsesMemory()
+          var indirectResult = signature.resultUsesMemory()
+          var indirectParams = signature.hasMemoryParam()
+          when defined(wasmComponentAsyncCallbacks):
+            if lowering.asyncLower:
+              let asyncType = new(ComponentFuncType)
+              asyncType[] = loweringSignature(result, lowering)
+              asyncType[].configureAsyncParams()
+              lowering.resourceSignature = asyncType
+              indirectResult = signature.asyncResultArea()
+              indirectParams = indirectParams or signature.flatParamCount() > MaxFlatAsyncParams
           if lowering.memoryInstance == 0:
             if cpString in signature.params or
                 (signature.hasResult and signature.resultType == cpString):
               componentFail("string import needs canonical memory")
-            if signature.hasMemoryParam() or indirectResult:
+            if indirectParams or indirectResult:
               componentFail("indirect component import needs canonical memory")
           if signature.resultRequiresRealloc() and lowering.reallocSource == 0:
             if signature.resultType == cpString:
@@ -5809,25 +6977,289 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
             componentFail("canonical function requires a local resource type")
           if opcode != 3 and (result.resources[resource].importName.len != 0 or
               result.resources[resource].sourceChild != 0 or
+              result.resources[resource].ascribedFrom != 0 or
               result.contractResourceCapture(resource).depth != 0):
             componentFail("canonical function requires a local resource type")
           boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
             loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
           result.addLowering(CoreLowering(
             kind: CoreLoweringKind(opcode - 1), targetIndex: resource.uint16))
+        of 0x09'u8:
+          when defined(wasmComponentAsyncCallbacks):
+            let signature = new(ComponentFuncType)
+            readComponentResult(data, pos, stop, valueKinds, signature[])
+            signature[].configureCanonicalType(scope.shapes)
+            var lowering = CoreLowering(kind: clTaskReturn, resourceSignature: signature)
+            var sawEncoding = false
+            let count = takeCount(data, pos, stop, 8)
+            for _ in 0 ..< count:
+              let option = take(data, pos, stop)
+              case option
+              of 0'u8 .. 2'u8:
+                if sawEncoding: componentFail("duplicate canonical string encoding")
+                sawEncoding = true
+                lowering.stringEncoding = CanonicalStringEncoding(option)
+              of 3'u8:
+                if lowering.memoryInstance != 0: componentFail("duplicate canonical memory")
+                let index = takeU32(data, pos, stop)
+                if index >= aliases[ekMemory].len.uint32:
+                  componentFail("unknown canonical task.return memory")
+                let alias = unsafeAddr aliases[ekMemory][index.int]
+                lowering.memoryInstance = coreInstances[alias.coreInstance.int].storeIndex + 1
+                lowering.memoryName = alias.name
+              else: componentFail("invalid canonical task.return option")
+            if signature.hasResult:
+              let slot = resultSlot(signature[])
+              if (hasPointerPayload(slot) or flatSlotWidth(slot) > MaxFlatParams) and
+                  lowering.memoryInstance == 0:
+                componentFail("canonical task.return needs memory")
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else:
+            componentFail("unsupported canonical definition")
+        of 0x0a'u8, 0x0b'u8:
+          when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+            if take(data, pos, stop) != vtI32.ord.byte:
+              componentFail("canonical context type must be i32")
+            let slot = takeU32(data, pos, stop)
+            if slot > (when defined(wasmComponentThreads): 1'u32 else: 0'u32):
+              componentFail("canonical context slot out of range")
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            var lowering = CoreLowering(kind: if opcode == 0x0a: clContextGet else: clContextSet)
+            when defined(wasmComponentThreads): lowering.contextSlot = slot.uint8
+            result.addLowering(move lowering)
+          else:
+            componentFail("unsupported canonical definition")
+        of 0x0e'u8 .. 0x1b'u8, 0x2e'u8, 0x2f'u8:
+          when ComponentEndpointsEnabled:
+            let isStream = opcode <= 0x14 or opcode == 0x2e
+            let kind = if isStream: cpStream else: cpFuture
+            if not endpointEnabled(kind): componentFail("unsupported canonical definition")
+            let name = endpointName(kind)
+            let index = takeU32(data, pos, stop)
+            if index >= valueKinds.len.uint32 or valueKinds[index.int] != kind:
+              componentFail("canonical " & name & " operation requires a " & name & " type")
+            var lowering = CoreLowering(endpointShape: canonicalShape(index.int32, scope.shapes),
+              kind: case opcode
+                of 0x0e, 0x15: clEndpointNew
+                of 0x0f, 0x16: clEndpointRead
+                of 0x10, 0x17: clEndpointWrite
+                of 0x11, 0x18: clEndpointCancelRead
+                of 0x12, 0x19: clEndpointCancelWrite
+                of 0x13, 0x1a: clEndpointDropReadable
+                of 0x14, 0x1b: clEndpointDropWritable
+                else: clEndpointForward)
+            if lowering.kind in {clEndpointCancelRead, clEndpointCancelWrite}:
+              let mode = take(data, pos, stop)
+              if mode > 1:
+                componentFail("invalid canonical " & name & " cancellation async flag")
+              lowering.asyncCancel = mode == 1
+            elif lowering.kind in {clEndpointRead, clEndpointWrite}:
+              var sawEncoding = false
+              let optionCount = takeCount(data, pos, stop, 8)
+              for _ in 0 ..< optionCount:
+                let option = take(data, pos, stop)
+                case option
+                of 0'u8 .. 2'u8:
+                  if sawEncoding: componentFail("duplicate canonical string encoding")
+                  sawEncoding = true
+                  lowering.stringEncoding = CanonicalStringEncoding(option)
+                of 3:
+                  if lowering.memoryInstance != 0: componentFail("duplicate canonical memory")
+                  let memory = takeU32(data, pos, stop)
+                  if memory >= aliases[ekMemory].len.uint32:
+                    componentFail("unknown canonical " & name & " memory")
+                  let source = unsafeAddr aliases[ekMemory][memory.int]
+                  lowering.memoryName = source.name
+                  lowering.memoryInstance = coreInstances[source.coreInstance.int].storeIndex + 1
+                of 4:
+                  if lowering.reallocSource != 0: componentFail("duplicate canonical realloc")
+                  let function = takeU32(data, pos, stop)
+                  if function >= coreFunctions.len.uint32:
+                    componentFail("unknown canonical " & name & " realloc")
+                  let source = unsafeAddr coreFunctions[function.int]
+                  lowering.reallocName = source.name
+                  lowering.reallocSource = coreFunctionSource(source[], coreInstances)
+                  if source.kind == cfLower:
+                    result.requireGeneratedCoreType(source[],
+                      FuncType(params: @[vtI32, vtI32, vtI32, vtI32], results: @[vtI32]),
+                      "invalid canonical realloc function")
+                of 6:
+                  if lowering.asyncCancel: componentFail("duplicate canonical async option")
+                  lowering.asyncCancel = true
+                else: componentFail("invalid canonical " & name & " copy option")
+              when not defined(wasmComponentStackful):
+                if not lowering.asyncCancel:
+                  componentFail("synchronous " & name & " copy requires stackful execution")
+              let payload = lowering.endpointShape.listElement
+              if payload != nil and lowering.memoryInstance == 0:
+                componentFail("typed " & name & " copy requires canonical memory")
+              if lowering.reallocSource != 0 and lowering.memoryInstance == 0:
+                componentFail("canonical realloc requires memory")
+              if payload != nil and lowering.kind == clEndpointRead and hasPointerPayload(payload[]) and
+                  lowering.reallocSource == 0:
+                componentFail(name & " read payload requires canonical realloc")
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else:
+            componentFail("unsupported canonical definition")
+        of 0x1c'u8 .. 0x1e'u8:
+          when defined(wasmComponentErrorContext):
+            var lowering = CoreLowering(kind: case opcode
+              of 0x1c: clErrorContextNew
+              of 0x1d: clErrorContextDebugMessage
+              else: clErrorContextDrop)
+            if lowering.kind != clErrorContextDrop:
+              var sawEncoding = false
+              let optionCount = takeCount(data, pos, stop, 3)
+              for _ in 0 ..< optionCount:
+                let option = take(data, pos, stop)
+                case option
+                of 0'u8 .. 2'u8:
+                  if sawEncoding: componentFail("duplicate canonical string encoding")
+                  sawEncoding = true
+                  lowering.stringEncoding = CanonicalStringEncoding(option)
+                of 3:
+                  if lowering.memoryInstance != 0: componentFail("duplicate canonical memory")
+                  let memory = takeU32(data, pos, stop)
+                  if memory >= aliases[ekMemory].len.uint32:
+                    componentFail("unknown canonical error-context memory")
+                  let source = unsafeAddr aliases[ekMemory][memory.int]
+                  lowering.memoryName = source.name
+                  lowering.memoryInstance = coreInstances[source.coreInstance.int].storeIndex + 1
+                of 4:
+                  if lowering.reallocSource != 0: componentFail("duplicate canonical realloc")
+                  let function = takeU32(data, pos, stop)
+                  if function >= coreFunctions.len.uint32:
+                    componentFail("unknown canonical error-context realloc")
+                  let source = unsafeAddr coreFunctions[function.int]
+                  lowering.reallocName = source.name
+                  lowering.reallocSource = coreFunctionSource(source[], coreInstances)
+                  if source.kind == cfLower:
+                    result.requireGeneratedCoreType(source[],
+                      FuncType(params: @[vtI32, vtI32, vtI32, vtI32], results: @[vtI32]),
+                      "invalid canonical realloc function")
+                else: componentFail("invalid canonical error-context option")
+              if lowering.memoryInstance == 0:
+                componentFail("canonical error-context requires memory")
+              if lowering.kind == clErrorContextDebugMessage and lowering.reallocSource == 0:
+                componentFail("canonical error-context debug-message requires realloc")
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else: componentFail("component error-context is disabled")
+        of 0x26'u8 .. 0x2d'u8:
+          when defined(wasmComponentThreads):
+            var lowering = CoreLowering(kind: case opcode
+              of 0x26: clThreadIndex
+              of 0x27: clThreadNewIndirect
+              of 0x28: clThreadResumeLater
+              of 0x29: clThreadSuspend
+              of 0x2a: clThreadSuspendResume
+              of 0x2b: clThreadYieldResume
+              of 0x2c: clThreadSuspendPromote
+              else: clThreadYieldPromote)
+            if lowering.kind == clThreadNewIndirect:
+              let typeIndex = takeU32(data, pos, stop)
+              if typeIndex >= scope.coreTypes.len.uint32 or scope.coreTypes[typeIndex.int].module != nil:
+                componentFail("invalid canonical thread function type")
+              let ft = addr scope.coreTypes[typeIndex.int].function
+              if ft[].isSharedCoreFunction() or ft.params != @[vtI32] or ft.results.len != 0:
+                componentFail("canonical thread function must have type (i32) -> ()")
+              lowering.threadClosure = ft.params[0]
+              let table = takeU32(data, pos, stop)
+              if table >= aliases[ekTable].len.uint32:
+                componentFail("unknown canonical thread table")
+              let source = addr aliases[ekTable][table.int]
+              lowering.threadTable = coreInstances[source.coreInstance.int].storeIndex + 1
+              lowering.threadTableName = source.name
+            elif opcode >= 0x29 and take(data, pos, stop) != 0:
+              componentFail("invalid canonical thread suspend sort")
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else:
+            componentFail("unsupported canonical definition")
+        of 0x40'u8 .. 0x42'u8:
+          when defined(wasmComponentThreadSpawn):
+            case take(data, pos, stop)
+            of 0: discard  # Cooperative function on the component's core.
+            of 1: componentFail("shared canonical threads require preemptive core support")
+            else: componentFail("invalid canonical thread sharedness")
+            var lowering = CoreLowering(kind: clThreadAvailableParallelism)
+            if opcode != 0x42:
+              let typeIndex = takeU32(data, pos, stop)
+              if typeIndex >= scope.coreTypes.len.uint32 or scope.coreTypes[typeIndex.int].module != nil:
+                componentFail("invalid canonical spawn function type")
+              let signature = addr scope.coreTypes[typeIndex.int].function
+              if signature.params != @[vtI32] or signature.results.len != 0:
+                componentFail("canonical spawn function must have type (i32) -> ()")
+              if signature[].isSharedCoreFunction():
+                componentFail("cooperative canonical spawn function type must be unshared")
+              if opcode == 0x41:
+                let table = takeU32(data, pos, stop)
+                if table >= aliases[ekTable].len.uint32:
+                  componentFail("unknown canonical spawn table")
+                componentFail("canonical thread.spawn-indirect requires a shared core table")
+              lowering.kind = clThreadSpawnRef
+              new(lowering.threadSignature)
+              lowering.threadSignature[] = signature[]
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else: componentFail("canonical thread spawning is disabled")
+        of 0x05'u8, 0x06'u8, 0x0c'u8, 0x0d'u8, 0x1f'u8 .. 0x25'u8:
+          when defined(wasmComponentAsyncCallbacks):
+            when not defined(wasmComponentStackful):
+              if opcode in {0x0c'u8, 0x20'u8}:
+                componentFail("unsupported canonical definition")
+            var lowering = CoreLowering(kind: case opcode
+              of 0x05: clTaskCancel
+              of 0x06: clSubtaskCancel
+              of 0x0c: clThreadYield
+              of 0x0d: clSubtaskDrop
+              of 0x1f: clWaitableSetNew
+              of 0x20: clWaitableSetWait
+              of 0x21: clWaitableSetPoll
+              of 0x22: clWaitableSetDrop
+              of 0x23: clWaitableJoin
+              of 0x24: clBackpressureInc
+              else: clBackpressureDec)
+            if opcode == 0x06:
+              let mode = take(data, pos, stop)
+              if mode > 1: componentFail("invalid canonical subtask.cancel async flag")
+              lowering.asyncCancel = mode == 1
+            if opcode == 0x0c and take(data, pos, stop) != 0:
+              componentFail("invalid canonical thread.yield sort")
+            if opcode in {0x20'u8, 0x21'u8}:
+              if take(data, pos, stop) != 0:
+                componentFail("invalid canonical waitable-set.poll sort")
+              let index = takeU32(data, pos, stop)
+              if index >= aliases[ekMemory].len.uint32:
+                componentFail("unknown canonical waitable-set.poll memory")
+              let source = unsafeAddr aliases[ekMemory][index.int]
+              lowering.memoryName = source.name
+              lowering.memoryInstance = coreInstances[source.coreInstance.int].storeIndex + 1
+            boundedAdd(coreFunctions, CoreFunction(kind: cfLower,
+              loweringIndex: result.lowerings.len.uint32), MaxComponentFunctions)
+            result.addLowering(move lowering)
+          else:
+            componentFail("unsupported canonical definition")
         else: componentFail("unsupported canonical definition")
     of 10'u8:
       let count = takeCount(data, pos, stop, MaxComponentFunctions)
       for _ in 0 ..< count:
-        let nameTag = take(data, pos, stop)
-        if nameTag != 0 and nameTag != 1:
-          componentFail("unsupported import name attributes")
-        let name = takeExternName(data, pos, stop)
+        let external = takeExternalName(data, pos, stop)
+        let name = external.name
         for previous in importNames:
           if sameCanonicalName(previous, name):
             componentFail("duplicate component import")
         boundedAdd(importNames, name, MaxComponentFunctions)
-        case take(data, pos, stop)
+        result.rememberNameAttributes(external, importing = true)
+        case external.sort
         of 0'u8:
           let shape = readModuleTypeRef(data, pos, stop, scope)
           let value = addCoreModuleImport(result, name, shape)
@@ -5840,8 +7272,11 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
             componentFail("unknown component import type")
           if not supportedHostSignature(types[typeIndex.int], linkedResources = true):
             componentFail("unsupported component import signature")
-          result.requireVisibleResources(types[typeIndex.int], forImport = true)
+          result.requireVisibleResources(types[typeIndex.int], forImport = true, scope = addr scope)
           requireVisibleFunctionType(scope, typeIndex, forImport = true)
+          if resourceMember(name).kind != rmNone:
+            checkResourceMemberName(result, ComponentExport(name: name,
+              signature: types[typeIndex.int]), resourceImports)
           boundedAdd(functions, ComponentFunction(kind: fnImport,
             typeIndex: typeIndex, importIndex: result.imports.len.uint32),
             MaxComponentFunctions)
@@ -5850,28 +7285,25 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
         of 5'u8:
           let index = lookupInterface(interfaceTypes, takeU32(data, pos, stop))
           requireInterfaceNames(interfaceTypes[index], addr scope, forImport = true)
-          let source = addInterfaceImport(result, name, interfaceTypes[index])
+          let source = addInterfaceImport(result, name, interfaceTypes[index], addr scope)
           boundedAdd(componentInstances, source, MaxComponentFunctions)
         of 4'u8:
           let contract = lookupComponentType(componentTypes, takeU32(data, pos, stop))
           definitions.addDefinition(addComponentTypeImport(result, name, contract))
         of 3'u8:
-          readComponentTypeImport(data, pos, stop, name, result, scope)
+          readComponentTypeImport(data, pos, stop, name, result, scope, resourceImports)
         else: componentFail("unsupported component import sort")
     of 11'u8:
       let count = takeCount(data, pos, stop, MaxComponentFunctions)
       for _ in 0 ..< count:
-        let nameTag = take(data, pos, stop)
-        if nameTag != 0 and nameTag != 1:
-          componentFail("unsupported export name attributes")
-        let name = takeExternName(data, pos, stop, allowResourceMembers = true)
+        let external = takeExternalName(data, pos, stop)
+        let name = external.name
         for previous in exportNames:
           if sameCanonicalName(previous, name):
             componentFail("duplicate component export")
         boundedAdd(exportNames, name, MaxComponentFunctions)
-        let sort = take(data, pos, stop)
-        if sort != 1 and resourceMember(name).kind != rmNone:
-          componentFail("resource member export must be a function")
+        result.rememberNameAttributes(external, importing = false)
+        let sort = external.sort
         if sort == 4:
           readComponentDefinitionExport(data, pos, stop, name, result, definitions, componentTypes)
           continue
@@ -5893,7 +7325,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
           continue
         if sort == 5:
           readInterfaceExport(data, pos, stop, name, result, componentInstances,
-            interfaceTypes, types, coreInstances, coreFunctions, aliases[ekMemory], addr scope)
+            interfaceTypes, coreInstances, coreFunctions, aliases[ekMemory], addr scope)
           continue
         if sort == 3:
           readComponentTypeExport(data, pos, stop, name, result, scope)
@@ -5906,7 +7338,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
         let fn = functions[functionIndex.int]
         var exp = describeFunction(fn, result, types, coreInstances,
                                   coreFunctions, aliases[ekMemory])
-        var scopeType = if fn.kind == fnChild: uint32.high else: fn.typeIndex
+        var scopeType = fn.typeIndex
         case take(data, pos, stop)
         of 0'u8: discard
         of 1'u8:
@@ -5921,24 +7353,37 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
             componentFail("component function export annotation type mismatch")
           if exp.target != ctChild:
             exp.signature = types[index.int]
-            scopeType = index
+          scopeType = index
         else: componentFail("invalid component function export annotation")
         exp.name = name
         if exp.target == ctImport and result.links == nil: new(result.links)
-        if exp.target == ctChild and not supportedHostSignature(exp.signature):
-          componentFail("resource function re-export requires its interface")
-        result.requireVisibleResources(exp.signature)
+        if scopeType == uint32.high:
+          exp.resourceNames = result.componentFunctionResources(fn, exp.signature, addr scope)
+          requirePublishedResourceNames(addr scope, exp.resourceNames,
+            "component function resource type is not exported")
+        else:
+          result.requireVisibleResources(types[scopeType.int], scope = addr scope)
+          exp.resourceNames = resourceNames(types[scopeType.int], result.handleTypes)
         if result.links != nil:
           checkResourceMemberName(result, exp, result.links.resourceExports)
         elif resourceMember(name).kind != rmNone:
           componentFail("resource member names a type absent from its interface")
         if scopeType == uint32.high:
-          requireVisibleValueTypes(exp.signature, scope)
+          exp.visibilityNames = result.componentFunctionNames(fn, addr scope)
+          if exp.visibilityNames != nil:
+            for name in exp.visibilityNames[]:
+              requireVisibleReference(name.shape, addr scope, false, name.diagnostic)
         else:
           requireVisibleFunctionType(scope, scopeType)
+          exp.visibilityNames = functionTypeNames(addr scope, scopeType)
+        if exp.visibilityNames != nil or exp.resourceNames != nil:
+          if result.links == nil: new(result.links)
+          result.links.visibilityOrder.addMember(vmFunction, result.exports.len)
         boundedAdd(result.exports, move exp, MaxComponentFunctions)
         # Component exports add an alias to the function index space.
-        boundedAdd(functions, fn, MaxComponentFunctions)
+        var alias = fn
+        alias.typeIndex = scopeType
+        boundedAdd(functions, alias, MaxComponentFunctions)
     else:
       componentFail("unsupported component section")
     if pos != stop: componentFail("component section length mismatch")
@@ -5950,6 +7395,7 @@ proc decodeComponentAtDepth(data: openArray[byte], depth: int,
   reset(componentTypes)
   reset(importNames)
   reset(exportNames)
+  reset(resourceImports)
   reset(resourceAliases)
   reset(valueKinds)
   reset(scope.shapes)
@@ -6009,18 +7455,44 @@ proc readCanonicalString(memory: var MemInst, offset, taggedCount: uint32,
     if result.len > MaxComponentStringBytes:
       componentFail("canonical string length limit")
 
-proc canonicalRealloc(vm: var WasmVM, mayLeave: ref bool,
+template withFreshContext(execution, body: untyped): untyped =
+  when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+    block:
+      let state: CanonicalExecutionState = execution
+      let previous = state.context
+      var context = 0'i32
+      state.context = addr context
+      defer: state.context = previous
+      when defined(wasmComponentThreads):
+        let previousSecond = state.contextSecond
+        var contextSecond = 0'i32
+        state.contextSecond = addr contextSecond
+        defer: state.contextSecond = previousSecond
+      when defined(wasmComponentAsyncCallbacks):
+        let previousTask = state.callbackTask
+        let previousScope = state.borrowScope
+        state.callbackTask = nil
+        state.borrowScope = 0
+        defer:
+          state.callbackTask = previousTask
+          state.borrowScope = previousScope
+      body
+  else:
+    body
+
+proc canonicalRealloc(vm: var WasmVM, execution: CanonicalExecutionState,
     memoryAddress, reallocAddress: int, oldOffset, oldBytes: uint32,
     newBytes, alignment: int): uint32 =
-  let previous = mayLeave[]
-  mayLeave[] = false
+  let previous = execution.mayLeave
+  execution.mayLeave = false
   var allocated: seq[WasmValue]
   try:
-    allocated = vm.execute(reallocAddress,
-      [wasmI32(cast[int32](oldOffset)), wasmI32(cast[int32](oldBytes)),
-       wasmI32(alignment.int32), wasmI32(newBytes.int32)])
+    withFreshContext(execution):
+      allocated = vm.execute(reallocAddress,
+        [wasmI32(cast[int32](oldOffset)), wasmI32(cast[int32](oldBytes)),
+         wasmI32(alignment.int32), wasmI32(newBytes.int32)])
   finally:
-    mayLeave[] = previous
+    execution.mayLeave = previous
   if allocated.len != 1 or allocated[0].kind != wvkI32:
     componentFail("canonical realloc returned invalid pointer")
   result = allocated[0].i32.uint32
@@ -6028,23 +7500,23 @@ proc canonicalRealloc(vm: var WasmVM, mayLeave: ref bool,
     componentFail("unaligned canonical realloc result")
   vm.store.mems[memoryAddress].checkMemoryRange(result.uint64, newBytes.uint32)
 
-proc allocCanonicalPayload(vm: var WasmVM, mayLeave: ref bool,
+proc allocCanonicalPayload(vm: var WasmVM, execution: CanonicalExecutionState,
     memoryAddress, reallocAddress: int, source: pointer,
     count, alignment: int): uint32 =
-  result = vm.canonicalRealloc(mayLeave, memoryAddress, reallocAddress,
+  result = vm.canonicalRealloc(execution, memoryAddress, reallocAddress,
     0, 0, count, alignment)
   vm.store.mems[memoryAddress].writeMemoryBytes(result.uint64,
     cast[ptr UncheckedArray[byte]](source), count.uint32)
 
-proc storeCanonicalText(vm: var WasmVM, mayLeave: ref bool,
+proc storeCanonicalText(vm: var WasmVM, execution: CanonicalExecutionState,
     memoryAddress, reallocAddress: int, value: string,
     encoding: CanonicalStringEncoding): tuple[offset, units: uint32] =
   let source = if value.len == 0: nil else: unsafeAddr value[0]
   if encoding == cseUtf8:
-    return (vm.allocCanonicalPayload(mayLeave, memoryAddress, reallocAddress,
+    return (vm.allocCanonicalPayload(execution, memoryAddress, reallocAddress,
       source, value.len, 1), value.len.uint32)
   let initialBytes = if encoding == cseUtf16: value.len * 2 else: value.len
-  result.offset = vm.canonicalRealloc(mayLeave, memoryAddress, reallocAddress,
+  result.offset = vm.canonicalRealloc(execution, memoryAddress, reallocAddress,
     0, 0, initialBytes, 2)
   var latinPrefix = ""
   if encoding == cseLatin1Utf16:
@@ -6059,11 +7531,11 @@ proc storeCanonicalText(vm: var WasmVM, mayLeave: ref bool,
         cast[ptr UncheckedArray[byte]](addr latinPrefix[0]), latinPrefix.len.uint32)
     if allLatin:
       if latinPrefix.len < initialBytes:
-        result.offset = vm.canonicalRealloc(mayLeave, memoryAddress, reallocAddress,
+        result.offset = vm.canonicalRealloc(execution, memoryAddress, reallocAddress,
           result.offset, initialBytes.uint32, latinPrefix.len, 2)
       result.units = latinPrefix.len.uint32
       return
-    result.offset = vm.canonicalRealloc(mayLeave, memoryAddress, reallocAddress,
+    result.offset = vm.canonicalRealloc(execution, memoryAddress, reallocAddress,
       result.offset, initialBytes.uint32, value.len * 2, 2)
   var encoded = ""
   template addUnit(unit: uint32) =
@@ -6083,21 +7555,46 @@ proc storeCanonicalText(vm: var WasmVM, mayLeave: ref bool,
       cast[ptr UncheckedArray[byte]](addr encoded[0]), encoded.len.uint32)
   let reserved = value.len * 2
   if encoded.len < reserved:
-    result.offset = vm.canonicalRealloc(mayLeave, memoryAddress, reallocAddress,
+    result.offset = vm.canonicalRealloc(execution, memoryAddress, reallocAddress,
       result.offset, reserved.uint32, encoded.len, 2)
   result.units = (encoded.len div 2).uint32
   if encoding == cseLatin1Utf16:
     result.units = result.units or Utf16LengthTag
 
+when defined(wasmComponentHostEndpoints):
+  type EndpointLoweredHandle = object
+    handle: uint32
+    when defined(wasmComponentErrorContext):
+      isErrorContext: bool
+    case isResource: bool
+    of true:
+      resourceType: uint32
+      resource: ComponentOwnedValue
+      definer, graph: ComponentInstance
+    else:
+      token: ComponentEndpointValue
+      endpoint: ComponentEndpoint
+      shape: ref CanonicalSlot
+      payloadResources: seq[EndpointResourceIdentity]
+
 type AbiAccess {.byref.} = object
   vm: ptr WasmVM
-  mayLeave: ref bool
+  execution: CanonicalExecutionState
   memoryAddress, reallocAddress: int
   encoding: CanonicalStringEncoding
   resourceOwner: pointer
+  when defined(wasmComponentHostEndpoints):
+    endpointMoves: ptr seq[EndpointLoweredHandle]
 
 proc lowerResourceHandle(access: AbiAccess, slot: CanonicalSlot,
                          value: ComponentValue): uint32
+when ComponentEndpointsEnabled:
+  proc lowerEndpointHandle(access: AbiAccess, slot: CanonicalSlot,
+                         value: ComponentValue): uint32
+  proc liftEndpointHandle(instance: ComponentInstance, slot: CanonicalSlot,
+                        handle: uint32): ComponentValue
+  proc validateEndpointValue(instance: ComponentInstance, slot: CanonicalSlot,
+                           value: ComponentValue)
 
 proc lowerFlatSlot(access: AbiAccess, slot: CanonicalSlot, value: ComponentValue,
                    lanes: var seq[WasmValue])
@@ -6122,9 +7619,9 @@ proc invokeFunction(instance: ComponentInstance, exp: ComponentExport,
     destination: ptr LoweredResult = nil): seq[ComponentValue]
 
 proc runPostReturn(instance: ComponentInstance, address: int, values: openArray[WasmValue]) =
-  let previous = instance.mayLeave[]
-  instance.mayLeave[] = false
-  defer: instance.mayLeave[] = previous
+  let previous = instance.execution.mayLeave
+  instance.execution.mayLeave = false
+  defer: instance.execution.mayLeave = previous
   if instance.vm.execute(address, values).len != 0:
     componentFail("canonical post-return result mismatch")
 
@@ -6137,9 +7634,10 @@ proc usesResources(sig: ComponentFuncType): bool =
   sig.parameterResources() != {} or sig.hasResourceResult()
 
 proc readLoweredArguments(access: AbiAccess, sig: ComponentFuncType,
-    args: openArray[WasmValue], returnPointer: var uint32): seq[ComponentValue] =
+    args: openArray[WasmValue], returnPointer: var uint32, asyncAbi = false): seq[ComponentValue] =
   var offset = 0
-  if sig.paramsUseMemoryArea():
+  let indirect = if asyncAbi: sig.flatParamCount() > MaxFlatAsyncParams else: sig.paramsUseMemoryArea()
+  if indirect:
     if args.len == 0 or args[0].kind != wvkI32 or access.memoryAddress < 0:
       componentFail("canonical import argument count mismatch")
     result = readIndirectArgs(access.vm[].store.mems[access.memoryAddress],
@@ -6147,7 +7645,9 @@ proc readLoweredArguments(access: AbiAccess, sig: ComponentFuncType,
     offset = 1
   else:
     result = readFlatArgs(access, sig, args, offset)
-  let indirectResult = sig.resultUsesMemory()
+  let indirectResult = when defined(wasmComponentAsyncCallbacks):
+    if asyncAbi: sig.asyncResultArea() else: sig.resultUsesMemory()
+  else: sig.resultUsesMemory()
   if offset + indirectResult.int != args.len:
     componentFail("canonical import argument count mismatch")
   if indirectResult: returnPointer = args[offset].i32.uint32
@@ -6162,14 +7662,14 @@ proc invokeLoweredTarget(callback: ComponentHostFunc, target: ComponentCallTarge
     resolveLoweredResult(destination, returned)
 
 proc makeLowering(callback: ComponentHostFunc, target: ComponentCallTarget, sig: ComponentFuncType,
-                   mayLeave: ref bool, vm: ptr WasmVM, memoryAddress, reallocAddress: int,
+                   execution: CanonicalExecutionState, vm: ptr WasmVM, memoryAddress, reallocAddress: int,
                    encoding: CanonicalStringEncoding, resourceOwner: pointer): HostFunc =
   ## A separate closure environment is required for each imported function.
   ## Capturing a loop variable would bind every import to the last callback.
   result = proc(args: openArray[WasmValue]): seq[WasmValue] =
-    if not mayLeave[]:
+    if not execution.mayLeave:
       componentFail("canonical host call during realloc or post-return")
-    let access = AbiAccess(vm: vm, mayLeave: mayLeave, memoryAddress: memoryAddress,
+    let access = AbiAccess(vm: vm, execution: execution, memoryAddress: memoryAddress,
       reallocAddress: reallocAddress, encoding: encoding, resourceOwner: resourceOwner)
     var returnPointer: uint32
     var componentArgs = readLoweredArguments(access, sig, args, returnPointer)
@@ -6181,21 +7681,30 @@ proc makeLowering(callback: ComponentHostFunc, target: ComponentCallTarget, sig:
     else:
       invokeLoweredTarget(callback, target, componentArgs, addr destination)
 
+when defined(wasmComponentThreads):
+  proc invokeGuestDestructor(instance: ComponentInstance, address: int,
+      representation: WasmValue): bool
+
 proc dropLocalResource(ctx: pointer, representation: uint64): bool =
   let destructor = cast[ResourceDestructorContext](ctx)
   if destructor.address < 0: return false
   try:
-    return destructor.vm[].execute(destructor.address,
-      [wasmI32(cast[int32](representation.uint32))]).len == 0
+    withFreshContext(destructor.execution):
+      let value = wasmI32(cast[int32](representation.uint32))
+      when defined(wasmComponentThreads):
+        return cast[ComponentInstance](destructor.owner).invokeGuestDestructor(
+          destructor.address, value)
+      else:
+        return destructor.vm[].execute(destructor.address, [value]).len == 0
   except CatchableError:
     return false
 
-proc makeResourceBuiltin(state: LocalResourceState, mayLeave: ref bool,
+proc makeResourceBuiltin(state: LocalResourceState, execution: CanonicalExecutionState,
                          kind: CoreLoweringKind, typeIndex: uint32): HostFunc =
   result = proc(args: openArray[WasmValue]): seq[WasmValue] =
     if args.len != 1:
       componentFail("invalid canonical resource arguments")
-    if kind != clResourceRep and not mayLeave[]:
+    if kind != clResourceRep and not execution.mayLeave:
       componentFail("resource builtin called during realloc or post-return")
     let bits = args[0].i32.uint32
     var status: ComponentResourceStatus
@@ -6239,16 +7748,41 @@ proc bindResource(instance: ComponentInstance, index: uint32, binding: ResourceB
   instance.links.resourceBindings[index.int] = binding
   instance.resources.destructors[index.int] = destructor
 
-proc setupResources(instance: ComponentInstance, plan: ComponentPlan) =
-  if plan.resources.len == 0: return
+proc bindAscribedResources(instance: ComponentInstance, plan: ComponentPlan) {.noinline.} =
+  ## An abstract export introduces a static type while retaining the original
+  ## runtime resource. Child-backed implementations are bound once ready.
+  for i, resource in plan.resources:
+    if resource.ascribedFrom == 0 or instance.links.resourceBindings[i].owner != nil:
+      continue
+    let source = resource.ascribedFrom.int - 1
+    let binding = instance.links.resourceBindings[source]
+    if binding.owner != nil:
+      instance.bindResource(i.uint32, binding)
+    else:
+      let definition = unsafeAddr plan.resources[source]
+      if definition.ascribedFrom == 0 and definition.sourceChild == 0 and
+          definition.importName.len == 0 and plan.contractResourceCapture(source).depth == 0:
+        instance.bindResource(i.uint32,
+          ResourceBinding(owner: cast[pointer](instance), resourceIndex: source.uint32))
+
+proc initCanonicalHandles(instance: ComponentInstance) =
+  if instance.resources != nil: return
   let capacity = when defined(bl808lp): 8'u32 else: MaxComponentResourceHandles.uint32
   new(instance.resources)
   if instance.resources.table.initResourceTable(capacity, reuseFreed = true) != crOk:
     componentFail("resource table initialization failed")
+
+proc setupResources(instance: ComponentInstance, plan: ComponentPlan) =
+  if plan.resources.len == 0: return
+  instance.initCanonicalHandles()
   for i, resource in plan.resources:
     var context: ResourceDestructorContext
     if resource.destructorSource != 0:
       context = ResourceDestructorContext(vm: addr instance.vm, address: -1)
+      when defined(wasmComponentThreads):
+        context.owner = cast[pointer](instance)
+      when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+        context.execution = instance.execution
     var typeIndex: uint32
     if instance.resources.table.registerResourceType(i.uint64 + 1, crrI32,
         if context == nil: nil else: dropLocalResource,
@@ -6259,6 +7793,7 @@ proc setupResources(instance: ComponentInstance, plan: ComponentPlan) =
     for i, binding in instance.links.resourceBindings:
       if binding.owner != nil:
         instance.bindResource(i.uint32, binding)
+    instance.bindAscribedResources(plan)
 
 proc isLocked(instance: ComponentInstance): bool =
   instance.locked or (instance.links != nil and instance.links.store.locked)
@@ -6267,6 +7802,50 @@ proc lockStore(instance: ComponentInstance) =
   instance.locked = true
   if instance.links != nil:
     instance.links.store.locked = true
+
+when defined(wasmComponentThreads):
+  proc threadAt(instance: ComponentInstance, id: uint32): ComponentGuestThread =
+    let owner = cast[pointer](instance)
+    for thread in instance.links.store.guestThreads:
+      if thread.owner == owner and thread.id == id: return thread
+
+  proc registerThread(instance: ComponentInstance, thread: ComponentGuestThread): bool =
+    let store = instance.links.store
+    if store.guestThreads.len >= MaxComponentGuestThreads: return false
+    thread.owner = cast[pointer](instance)
+    for id in 1'u32 .. MaxComponentGuestThreads.uint32:
+      if instance.threadAt(id) == nil:
+        thread.id = id
+        store.guestThreads.add(thread)
+        return true
+
+  proc retireThread(instance: ComponentInstance, thread: ComponentGuestThread) =
+    let store = instance.links.store
+    for i, candidate in store.guestThreads:
+      if candidate == thread:
+        store.guestThreads.delete(i)
+        if i < store.nextGuestThread: dec store.nextGuestThread
+        return
+
+  template withDirectGuestThread(instance, body: untyped): untyped =
+    block:
+      let owner: ComponentInstance = instance
+      let invocation = ComponentInvocation(owner: cast[pointer](owner), state: ccsComplete)
+      let thread = ComponentGuestThread(implicit: true, state: cgtRunning, invocation: invocation)
+      if not owner.registerThread(thread):
+        componentFail("component guest thread capacity exceeded")
+      let previous = owner.execution.thread
+      let previousContext = owner.execution.context
+      let previousSecond = owner.execution.contextSecond
+      owner.execution.thread = thread
+      owner.execution.context = addr thread.context
+      owner.execution.contextSecond = addr thread.contextSecond
+      defer:
+        owner.execution.thread = previous
+        owner.execution.context = previousContext
+        owner.execution.contextSecond = previousSecond
+        owner.retireThread(thread)
+      body
 
 proc childExportAt(child: ComponentInstance, alias: ChildExport): ptr ComponentExport =
   if alias.interfaceIndex == 0:
@@ -6304,10 +7883,11 @@ proc instantiateComponentInStore(plan: ComponentPlan,
 proc bindAvailableCoreFunctions(instance: ComponentInstance,
     pending: ptr CanonicalInstantiations, beforeCore: int) {.noinline.}
 
-proc instantiateChildren(instance: ComponentInstance, links: ComponentLinks,
+proc instantiateChildren(instance: ComponentInstance, plan: ComponentPlan,
     beforeCore: int, memoryFactory: ComponentMemoryFactory,
     memoryFactoryContext: pointer, canonical: ptr CanonicalInstantiations) =
   if canonical != nil: instance.bindAvailableCoreFunctions(canonical, beforeCore)
+  let links = plan.links
   if links == nil: return
   while instance.links.children.len < links.children.len:
     let node = unsafeAddr links.children[instance.links.children.len]
@@ -6328,6 +7908,7 @@ proc instantiateChildren(instance: ComponentInstance, links: ComponentLinks,
         instance.bindResource((resource - 1).uint32, child.resourceOrigin(i.uint32))
     for (childType, parentType) in node.resourceReexports:
       instance.bindResource(parentType.uint32, child.resourceOrigin(childType.uint32))
+    instance.bindAscribedResources(plan)
     if canonical != nil: instance.bindAvailableCoreFunctions(canonical, beforeCore)
 
 proc bindLinkedResources(instance: ComponentInstance, frame: LinkedResourceFrame) {.noinline.} =
@@ -6339,10 +7920,72 @@ proc bindLinkedResources(instance: ComponentInstance, frame: LinkedResourceFrame
     instance.links.resourceBindings[item.slot] = owner.resourceOrigin(origin.slot.uint32)
   if frame.local != nil: frame.local.owner = cast[pointer](instance)
 
+when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+  proc makeContextBuiltin(execution: CanonicalExecutionState, kind: CoreLoweringKind,
+      slot = 0'u8): HostFunc =
+    result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+      let cell = when defined(wasmComponentThreads):
+        (if slot == 0: execution.context else: execution.contextSecond)
+        else: execution.context
+      if cell == nil:
+        componentFail("canonical context has no active thread")
+      if kind == clContextGet:
+        if args.len != 0: componentFail("invalid canonical context arguments")
+        return @[wasmI32(cell[])]
+      if args.len != 1 or args[0].kind != wvkI32:
+        componentFail("invalid canonical context arguments")
+      cell[] = args[0].i32
+
+when defined(wasmComponentAsyncCallbacks):
+  proc resolveSubtask(task: ComponentSubtask, values: var seq[ComponentValue])
+
+  proc returnFromCallback(instance: ComponentInstance, declared: ComponentFuncType,
+      memoryAddress: int, encoding: CanonicalStringEncoding, args: openArray[WasmValue])
+  proc makeAsyncBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc
+  when defined(wasmComponentThreads):
+    proc makeThreadBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc
+  when ComponentEndpointsEnabled:
+    proc makeEndpointBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc
+  proc makeScheduledLowering(lowering: ComponentScheduledLowering): HostFunc
+
+  proc makeTaskReturn(instance: ComponentInstance, lowering: CoreLowering): HostFunc =
+    let owner = cast[pointer](instance)
+    let signature = lowering.resourceSignature
+    let encoding = lowering.stringEncoding
+    let memory = if lowering.memoryInstance == 0: -1
+      else: instance.coreExport(lowering.memoryInstance, lowering.memoryName, ekMemory)
+    result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+      cast[ComponentInstance](owner).returnFromCallback(signature[], memory, encoding, args)
+
+when defined(wasmComponentErrorContext):
+  proc makeErrorContextBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc
+
 proc bindLowering(instance: ComponentInstance, plan: ComponentPlan,
     lowering: CoreLowering, bindings: openArray[ComponentHostBinding]): HostFunc {.noinline.} =
+  when defined(wasmComponentErrorContext):
+    if lowering.kind in {clErrorContextNew .. clErrorContextDrop}:
+      return makeErrorContextBuiltin(instance, lowering)
+  when defined(wasmComponentContext) or defined(wasmComponentAsyncCallbacks):
+    if lowering.kind in {clContextGet, clContextSet}:
+      when defined(wasmComponentThreads):
+        return makeContextBuiltin(instance.execution, lowering.kind, lowering.contextSlot)
+      else:
+        return makeContextBuiltin(instance.execution, lowering.kind)
+  when defined(wasmComponentAsyncCallbacks):
+    when defined(wasmComponentThreads):
+      if lowering.kind in {clThreadIndex .. clThreadAvailableParallelism}:
+        return makeThreadBuiltin(instance, lowering)
+    when ComponentEndpointsEnabled:
+      if lowering.kind in {clEndpointNew .. clEndpointForward}:
+        return makeEndpointBuiltin(instance, lowering)
+    if lowering.kind == clTaskReturn:
+      return makeTaskReturn(instance, lowering)
+    if lowering.kind in {clWaitableSetNew, clWaitableSetDrop, clWaitableSetPoll,
+        clWaitableJoin, clSubtaskDrop, clBackpressureInc, clBackpressureDec,
+        clTaskCancel, clSubtaskCancel, clWaitableSetWait, clThreadYield}:
+      return makeAsyncBuiltin(instance, lowering)
   if lowering.kind notin {clHost, clChild, clLocal}:
-    return makeResourceBuiltin(instance.resources, instance.mayLeave, lowering.kind,
+    return makeResourceBuiltin(instance.resources, instance.execution, lowering.kind,
                                lowering.targetIndex.uint32)
   let memoryAddress = if lowering.memoryInstance == 0: -1
     else: instance.coreExport(lowering.memoryInstance, lowering.memoryName, ekMemory)
@@ -6358,7 +8001,17 @@ proc bindLowering(instance: ComponentInstance, plan: ComponentPlan,
     of clLocal: instance.planCallTarget(lowering.localTarget)
     else: nil   # Resource operations were bound above.
   let signature = loweringSignature(plan, lowering)
-  makeLowering(callback, target, signature, instance.mayLeave, addr instance.vm,
+  when defined(wasmComponentAsyncCallbacks):
+    let scheduledSync = when defined(wasmComponentStackful):
+      not lowering.asyncLower and target != nil and signature.asyncSignature()
+      else: false
+    if lowering.asyncLower or scheduledSync:
+      let scheduled = ComponentScheduledLowering(caller: cast[pointer](instance),
+        callback: callback, target: target, signature: signature, memoryAddress: memoryAddress,
+        reallocAddress: reallocAddress, encoding: lowering.stringEncoding)
+      when defined(wasmComponentStackful): scheduled.synchronous = scheduledSync
+      return makeScheduledLowering(scheduled)
+  makeLowering(callback, target, signature, instance.execution, addr instance.vm,
     memoryAddress, reallocAddress, lowering.stringEncoding,
     if signature.usesResources(): cast[pointer](instance) else: nil)
 
@@ -6396,11 +8049,10 @@ proc instantiateComponentInStore(plan: ComponentPlan,
   when not defined(wasmChunkedMemory):
     if memoryFactory != nil:
       componentFail("chunked component memory is not compiled in")
-  let mayLeave = new(bool)
-  mayLeave[] = true
+  let execution = CanonicalExecutionState(mayLeave: true)
   var hostBindings = unsafeAddr selected
-  result = ComponentInstance(handleTypes: plan.handleTypes, mayLeave: mayLeave)
-  if plan.links != nil or store != nil:
+  result = ComponentInstance(handleTypes: plan.handleTypes, execution: execution)
+  if plan.links != nil or store != nil or defined(wasmComponentAsyncCallbacks):
     new(result.links)
     result.links.store = if store == nil: ComponentLinkStore(root: cast[pointer](result)) else: store
     result.links.resourceBindings = move resourceBindings
@@ -6430,7 +8082,7 @@ proc instantiateComponentInStore(plan: ComponentPlan,
       break
   try:
     for i in 0 ..< plan.instances.len:
-      result.instantiateChildren(plan.links, i, memoryFactory, memoryFactoryContext, pending)
+      result.instantiateChildren(plan, i, memoryFactory, memoryFactoryContext, pending)
       if i == 0 and pending == nil:
         result.vm = initWasmVM()
         when defined(wasmChunkedMemory):
@@ -6441,7 +8093,7 @@ proc instantiateComponentInStore(plan: ComponentPlan,
       # before any start function or supplied host callback could run.
       var module = if node.external == nil:
           decodeModule(plan.embeddedCoreBytes(node.moduleIndex.int),
-            optimize = false, retainCustomSections = false)
+            optimize = false, retainCustomSections = false, allowFunctionSubtyping = true)
         else:
           node.external.image.decodeCoreModule()
       when defined(bl808m0) or defined(bl808lp):
@@ -6450,7 +8102,6 @@ proc instantiateComponentInStore(plan: ComponentPlan,
       for exp in plan.exports:
         if exp.coreSources[clsFunction].int == i + 1:
           validateCoreExport(module, exp)
-          plan.requireVisibleResources(exp.signature)
       var coreImports: seq[(string, string, ExternalVal)]
       var linkedImports: seq[StoreImport]
       for j in 0 ..< module.imports.len:
@@ -6490,14 +8141,15 @@ proc instantiateComponentInStore(plan: ComponentPlan,
           let target = unsafeAddr exports[][exportIndex]
           linkedImports.add((imp.module, imp.name,
             ExternalStoreRef(kind: target.kind, address: target.idx)))
-      discard result.vm.instantiateOwned(move module, coreImports, linkedImports)
+      withFreshContext(result.execution):
+        discard result.vm.instantiateOwned(move module, coreImports, linkedImports)
       for j, resource in plan.resources:
         if resource.destructorSource.int == i + 1:
           result.resources.destructors[j].address =
             result.coreExport(resource.destructorSource, resource.destructorName, ekFunc)
   except WasmTrap as e:
     componentFail("component instantiation trap: " & e.msg)
-  result.instantiateChildren(plan.links, plan.instances.len,
+  result.instantiateChildren(plan, plan.instances.len,
     memoryFactory, memoryFactoryContext, pending)
   result.exports = plan.exports
 
@@ -6507,6 +8159,7 @@ proc requireHostBinding(needed: ComponentImport,
   for binding in bindings:
     if binding.name != needed.name: continue
     if found or binding.signature.params != needed.signature.params or
+        binding.signature.asyncSignature() != needed.signature.asyncSignature() or
         binding.signature.hasResult != needed.signature.hasResult or
         (needed.signature.hasResult and
          binding.signature.resultType != needed.signature.resultType) or
@@ -6976,6 +8629,15 @@ proc instantiateComponent*(plan: ComponentPlan): ComponentInstance =
   let noBindings: seq[ComponentHostBinding] = @[]
   instantiateComponent(plan, noBindings)
 
+when WasmAtomicWaitEnabled:
+  proc setComponentAtomicClock*(instance: ComponentInstance, clock: WasmAtomicClock) =
+    ## Configure the graph before running a component that can park on a
+    ## finite core atomic wait.
+    instance.vm.setWasmAtomicClock(clock)
+    if instance.links != nil:
+      for child in instance.links.children:
+        child.setComponentAtomicClock(clock)
+
 proc requireInactiveGraph(instance: ComponentInstance) =
   if instance.activeEntries != 0 or
       (instance.links != nil and instance.links.store.callDepth != 0):
@@ -7002,12 +8664,85 @@ proc requireEmptyGraph(instance: ComponentInstance) =
     for child in instance.links.children:
       requireEmptyGraph(child)
 
+when defined(wasmComponentErrorContext):
+  proc clearErrorContextGraph(instance: ComponentInstance) =
+    if instance.resources != nil: instance.resources.table.clearErrorContextHandles()
+    if instance.links != nil:
+      for child in instance.links.children: child.clearErrorContextGraph()
+
+when WasmAtomicWaitEnabled:
+  proc clearAtomicWaitGraph(instance: ComponentInstance) =
+    instance.vm.clearWasmAtomicWaits()
+    if instance.links != nil:
+      for child in instance.links.children: child.clearAtomicWaitGraph()
+
+when defined(wasmComponentAsyncCallbacks):
+  proc abortBorrowScopes(instance: ComponentInstance, releaseSources: static bool) =
+    let resources = instance.resources
+    if resources != nil:
+      when releaseSources:
+        while resources.lendBatches.len != 0:
+          cast[ptr ResourceLendBatchState](resources.lendBatches[^1])[].releaseLendBatch()
+      else:
+        while resources.taskBorrowScopes.len != 0:
+          cast[ptr TaskBorrowScopeState](resources.taskBorrowScopes[^1])[].releaseTaskBorrows()
+    if instance.links != nil:
+      for child in instance.links.children: child.abortBorrowScopes(releaseSources)
+
+  proc releaseAsyncGraph(instance: ComponentInstance) =
+    for i, slot in instance.asyncSlots:
+      let isEndpoint = when ComponentEndpointsEnabled: slot.endpoint != nil else: false
+      when ComponentEndpointsEnabled:
+        if isEndpoint: slot.endpoint[].detachEndpoint()
+      if slot.waitSet != nil or slot.subtask != nil or isEndpoint:
+        discard instance.resources.table.dropAsyncHandle(i.uint32 + 1)
+    instance.asyncSlots.setLen(0)
+    if instance.links != nil:
+      for child in instance.links.children: child.releaseAsyncGraph()
+
 proc closeComponent*(instance: ComponentInstance) =
   ## Dispose guest owners while their defining guest code can still run.
-  if instance == nil or instance.isLocked: return
+  if instance == nil: return
+  if instance.isLocked:
+    when WasmAtomicWaitEnabled:
+      if instance.activeEntries == 0 and (instance.links == nil or
+          (instance.links.store.callDepth == 0 and
+           (when defined(wasmComponentAsyncCallbacks): instance.links.store.activeCallbackTurns == 0
+            else: true))):
+        instance.clearAtomicWaitGraph()
+    when defined(wasmComponentErrorContext):
+      if instance.activeEntries == 0 and (instance.links == nil or
+          (instance.links.store.callDepth == 0 and
+          (when defined(wasmComponentAsyncCallbacks): instance.links.store.activeCallbackTurns == 0
+           else: true))):
+        instance.clearErrorContextGraph()
+    when defined(wasmComponentAsyncCallbacks):
+      if instance.activeEntries == 0 and instance.links != nil and
+          instance.links.store.activeCallbackTurns == 0 and instance.links.store.callDepth == 0:
+        instance.abortBorrowScopes(true)
+        instance.abortBorrowScopes(false)
+        when ComponentEndpointsEnabled:
+          instance.releaseAsyncGraph()
+        when defined(wasmComponentThreads):
+          instance.links.store.switchTarget = nil
+          instance.links.store.guestThreads.setLen(0)
+    return
   requireInactiveGraph(instance)
+  when defined(wasmComponentAsyncCallbacks):
+    instance.abortBorrowScopes(true)
+    instance.abortBorrowScopes(false)
+    if instance.links != nil: instance.links.store.pendingSubtasks.setLen(0)
   instance.activeEntries = 1
   defer:
+    when WasmAtomicWaitEnabled: instance.clearAtomicWaitGraph()
+    when defined(wasmComponentErrorContext): instance.clearErrorContextGraph()
+    when defined(wasmComponentAsyncCallbacks):
+      if instance.links != nil: instance.links.store.pendingSubtasks.setLen(0)
+      instance.releaseAsyncGraph()
+      when defined(wasmComponentThreads):
+        if instance.links != nil:
+          instance.links.store.switchTarget = nil
+          instance.links.store.guestThreads.setLen(0)
     instance.activeEntries = 0
     instance.lockStore()
   disposeGraphResources(instance)
@@ -7048,6 +8783,17 @@ proc componentString*(value: string): ComponentValue =
   if not validWasmName(value): componentFail("invalid UTF-8 component string")
   ComponentValue(kind: cpString, text: value)
 
+when defined(wasmComponentErrorContext):
+  proc componentErrorContext*(message = ""): ComponentValue =
+    if message.len > MaxComponentStringBytes or not validWasmName(message):
+      componentFail("invalid component error-context debug message")
+    ComponentValue(kind: cpErrorContext, errorContext: newErrorContextValue(message))
+
+  proc componentErrorContextMessage*(value: ComponentValue): string =
+    if value.kind != cpErrorContext or value.errorContext == nil:
+      componentFail("invalid component error-context value")
+    value.errorContext.debugMessage()
+
 proc componentBytes*(value: openArray[byte]): ComponentValue =
   if value.len > MaxComponentByteListBytes:
     componentFail("component byte list length limit")
@@ -7073,6 +8819,32 @@ proc componentList*(values: openArray[ComponentValue]): ComponentValue =
   if values.len > MaxGenericListValues:
     componentFail("component list value limit")
   ComponentValue(kind: cpList, fields: @values)
+
+proc checkFixedListValueCount(count: int) =
+  if count == 0 or count > MaxGenericListValues:
+    componentFail("component fixed-length list value limit")
+
+proc componentFixedList*(values: sink seq[ComponentValue]): ComponentValue =
+  checkFixedListValueCount(values.len)
+  ComponentValue(kind: cpFixedList, fields: move values)
+
+proc componentFixedList*(values: openArray[ComponentValue]): ComponentValue =
+  checkFixedListValueCount(values.len)
+  ComponentValue(kind: cpFixedList, fields: @values)
+
+proc requireFixedListLength(slot: CanonicalSlot, value: ComponentValue) =
+  if value.fields.len.uint64 != slot.listLength.uint64:
+    componentFail("component fixed-length list length mismatch")
+  checkFixedListValueCount(value.fields.len)
+
+proc componentMap*(entries: openArray[ComponentValue]): ComponentValue =
+  ## Accept key/value tuples in wire order. Duplicate entries are preserved.
+  if entries.len > MaxGenericListValues:
+    componentFail("component map value limit")
+  for entry in entries:
+    if entry.kind != cpTuple or entry.fields.len != 2 or entry.fields[0].kind notin MapKeyTypes:
+      componentFail("invalid component map entry")
+  ComponentValue(kind: cpMap, fields: @entries)
 
 proc componentRecord*(fields: openArray[ComponentValue]): ComponentValue =
   if fields.len == 0 or fields.len > MaxComponentRecordFields:
@@ -7126,9 +8898,9 @@ proc lower(value: ComponentValue): WasmValue =
   of cpS64, cpU64: wasmI64(cast[int64](value.bits))
   of cpF32: wasmF32(cast[float32](canonicalF32(value.bits.uint32)))
   of cpF64: wasmF64(cast[float64](canonicalF64(value.bits)))
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpRecord, cpTuple, cpFlags, cpOption,
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFixedList, cpRecord, cpTuple, cpFlags, cpOption,
      cpVariant, cpEnum, cpResult, cpResourceType, cpInterfaceType, cpFunctionType, cpComponentType,
-     cpOwnedResource, cpBorrowedResource:
+     cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext:
     componentFail("composite lowering requires canonical memory")
 
 proc lift(value: WasmValue, kind: ComponentPrim): ComponentValue =
@@ -7150,9 +8922,9 @@ proc lift(value: WasmValue, kind: ComponentPrim): ComponentValue =
   of cpS64, cpU64: result.bits = cast[uint64](value.i64)
   of cpF32: result.bits = canonicalF32(cast[uint32](value.f32)).uint64
   of cpF64: result.bits = canonicalF64(cast[uint64](value.f64))
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpRecord, cpTuple, cpFlags, cpOption,
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFixedList, cpRecord, cpTuple, cpFlags, cpOption,
      cpVariant, cpEnum, cpResult, cpResourceType, cpInterfaceType, cpFunctionType, cpComponentType,
-     cpOwnedResource, cpBorrowedResource:
+     cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext:
     componentFail("composite lifting requires canonical memory")
 
 proc coreExport(instance: ComponentInstance, source: uint16,
@@ -7185,7 +8957,7 @@ proc lowerPayload(instance: ComponentInstance, exp: ComponentExport,
                                       exp.memoryName, ekMemory)
   var offset: uint32
   try:
-    offset = instance.vm.allocCanonicalPayload(instance.mayLeave, memoryAddr,
+    offset = instance.vm.allocCanonicalPayload(instance.execution, memoryAddr,
       allocAddr, source, count, alignment)
   except CatchableError:
     instance.lockStore()
@@ -7202,7 +8974,7 @@ proc lowerString(instance: ComponentInstance, exp: ComponentExport,
   let memoryAddr = instance.coreExport(exp.coreSources[clsMemory],
                                        exp.memoryName, ekMemory)
   try:
-    let (offset, units) = instance.vm.storeCanonicalText(instance.mayLeave,
+    let (offset, units) = instance.vm.storeCanonicalText(instance.execution,
       memoryAddr, allocAddr, value.text, exp.stringEncoding)
     args.add(wasmI32(cast[int32](offset)))
     args.add(wasmI32(cast[int32](units)))
@@ -7313,11 +9085,11 @@ proc recordScalarBytes(kind: ComponentPrim): int =
   case kind
   of cpBool, cpS8, cpU8: 1
   of cpS16, cpU16: 2
-  of cpS32, cpU32, cpF32, cpChar: 4
+  of cpS32, cpU32, cpF32, cpChar, cpErrorContext: 4
   of cpS64, cpU64, cpF64: 8
-  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpRecord, cpTuple, cpFlags, cpOption,
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap, cpFixedList, cpRecord, cpTuple, cpFlags, cpOption,
      cpVariant, cpEnum, cpResult, cpResourceType, cpInterfaceType, cpFunctionType, cpComponentType,
-     cpOwnedResource, cpBorrowedResource:
+     cpOwnedResource, cpBorrowedResource, cpFuture, cpStream:
     componentFail("nested composite record field unsupported")
 
 proc readAbiInt(memory: var MemInst, offset: uint64, width: int): uint64 =
@@ -7334,6 +9106,58 @@ proc writeAbiInt(memory: var MemInst, offset: uint64, width: int, value: uint64)
   memory.writeMemoryBytes(offset,
     cast[ptr UncheckedArray[byte]](addr raw[0]), width.uint32)
 
+when defined(wasmComponentErrorContext):
+  proc errorContextAt(instance: ComponentInstance, handle: uint32): ComponentErrorContextValue =
+    if instance != nil and instance.resources != nil:
+      result = instance.resources.table.errorContextAt(handle)
+    if result == nil: componentFail("invalid canonical error-context handle")
+
+  proc lowerErrorContext(instance: ComponentInstance, value: ComponentValue): uint32 =
+    if instance == nil or value.kind != cpErrorContext or value.errorContext == nil:
+      componentFail("invalid component error-context value")
+    instance.initCanonicalHandles()
+    if not instance.resources.table.newErrorContextHandle(value.errorContext, result):
+      componentFail("component error-context handle capacity exceeded")
+
+  proc lowerErrorContext(access: AbiAccess, value: ComponentValue): uint32 =
+    result = cast[ComponentInstance](access.resourceOwner).lowerErrorContext(value)
+    when defined(wasmComponentHostEndpoints):
+      if access.endpointMoves != nil:
+        access.endpointMoves[].add(EndpointLoweredHandle(handle: result, isErrorContext: true))
+
+  proc makeErrorContextBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc =
+    let owner = cast[pointer](instance)
+    let kind = lowering.kind
+    let encoding = lowering.stringEncoding
+    let memory = if lowering.memoryInstance == 0: -1
+      else: instance.coreExport(lowering.memoryInstance, lowering.memoryName, ekMemory)
+    let realloc = if lowering.reallocSource == 0: -1
+      else: instance.coreExport(lowering.reallocSource, lowering.reallocName, ekFunc)
+    result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+      let inst = cast[ComponentInstance](owner)
+      if not inst.execution.mayLeave: componentFail("canonical error-context builtin cannot leave")
+      let first = args[0].i32.uint32
+      case kind
+      of clErrorContextNew:
+        let message = when defined(wasmComponentErrorContextMessages):
+            inst.vm.store.mems[memory].readCanonicalString(first, args[1].i32.uint32, encoding)
+          else: ""
+        let handle = inst.lowerErrorContext(componentErrorContext(message))
+        return @[wasmI32(cast[int32](handle))]
+      of clErrorContextDebugMessage:
+        let value = inst.errorContextAt(first)
+        let address = args[1].i32.uint32.uint64
+        if (address and 3) != 0: componentFail("unaligned canonical error-context return area")
+        inst.vm.store.mems[memory].checkMemoryRange(address, 8)
+        let (ptrValue, units) = inst.vm.storeCanonicalText(inst.execution,
+          memory, realloc, value.debugMessage(), encoding)
+        inst.vm.store.mems[memory].writeAbiInt(address, 4, ptrValue.uint64)
+        inst.vm.store.mems[memory].writeAbiInt(address + 4, 4, units.uint64)
+      of clErrorContextDrop:
+        if inst.resources == nil or not inst.resources.table.dropErrorContextHandle(first):
+          componentFail("invalid canonical error-context handle")
+      else: componentFail("invalid canonical error-context builtin")
+
 proc readAbiScalar(memory: var MemInst, offset: uint64,
                    kind: ComponentPrim): ComponentValue =
   let bits = readAbiInt(memory, offset, recordScalarBytes(kind))
@@ -7345,7 +9169,7 @@ proc readAbiScalar(memory: var MemInst, offset: uint64,
     else: componentFail("invalid canonical scalar")
   lift(scalar, kind)
 
-proc variantLayout(cases: openArray[ComponentVariantCase]):
+proc variantLayout(cases: openArray[ComponentVariantCase], pointerBytes: int):
     tuple[size, alignment, payloadOffset: int] =
   if cases.len == 0 or cases.len > MaxComponentVariantCases:
     componentFail("invalid component variant layout")
@@ -7353,7 +9177,7 @@ proc variantLayout(cases: openArray[ComponentVariantCase]):
   var maxPayloadBytes = 0
   for item in cases:
     if not item.hasPayload: continue
-    let payload = canonicalSlotLayout(caseSlot(item))
+    let payload = canonicalSlotLayout(caseSlot(item), pointerBytes)
     result.alignment = max(result.alignment, payload.alignment)
     maxPayloadBytes = max(maxPayloadBytes, payload.size)
   result.payloadOffset = result.alignment
@@ -7378,18 +9202,18 @@ proc readAbiArgument(memory: var MemInst, offset: uint64, slot: CanonicalSlot,
                      encoding: CanonicalStringEncoding,
                      budget: ptr AbiListBudget = nil): ComponentValue
 
-proc readGenericList(memory: var MemInst, payload, count: uint32,
+proc readGenericList(memory: var MemInst, payload: uint64, count: uint32, kind: ComponentPrim,
     element: ref CanonicalSlot, encoding: CanonicalStringEncoding,
     budget: ptr AbiListBudget): ComponentValue =
   let layout = canonicalSlotLayout(element[])
   let bytes = count.uint64 * layout.size.uint64
   budget.charge(count.uint64, bytes)
-  if (payload and (layout.alignment - 1).uint32) != 0:
+  if (payload and (layout.alignment - 1).uint64) != 0:
     componentFail("unaligned canonical list pointer")
-  memory.checkMemoryRange(payload.uint64, bytes.uint32)
-  result = ComponentValue(kind: cpList, fields: newSeqOfCap[ComponentValue](count.int))
+  memory.checkMemoryRange(payload, bytes.uint32)
+  result = ComponentValue(kind: kind, fields: newSeqOfCap[ComponentValue](count.int))
   for i in 0 ..< count:
-    let offset = payload.uint64 + i.uint64 * layout.size.uint64
+    let offset = payload + i.uint64 * layout.size.uint64
     result.fields.add(readAbiArgument(memory, offset, element[], encoding, budget))
 
 proc readAbiPair(memory: var MemInst, payload, count: uint32, kind: ComponentPrim,
@@ -7423,11 +9247,11 @@ proc readAbiPair(memory: var MemInst, payload, count: uint32, kind: ComponentPri
   of cpU64List:
     budget.charge(count.uint64, count.uint64 * 8)
     readIntList(memory, payload, count, 8, cpU64List, cpU64)
-  of cpList:
+  of cpList, cpMap:
     if budget != nil:
-      return readGenericList(memory, payload, count, listElement, encoding, budget)
+      return readGenericList(memory, payload.uint64, count, kind, listElement, encoding, budget)
     var limit = listBudget()
-    readGenericList(memory, payload, count, listElement, encoding, addr limit)
+    readGenericList(memory, payload.uint64, count, kind, listElement, encoding, addr limit)
   else: componentFail("invalid canonical leaf type")
 
 proc readAbiLeaf(memory: var MemInst, offset: uint64, kind: ComponentPrim,
@@ -7489,6 +9313,12 @@ proc readFlatSlot(access: AbiAccess, slot: CanonicalSlot,
                   args: openArray[WasmValue], offset: var int,
                   joined: bool): ComponentValue =
   case slot.kind
+  of cpFixedList:
+    result = ComponentValue(kind: cpFixedList,
+      fields: newSeqOfCap[ComponentValue](slot.listLength.int))
+    for _ in 0 ..< slot.listLength:
+      result.fields.add(readFlatSlot(access, slot.listElement[], args, offset, joined))
+    return
   of cpRecord, cpTuple:
     result = ComponentValue(kind: slot.kind,
       fields: newSeqOfCap[ComponentValue](slot.recordShape.fields.len))
@@ -7503,11 +9333,11 @@ proc readFlatSlot(access: AbiAccess, slot: CanonicalSlot,
   of cpFlags:
     let bits = narrowFlatLane(takeFlatLane(args, offset), vtI32).i32.uint32
     ComponentValue(kind: cpFlags, bits: (bits and flagMask(slot.cases.len)).uint64)
-  of cpString, cpBytes, cpU32List, cpU64List, cpList:
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap:
     let first = narrowFlatLane(takeFlatLane(args, offset), vtI32)
     let last = narrowFlatLane(takeFlatLane(args, offset), vtI32)
     readFlatPair(access, first, last, slot.kind, slot.listElement)
-  of cpOwnedResource, cpBorrowedResource:
+  of cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext:
     let bits = narrowFlatLane(takeFlatLane(args, offset), vtI32).i32.uint32
     ComponentValue(kind: slot.kind, bits: bits)
   else:
@@ -7524,7 +9354,7 @@ proc readFlatArgs(access: AbiAccess, sig: ComponentFuncType,
       let first = takeFlatLane(args, offset)
       let last = takeFlatLane(args, offset)
       result.add(readFlatPair(access, first, last, kind))
-    elif kind in {cpOwnedResource, cpBorrowedResource}:
+    elif kind in {cpOwnedResource, cpBorrowedResource, cpErrorContext}:
       result.add(ComponentValue(kind: kind, bits: takeFlatLane(args, offset).i32.uint32))
     else:
       result.add(lift(takeFlatLane(args, offset), kind))
@@ -7533,6 +9363,13 @@ proc readAbiArgument(memory: var MemInst, offset: uint64, slot: CanonicalSlot,
                      encoding: CanonicalStringEncoding,
                      budget: ptr AbiListBudget): ComponentValue =
   case slot.kind
+  of cpFixedList:
+    if budget != nil:
+      return readGenericList(memory, offset, slot.listLength, slot.kind,
+        slot.listElement, encoding, budget)
+    var limit = listBudget()
+    return readGenericList(memory, offset, slot.listLength, slot.kind,
+      slot.listElement, encoding, addr limit)
   of cpRecord, cpTuple:
     budget.charge(slot.recordShape.fields.len.uint64, 0)
     result = ComponentValue(kind: slot.kind,
@@ -7563,21 +9400,22 @@ proc readAbiArgument(memory: var MemInst, offset: uint64, slot: CanonicalSlot,
       else:
         result.fields.add(readAbiArgument(memory, address, selected.shape[], encoding, budget))
     return
-  of cpOwnedResource, cpBorrowedResource:
+  of cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext:
     ComponentValue(kind: slot.kind, bits: readAbiInt(memory, offset, 4))
   else:
     readAbiLeaf(memory, offset, slot.kind, encoding, budget, slot.listElement)
 
-proc liftRecord(instance: ComponentInstance, exp: ComponentExport,
-                value: WasmValue, shape: CanonicalSlot): ComponentValue =
-  if shape.recordShape.flatWidth == 1:
+proc liftAggregate(instance: ComponentInstance, exp: ComponentExport,
+                   value: WasmValue, shape: CanonicalSlot): ComponentValue =
+  if flatSlotWidth(shape) == 1:
     var lane = 0
     return readFlatSlot(AbiAccess(memoryAddress: -1), shape, [value], lane)
   if value.kind != wvkI32:
     componentFail("invalid canonical record return pointer")
-  let layout = shape.recordShape.layout
+  let layout = canonicalSlotLayout(shape)
   let pointer = cast[uint32](value.i32)
   if (pointer and (layout.alignment - 1).uint32) != 0:
+    if shape.kind == cpFixedList: componentFail("unaligned canonical fixed-length list result")
     componentFail("unaligned canonical record result")
   let memoryAddress = instance.coreExport(exp.coreSources[clsMemory],
     exp.memoryName, ekMemory)
@@ -7610,13 +9448,13 @@ proc allocateAbiList(access: AbiAccess, value: ComponentValue):
     if value.bytes.len > MaxComponentByteListBytes:
       componentFail("component byte list length limit")
     let source = if value.bytes.len == 0: nil else: unsafeAddr value.bytes[0]
-    return (access.vm[].allocCanonicalPayload(access.mayLeave, access.memoryAddress,
+    return (access.vm[].allocCanonicalPayload(access.execution, access.memoryAddress,
       access.reallocAddress, source, value.bytes.len, 1), value.bytes.len.uint32)
   let width = if value.kind == cpU32List: 4 else: 8
   let kind = if width == 4: cpU32 else: cpU64
   let bytes = encodeIntList(value, width, kind)
   let source = if bytes.len == 0: nil else: unsafeAddr bytes[0]
-  (access.vm[].allocCanonicalPayload(access.mayLeave, access.memoryAddress,
+  (access.vm[].allocCanonicalPayload(access.execution, access.memoryAddress,
     access.reallocAddress, source, bytes.len, width), value.fields.len.uint32)
 
 proc writeAbiArgument(access: AbiAccess, offset: uint64, slot: CanonicalSlot,
@@ -7629,7 +9467,7 @@ proc writeGenericList(access: AbiAccess, element: ref CanonicalSlot,
   let bytes = values.len.uint64 * layout.size.uint64
   budget.charge(values.len.uint64, bytes)
   result.count = values.len.uint32
-  result.offset = access.vm[].canonicalRealloc(access.mayLeave, access.memoryAddress,
+  result.offset = access.vm[].canonicalRealloc(access.execution, access.memoryAddress,
     access.reallocAddress, 0, 0, bytes.int, layout.alignment)
   for i, item in values:
     let offset = result.offset.uint64 + i.uint64 * layout.size.uint64
@@ -7644,7 +9482,7 @@ proc allocateAbiPair(access: AbiAccess, value: ComponentValue,
       componentFail("invalid canonical string argument")
     # The string codec may reserve twice the UTF-8 input before shrinking.
     budget.charge(0, value.text.len.uint64 * (if access.encoding == cseUtf8: 1'u64 else: 2'u64))
-    let (offset, units) = access.vm[].storeCanonicalText(access.mayLeave, access.memoryAddress,
+    let (offset, units) = access.vm[].storeCanonicalText(access.execution, access.memoryAddress,
       access.reallocAddress, value.text, access.encoding)
     (offset: offset, count: units)
   of cpBytes:
@@ -7654,7 +9492,7 @@ proc allocateAbiPair(access: AbiAccess, value: ComponentValue,
     let width = if value.kind == cpU32List: 4'u64 else: 8'u64
     budget.charge(value.fields.len.uint64, value.fields.len.uint64 * width)
     allocateAbiList(access, value)
-  of cpList:
+  of cpList, cpMap:
     if budget != nil:
       return writeGenericList(access, listElement, value.fields, budget)
     var limit = listBudget()
@@ -7676,6 +9514,16 @@ proc writeAbiArgument(access: AbiAccess, offset: uint64, slot: CanonicalSlot,
   if slot.kind != value.kind:
     componentFail("canonical value type mismatch")
   case slot.kind
+  of cpFixedList:
+    requireFixedListLength(slot, value)
+    let stride = canonicalSlotLayout(slot.listElement[]).size.uint64
+    var limit: AbiListBudget
+    let activeBudget = if budget != nil: budget else:
+      limit = listBudget()
+      addr limit
+    activeBudget.charge(slot.listLength.uint64, slot.listLength.uint64 * stride)
+    for i, field in value.fields:
+      writeAbiArgument(access, offset + i.uint64 * stride, slot.listElement[], field, activeBudget)
   of cpRecord, cpTuple:
     if value.fields.len != slot.recordShape.fields.len:
       componentFail("component record field count mismatch")
@@ -7714,6 +9562,16 @@ proc writeAbiArgument(access: AbiAccess, offset: uint64, slot: CanonicalSlot,
   of cpOwnedResource, cpBorrowedResource:
     writeAbiInt(access.vm[].store.mems[access.memoryAddress],
       offset, 4, lowerResourceHandle(access, slot, value).uint64)
+  of cpErrorContext:
+    when defined(wasmComponentErrorContext):
+      writeAbiInt(access.vm[].store.mems[access.memoryAddress],
+        offset, 4, access.lowerErrorContext(value).uint64)
+    else: componentFail("component error-context is disabled")
+  of cpFuture, cpStream:
+    when ComponentEndpointsEnabled:
+      writeAbiInt(access.vm[].store.mems[access.memoryAddress],
+        offset, 4, lowerEndpointHandle(access, slot, value).uint64)
+    else: componentFail("canonical endpoint values are disabled")
   else:
     writeAbiLeaf(access, offset, value, budget, slot.listElement)
 
@@ -7746,6 +9604,14 @@ proc lowerAbiResult(access: AbiAccess, sig: ComponentFuncType, value: ComponentV
     @[wasmI32(value.caseIndex.int32)]
   of cpOwnedResource:
     @[wasmI32(cast[int32](lowerResourceHandle(access, resultSlot(sig), value)))]
+  of cpErrorContext:
+    when defined(wasmComponentErrorContext):
+      @[wasmI32(cast[int32](access.lowerErrorContext(value)))]
+    else: componentFail("component error-context is disabled")
+  of cpFuture, cpStream:
+    when ComponentEndpointsEnabled:
+      @[wasmI32(cast[int32](lowerEndpointHandle(access, resultSlot(sig), value)))]
+    else: componentFail("canonical endpoint values are disabled")
   else:
     @[lower(value)]
 
@@ -7796,6 +9662,10 @@ proc lowerFlatSlot(access: AbiAccess, slot: CanonicalSlot, value: ComponentValue
   if slot.kind != value.kind:
     componentFail("canonical value type mismatch")
   case slot.kind
+  of cpFixedList:
+    requireFixedListLength(slot, value)
+    for field in value.fields:
+      lowerFlatSlot(access, slot.listElement[], field, lanes)
   of cpRecord, cpTuple:
     if value.fields.len != slot.recordShape.fields.len:
       componentFail("component record field count mismatch")
@@ -7812,12 +9682,20 @@ proc lowerFlatSlot(access: AbiAccess, slot: CanonicalSlot, value: ComponentValue
     if (value.bits and not flagMask(slot.cases.len).uint64) != 0:
       componentFail("component flags argument out of range")
     lanes.add(wasmI32(cast[int32](value.bits.uint32)))
-  of cpString, cpBytes, cpU32List, cpU64List, cpList:
+  of cpString, cpBytes, cpU32List, cpU64List, cpList, cpMap:
     let (offset, count) = allocateAbiPair(access, value, slot.listElement)
     lanes.add(wasmI32(cast[int32](offset)))
     lanes.add(wasmI32(cast[int32](count)))
   of cpOwnedResource, cpBorrowedResource:
     lanes.add(wasmI32(cast[int32](lowerResourceHandle(access, slot, value))))
+  of cpErrorContext:
+    when defined(wasmComponentErrorContext):
+      lanes.add(wasmI32(cast[int32](access.lowerErrorContext(value))))
+    else: componentFail("component error-context is disabled")
+  of cpFuture, cpStream:
+    when ComponentEndpointsEnabled:
+      lanes.add(wasmI32(cast[int32](lowerEndpointHandle(access, slot, value))))
+    else: componentFail("canonical endpoint values are disabled")
   else:
     lanes.add(lower(value))
 
@@ -7880,13 +9758,20 @@ proc dropComponentResource*(value: ComponentValue) =
     instance.lockStore()
     componentFail("component resource drop failed: " & $status)
 
+proc resourceDefiner(resource: ComponentOwnedValue): ComponentInstance {.inline.} =
+  when defined(wasmComponentAsyncCallbacks):
+    if resource.borrowOwner != nil: return cast[ComponentInstance](resource.borrowOwner)
+  resource.owner
+
 proc matchesResourceIdentity(instance: ComponentInstance, index: int,
                              resource: ComponentOwnedValue): bool =
-  if index < 0 or resource == nil or not resource.live or resource.owner.isLocked or
+  if index < 0 or resource == nil or not resource.live or
       instance.resources == nil:
     return false
+  let definer = resource.resourceDefiner()
+  if definer == nil or definer.isLocked: return false
   let binding = instance.resourceOrigin(index.uint32)
-  cast[pointer](resource.owner) == binding.owner and
+  cast[pointer](definer) == binding.owner and
     resource.resourceIndex == binding.resourceIndex
 
 type ResourceLeafVisitor = proc(slot: CanonicalSlot, value: var ComponentValue) {.closure.}
@@ -7897,9 +9782,13 @@ proc visitResourceLeaves(slot: CanonicalSlot, value: var ComponentValue,
     componentFail("component argument type mismatch")
   if slot.resources == {}: return
   case slot.kind
-  of cpOwnedResource, cpBorrowedResource:
+  of cpOwnedResource, cpBorrowedResource, cpFuture, cpStream, cpErrorContext:
     visit(slot, value)
-  of cpList:
+  of cpFixedList:
+    requireFixedListLength(slot, value)
+    for item in value.fields.mitems:
+      visitResourceLeaves(slot.listElement[], item, visit)
+  of cpList, cpMap:
     if value.fields.len > MaxGenericListValues:
       componentFail("canonical list transfer exceeds profile limit")
     for item in value.fields.mitems:
@@ -7927,9 +9816,37 @@ proc checkArgumentKinds(signature: ComponentFuncType, args: openArray[ComponentV
 type PreparedResources = object
   owners, borrows: seq[ComponentOwnedValue]
   foreignBorrows: uint32
+  when defined(wasmComponentErrorContext):
+    errorContexts: uint32
+  when ComponentEndpointsEnabled:
+    endpointValues: seq[ComponentEndpointValue]
+
+proc preparedHandleCount(prepared: PreparedResources): uint32 =
+  result = prepared.owners.len.uint32 + prepared.foreignBorrows
+  when defined(wasmComponentErrorContext): result += prepared.errorContexts
+  when ComponentEndpointsEnabled:
+    result += prepared.endpointValues.len.uint32
+
+proc requireHandleCapacity(instance: ComponentInstance, count: uint32) =
+  if count == 0: return
+  instance.initCanonicalHandles()
+  if not instance.resources.table.hasResourceCapacity(count):
+    componentFail("component resource table capacity exceeded")
 
 proc collectHostResource(instance: ComponentInstance, slot: CanonicalSlot,
                          value: ComponentValue, prepared: var PreparedResources) =
+  when defined(wasmComponentErrorContext):
+    if slot.kind == cpErrorContext:
+      if value.errorContext == nil: componentFail("invalid component error-context value")
+      inc prepared.errorContexts
+      return
+  when ComponentEndpointsEnabled:
+    if slot.kind in {cpFuture, cpStream}:
+      instance.validateEndpointValue(slot, value)
+      if value.endpoint in prepared.endpointValues:
+        componentFail("canonical " & endpointName(slot.kind) & " endpoint supplied more than once")
+      prepared.endpointValues.add(value.endpoint)
+      return
   let resource = value.resource
   let expected = resourceIndex(instance.handleTypes, slot.resourceType.uint32)
   if not instance.matchesResourceIdentity(expected, resource):
@@ -7946,7 +9863,7 @@ proc collectHostResource(instance: ComponentInstance, slot: CanonicalSlot,
     prepared.owners.add(resource)
   else:
     prepared.borrows.add(resource)
-    if resource.owner != instance:
+    if resource.resourceDefiner() != instance:
       inc prepared.foreignBorrows
 
 proc collectHostResources(instance: ComponentInstance, sig: ComponentFuncType,
@@ -7994,22 +9911,25 @@ proc lowerBorrow(instance: ComponentInstance, index: uint32,
   let origin = instance.resourceOrigin(index)
   if origin.owner == cast[pointer](instance):
     return resource.representation.uint32
-  let status = instance.resources.table.newScopedBorrow(index, instance.activeEntries.uint32,
+  var scope = instance.activeEntries.uint32
+  when defined(wasmComponentAsyncCallbacks):
+    if instance.execution.borrowScope != 0: scope = instance.execution.borrowScope
+  let status = instance.resources.table.newScopedBorrow(index, scope,
     resource.representation, result)
   if status != crOk:
     componentFail("canonical resource borrow failed: " & $status)
 
-type ResourceLend = tuple[handle: uint32, token: ComponentOwnedValue]
-
-proc endLends(instance: ComponentInstance, lends: openArray[ResourceLend]) =
-  for lent in lends:
-    lent.token.live = false
-    lent.token.owner = nil
-    instance.resources.table.releaseLend(lent.handle)
-
 proc decodeResourceLeaf(instance: ComponentInstance, slot: CanonicalSlot,
-    value: var ComponentValue, lends: var seq[ResourceLend]) =
+    value: var ComponentValue, lends: var seq[ResourceLend], scheduled = false) =
   let handle = value.bits.uint32
+  when defined(wasmComponentErrorContext):
+    if slot.kind == cpErrorContext:
+      value = ComponentValue(kind: cpErrorContext, errorContext: instance.errorContextAt(handle))
+      return
+  when ComponentEndpointsEnabled:
+    if slot.kind in {cpFuture, cpStream}:
+      value = instance.liftEndpointHandle(slot, handle)
+      return
   let typeIndex = slot.resourceType.int32
   if slot.kind == cpOwnedResource:
     value = instance.liftOwned(wasmI32(cast[int32](handle)), typeIndex)
@@ -8020,9 +9940,17 @@ proc decodeResourceLeaf(instance: ComponentInstance, slot: CanonicalSlot,
   let status = instance.resources.table.lendRepresentation(handle, index.uint32, representation)
   if status != crOk: componentFail("canonical resource lend failed: " & $status)
   let origin = instance.resourceOrigin(index.uint32)
-  let token = ComponentOwnedValue(owner: cast[ComponentInstance](origin.owner),
+  let token = ComponentOwnedValue(
     resourceIndex: origin.resourceIndex, representation: representation, live: true)
-  lends.add((handle, token))
+  var lend = ResourceLend(handle: handle, token: token)
+  when defined(wasmComponentAsyncCallbacks):
+    let scope = instance.resources.table.borrowScopeForHandle(handle)
+    lend.sourceScope = instance.resources.findBorrowScope(scope)
+    if scheduled: token.borrowOwner = origin.owner
+    else: token.owner = cast[ComponentInstance](origin.owner)
+  else:
+    token.owner = cast[ComponentInstance](origin.owner)
+  lends.add(move lend)
   value = ComponentValue(kind: cpBorrowedResource, resource: token)
 
 proc decodeOwnedResult(instance: ComponentInstance, slot: CanonicalSlot,
@@ -8032,6 +9960,70 @@ proc decodeOwnedResult(instance: ComponentInstance, slot: CanonicalSlot,
     instance.decodeResourceLeaf(leaf, value, lends)
   visitResourceLeaves(slot, value, decode)
 
+when defined(wasmComponentAsyncCallbacks):
+  proc checkTaskBorrows(instance: ComponentInstance) =
+    let id = instance.execution.borrowScope
+    if id != 0 and instance.resources.table.hasScopedBorrows(id):
+      componentFail("borrow handles still remain at the end of the call")
+
+  proc returnTaskResult(task: var CanonicalCallbackTask) =
+    if task.subtask != nil:
+      cast[ComponentSubtask](task.subtask).resolveSubtask(task.values)
+      task.values.setLen(0)
+    task.resolution = ccrReturned
+
+  proc returnFromCallback(instance: ComponentInstance, declared: ComponentFuncType,
+      memoryAddress: int, encoding: CanonicalStringEncoding, args: openArray[WasmValue]) =
+    let task = instance.execution.callbackTask
+    if not instance.execution.mayLeave or task == nil:
+      componentFail("canonical task.return requires an active async task")
+    if task.resolution in {ccrReturned, ccrCancelled}:
+      componentFail("canonical task already resolved")
+    instance.checkTaskBorrows()
+    if task.memoryAddress != memoryAddress or task.encoding != encoding:
+      componentFail("canonical task.return options mismatch")
+    let expected = task.signature
+    if declared.hasResult != expected.hasResult:
+      componentFail("canonical task.return type mismatch")
+    if declared.hasResult:
+      let slot = resultSlot(declared)
+      let target = resultSlot(expected[])
+      if slot != target: componentFail("canonical task.return type mismatch")
+      if target.resources != {}:
+        var providedTypes, expectedTypes: seq[uint16]
+        collectResourceTypes(slot, providedTypes)
+        collectResourceTypes(target, expectedTypes)
+        if providedTypes.len != expectedTypes.len:
+          componentFail("canonical task.return resource type mismatch")
+        for i, provided in providedTypes:
+          let actualId = resourceIndex(instance.handleTypes, provided.uint32)
+          let expectedId = resourceIndex(instance.handleTypes, expectedTypes[i].uint32)
+          if actualId < 0 or expectedId < 0 or
+              instance.resourceOrigin(actualId.uint32) != instance.resourceOrigin(expectedId.uint32):
+            componentFail("canonical task.return resource type mismatch")
+      let width = flatSlotWidth(slot)
+      if args.len != (if width > MaxFlatParams: 1 else: width):
+        componentFail("canonical task.return argument count mismatch")
+      var value: ComponentValue
+      if width > MaxFlatParams:
+        let layout = canonicalSlotLayout(slot)
+        let offset = args[0].i32.uint32
+        if (offset and (layout.alignment - 1).uint32) != 0:
+          componentFail("unaligned canonical task.return area")
+        let mem = addr instance.vm.store.mems[memoryAddress]
+        mem[].checkMemoryRange(offset.uint64, layout.size.uint32)
+        value = readAbiArgument(mem[], offset.uint64, slot, encoding)
+      else:
+        let access = AbiAccess(vm: addr instance.vm, execution: instance.execution,
+          memoryAddress: memoryAddress, encoding: encoding)
+        var offset = 0
+        value = readFlatSlot(access, slot, args, offset)
+      if expected[].hasResourceResult(): instance.decodeOwnedResult(target, value)
+      task.values.add(move value)
+    elif args.len != 0:
+      componentFail("canonical task.return argument count mismatch")
+    task[].returnTaskResult()
+
 proc lowerResourceHandle(access: AbiAccess, slot: CanonicalSlot,
                          value: ComponentValue): uint32 =
   if access.resourceOwner == nil or value.resource == nil:
@@ -8039,8 +10031,18 @@ proc lowerResourceHandle(access: AbiAccess, slot: CanonicalSlot,
   let instance = cast[ComponentInstance](access.resourceOwner)
   let index = resourceIndex(instance.handleTypes, slot.resourceType.uint32)
   if index < 0: componentFail("unknown canonical handle type")
-  if slot.kind == cpOwnedResource: instance.transferOwner(index.uint32, value.resource)
-  else: instance.lowerBorrow(index.uint32, value.resource)
+  if slot.kind != cpOwnedResource:
+    return instance.lowerBorrow(index.uint32, value.resource)
+  let resource = value.resource
+  when defined(wasmComponentHostEndpoints):
+    if access.endpointMoves != nil:
+      var receipt = EndpointLoweredHandle(isResource: true, resourceType: index.uint32,
+        resource: resource, definer: resource.owner, graph: resource.graph)
+      result = instance.transferOwner(index.uint32, resource)
+      receipt.handle = result
+      access.endpointMoves[].add(move receipt)
+      return
+  instance.transferOwner(index.uint32, resource)
 
 proc validateHostResourceResult(instance: ComponentInstance, slot: CanonicalSlot,
                                 value: var ComponentValue): uint32 =
@@ -8049,7 +10051,7 @@ proc validateHostResourceResult(instance: ComponentInstance, slot: CanonicalSlot
   let collect = proc(leaf: CanonicalSlot, value: var ComponentValue) =
     instance.collectHostResource(leaf, value, prepared)
   visitResourceLeaves(slot, value, collect)
-  prepared.owners.len.uint32
+  prepared.preparedHandleCount()
 
 proc resolveLoweredResult(destination: ptr LoweredResult, returned: var seq[ComponentValue]) =
   let sig = destination.signature
@@ -8061,15 +10063,13 @@ proc resolveLoweredResult(destination: ptr LoweredResult, returned: var seq[Comp
   let access = destination.access
   if access.resourceOwner != nil and sig[].hasResourceResult():
     let instance = cast[ComponentInstance](access.resourceOwner)
-    let owners = instance.validateHostResourceResult(resultSlot(sig[]), returned[0])
-    if owners > 0 and not instance.resources.table.hasResourceCapacity(owners):
-      componentFail("component resource table capacity exceeded")
+    instance.requireHandleCapacity(instance.validateHostResourceResult(resultSlot(sig[]), returned[0]))
   destination.values[] = lowerAbiResult(access[], sig[], returned[0], destination.returnPointer)
 
 proc invokeResourceLowering(instance: ComponentInstance, callback: ComponentHostFunc,
     target: ComponentCallTarget, args: var seq[ComponentValue], destination: ptr LoweredResult) =
   var lends: seq[ResourceLend]
-  defer: instance.endLends(lends)
+  defer: instance.resources.releaseLends(lends)
   let decode = proc(slot: CanonicalSlot, value: var ComponentValue) =
     instance.decodeResourceLeaf(slot, value, lends)
   for i in 0 ..< args.len:
@@ -8079,12 +10079,12 @@ proc invokeResourceLowering(instance: ComponentInstance, callback: ComponentHost
 proc prepareIndirectArguments(instance: ComponentInstance, exp: ComponentExport,
                               args: openArray[ComponentValue]): seq[WasmValue] =
   let area = exp.signature.paramArea
-  let access = AbiAccess(vm: addr instance.vm, mayLeave: instance.mayLeave,
+  let access = AbiAccess(vm: addr instance.vm, execution: instance.execution,
     memoryAddress: instance.coreExport(exp.coreSources[clsMemory], exp.memoryName, ekMemory),
     reallocAddress: instance.coreExport(exp.coreSources[clsRealloc], exp.reallocName, ekFunc),
     encoding: exp.stringEncoding, resourceOwner: cast[pointer](instance))
   try:
-    let base = instance.vm.canonicalRealloc(access.mayLeave, access.memoryAddress,
+    let base = instance.vm.canonicalRealloc(access.execution, access.memoryAddress,
       access.reallocAddress, 0, 0, area.layout.size, area.layout.alignment)
     for i, arg in args:
       let slot = unsafeAddr area.slots[i]
@@ -8099,7 +10099,7 @@ proc prepareIndirectArguments(instance: ComponentInstance, exp: ComponentExport,
 
 proc lowerList(instance: ComponentInstance, exp: ComponentExport, element: ref CanonicalSlot,
                value: ComponentValue, args: var seq[WasmValue]) =
-  let access = AbiAccess(vm: addr instance.vm, mayLeave: instance.mayLeave,
+  let access = AbiAccess(vm: addr instance.vm, execution: instance.execution,
     memoryAddress: instance.coreExport(exp.coreSources[clsMemory], exp.memoryName, ekMemory),
     reallocAddress: instance.coreExport(exp.coreSources[clsRealloc], exp.reallocName, ekFunc),
     encoding: exp.stringEncoding, resourceOwner: cast[pointer](instance))
@@ -8119,13 +10119,13 @@ proc liftList(instance: ComponentInstance, exp: ComponentExport,
   let (offset, count) = instance.readPair(exp, value)
   let memoryAddress = instance.coreExport(exp.coreSources[clsMemory], exp.memoryName, ekMemory)
   readAbiPair(instance.vm.store.mems[memoryAddress], offset, count,
-    cpList, exp.stringEncoding, exp.signature.resultShape.listElement)
+    exp.signature.resultType, exp.stringEncoding, exp.signature.resultShape.listElement)
 
 proc lowerAggregate(instance: ComponentInstance, exp: ComponentExport, slot: CanonicalSlot,
                     value: ComponentValue, args: var seq[WasmValue]) =
   let memory = exp.coreSources[clsMemory]
   let realloc = exp.coreSources[clsRealloc]
-  let access = AbiAccess(vm: addr instance.vm, mayLeave: instance.mayLeave,
+  let access = AbiAccess(vm: addr instance.vm, execution: instance.execution,
     memoryAddress: (if memory == 0: -1 else: instance.coreExport(memory, exp.memoryName, ekMemory)),
     reallocAddress: (if realloc == 0: -1 else: instance.coreExport(realloc, exp.reallocName, ekFunc)),
     encoding: exp.stringEncoding, resourceOwner: cast[pointer](instance))
@@ -8138,9 +10138,8 @@ proc lowerAggregate(instance: ComponentInstance, exp: ComponentExport, slot: Can
     instance.lockStore()
     raise
 
-proc invokePreparedLift(instance: ComponentInstance, exp: ComponentExport,
-    args: openArray[ComponentValue], foreignBorrows: uint32,
-    destination: ptr LoweredResult): seq[ComponentValue] =
+proc prepareCoreArguments(instance: ComponentInstance, exp: ComponentExport,
+    args: openArray[ComponentValue]): seq[WasmValue] =
   var coreArgs: seq[WasmValue]
   if exp.signature.paramsUseMemoryArea():
     coreArgs = instance.prepareIndirectArguments(exp, args)
@@ -8151,6 +10150,10 @@ proc invokePreparedLift(instance: ComponentInstance, exp: ComponentExport,
         let handle = lowerResourceHandle(AbiAccess(resourceOwner: cast[pointer](instance)),
           parameterSlot(exp.signature, i), arg)
         coreArgs.add(wasmI32(cast[int32](handle)))
+      elif arg.kind == cpErrorContext:
+        when defined(wasmComponentErrorContext):
+          coreArgs.add(wasmI32(cast[int32](instance.lowerErrorContext(arg))))
+        else: componentFail("component error-context is disabled")
       elif arg.kind == cpString:
         try:
           instance.lowerString(exp, arg, coreArgs)
@@ -8168,9 +10171,9 @@ proc invokePreparedLift(instance: ComponentInstance, exp: ComponentExport,
             if arg.kind == cpU32List: cpU32 else: cpU64)
         except WasmTrap as e:
           componentFail("canonical integer list allocation trap: " & e.msg)
-      elif arg.kind == cpList:
+      elif arg.kind in {cpList, cpMap}:
         instance.lowerList(exp, exp.signature.paramArea.slots[i].listElement, arg, coreArgs)
-      elif arg.kind in {cpRecord, cpTuple} + CanonicalVariants:
+      elif arg.kind in {cpRecord, cpTuple, cpFixedList, cpFuture, cpStream} + CanonicalVariants:
         instance.lowerAggregate(exp, exp.signature.paramArea.slots[i], arg, coreArgs)
       elif arg.kind == cpFlags:
         if (arg.bits and not flagMask(exp.signature.paramArea.slots[i].cases.len).uint64) != 0:
@@ -8178,49 +10181,80 @@ proc invokePreparedLift(instance: ComponentInstance, exp: ComponentExport,
         coreArgs.add(wasmI32(cast[int32](arg.bits.uint32)))
       else:
         coreArgs.add(lower(arg))
-  let address = instance.coreExport(exp.coreSources[clsFunction],
-                                    exp.coreName, ekFunc)
+  move coreArgs
+
+proc liftCoreResults(instance: ComponentInstance, exp: ComponentExport,
+    values: openArray[WasmValue]): seq[ComponentValue] =
+  if values.len != exp.signature.hasResult.int:
+    componentFail("canonical result arity mismatch")
+  if values.len == 0: return
+  let value = values[0]
+  case exp.signature.resultType
+  of cpOwnedResource:
+    result.add(ComponentValue(kind: cpOwnedResource, bits: value.i32.uint32))
+  of cpFuture, cpStream, cpErrorContext:
+    result.add(ComponentValue(kind: exp.signature.resultType, bits: value.i32.uint32))
+  of cpString: result.add(instance.liftString(exp, value))
+  of cpBytes: result.add(instance.liftBytes(exp, value))
+  of cpU32List, cpU64List:
+    result.add(instance.liftIntList(exp, value,
+      if exp.signature.resultType == cpU32List: 4 else: 8,
+      exp.signature.resultType,
+      if exp.signature.resultType == cpU32List: cpU32 else: cpU64))
+  of cpList, cpMap:
+    result.add(instance.liftList(exp, value))
+  of cpRecord, cpTuple, cpFixedList:
+    result.add(instance.liftAggregate(exp, value, exp.signature.resultShape[]))
+  of cpFlags:
+    if value.kind != wvkI32: componentFail("canonical flags result type mismatch")
+    result.add(ComponentValue(kind: cpFlags,
+      bits: (value.i32.uint32 and flagMask(exp.signature.resultShape.cases.len)).uint64))
+  of cpOption, cpVariant, cpEnum, cpResult:
+    result.add(instance.liftVariant(exp, value, exp.signature.resultShape[]))
+  else:
+    result.add(lift(value, exp.signature.resultType))
+  if exp.signature.hasResourceResult():
+    instance.decodeOwnedResult(resultSlot(exp.signature), result[0])
+
+proc finishLift(instance: ComponentInstance, exp: ComponentExport,
+    values: openArray[WasmValue]) =
+  if exp.coreSources[clsPostReturn] != 0:
+    let address = instance.coreExport(exp.coreSources[clsPostReturn], exp.postReturnName, ekFunc)
+    instance.runPostReturn(address, values)
+
+when defined(wasmComponentThreads):
+  proc invokeSynchronousGuestCore(instance: ComponentInstance, address: int,
+      args: openArray[WasmValue]): seq[WasmValue]
+
+  proc invokeGuestDestructor(instance: ComponentInstance, address: int,
+      representation: WasmValue): bool =
+    let store = instance.links.store
+    if instance.activeEntries.int >= MaxComponentCallDepth or
+        store.callDepth >= MaxComponentCallDepth:
+      componentFail("component call depth exceeds profile limit")
+    inc instance.activeEntries
+    inc store.callDepth
+    defer:
+      dec store.callDepth
+      dec instance.activeEntries
+    withDirectGuestThread(instance):
+      result = instance.invokeSynchronousGuestCore(address, [representation]).len == 0
+
+proc invokePreparedLift(instance: ComponentInstance, exp: ComponentExport,
+    args: openArray[ComponentValue], foreignBorrows: uint32,
+    destination: ptr LoweredResult): seq[ComponentValue] =
+  let coreArgs = instance.prepareCoreArguments(exp, args)
+  let address = instance.coreExport(exp.coreSources[clsFunction], exp.coreName, ekFunc)
   try:
-    let values = instance.vm.execute(address, coreArgs)
+    let values = when defined(wasmComponentThreads):
+        instance.invokeSynchronousGuestCore(address, coreArgs)
+      else: instance.vm.execute(address, coreArgs)
     if foreignBorrows > 0 and instance.resources.table.hasScopedBorrows(instance.activeEntries.uint32):
       componentFail("canonical call returned with a live borrow handle")
-    if values.len != (if exp.signature.hasResult: 1 else: 0):
-      componentFail("canonical result arity mismatch")
-    if exp.signature.hasResult:
-      if exp.signature.resultType == cpOwnedResource:
-        result.add(ComponentValue(kind: cpOwnedResource, bits: values[0].i32.uint32))
-      elif exp.signature.resultType == cpString:
-        result.add(instance.liftString(exp, values[0]))
-      elif exp.signature.resultType == cpBytes:
-        result.add(instance.liftBytes(exp, values[0]))
-      elif exp.signature.resultType in {cpU32List, cpU64List}:
-        result.add(instance.liftIntList(exp, values[0],
-          if exp.signature.resultType == cpU32List: 4 else: 8,
-          exp.signature.resultType,
-          if exp.signature.resultType == cpU32List: cpU32 else: cpU64))
-      elif exp.signature.resultType == cpList:
-        result.add(instance.liftList(exp, values[0]))
-      elif exp.signature.resultType in {cpRecord, cpTuple}:
-        result.add(instance.liftRecord(exp, values[0], exp.signature.resultShape[]))
-      elif exp.signature.resultType == cpFlags:
-        if values[0].kind != wvkI32:
-          componentFail("canonical flags result type mismatch")
-        result.add(ComponentValue(kind: cpFlags,
-          bits: (values[0].i32.uint32 and
-            flagMask(exp.signature.resultShape.cases.len)).uint64))
-      elif exp.signature.resultType in {cpOption, cpVariant, cpEnum,
-                                        cpResult}:
-        result.add(instance.liftVariant(exp, values[0], exp.signature.resultShape[]))
-      else:
-        result.add(lift(values[0], exp.signature.resultType))
-      if exp.signature.hasResourceResult():
-        instance.decodeOwnedResult(resultSlot(exp.signature), result[0])
+    result = instance.liftCoreResults(exp, values)
     # Resolving a synchronous guest call includes lowering into the caller.
     if destination != nil: resolveLoweredResult(destination, result)
-    if exp.coreSources[clsPostReturn] != 0:
-      let postAddress = instance.coreExport(exp.coreSources[clsPostReturn],
-                                            exp.postReturnName, ekFunc)
-      instance.runPostReturn(postAddress, values)
+    instance.finishLift(exp, values)
   except WasmTrap as e:
     instance.lockStore()
     componentFail("component core trap: " & e.msg)
@@ -8232,9 +10266,7 @@ proc invokeLiftedResources(instance: ComponentInstance, exp: ComponentExport,
     args: openArray[ComponentValue], destination: ptr LoweredResult): seq[ComponentValue] =
   var inspect = @args
   let prepared = instance.collectHostResources(exp.signature, inspect)
-  let handles = prepared.owners.len.uint32 + prepared.foreignBorrows
-  if handles > 0 and not instance.resources.table.hasResourceCapacity(handles):
-    componentFail("component resource table capacity exceeded")
+  instance.requireHandleCapacity(prepared.preparedHandleCount())
   pinBorrowArguments(prepared)
   defer:
     if prepared.foreignBorrows > 0:
@@ -8246,12 +10278,32 @@ proc invokeLiftedResources(instance: ComponentInstance, exp: ComponentExport,
     instance.lockStore()
     raise
 
+when defined(wasmComponentAsyncCallbacks):
+  proc stackfulLift(exp: ComponentExport): bool {.inline.} =
+    when defined(wasmComponentStackful): exp.stackful
+    else: false
+
+  proc usesAsyncLiftAbi(exp: ComponentExport): bool {.inline.} =
+    exp.callbackSource != 0 or exp.stackfulLift()
+
+  proc scheduledLift(exp: ComponentExport): bool {.inline.} =
+    exp.target == ctCore and (exp.usesAsyncLiftAbi() or (when defined(wasmComponentStackful):
+      exp.signature.asyncSignature() and ruBorrow notin exp.signature.parameterResources()
+      else: false))
+
+  proc invokeImmediateCallback(instance: ComponentInstance, entry: ptr ComponentExport,
+      args: openArray[ComponentValue], destination: ptr LoweredResult): seq[ComponentValue]
+
 proc invokeLifted(instance: ComponentInstance, exp: ComponentExport,
     args: openArray[ComponentValue], guestEntry: bool,
     destination: ptr LoweredResult): seq[ComponentValue] =
+  when defined(wasmComponentAsyncCallbacks):
+    if exp.usesAsyncLiftAbi():
+      if destination == nil: componentFail("canonical callback requires a polled invocation")
+      return instance.invokeImmediateCallback(unsafeAddr exp, args, destination)
   if instance.activeEntries != 0 and not guestEntry:
     componentFail("canonical reentry into active component")
-  if not instance.mayLeave[]:
+  if not instance.execution.mayLeave:
     componentFail("canonical entry during realloc or post-return")
   if instance.activeEntries.int >= MaxComponentCallDepth:
     instance.lockStore()
@@ -8259,16 +10311,20 @@ proc invokeLifted(instance: ComponentInstance, exp: ComponentExport,
   checkArgumentKinds(exp.signature, args)
   inc instance.activeEntries
   defer: dec instance.activeEntries
-  if exp.signature.parameterResources() != {}:
-    instance.invokeLiftedResources(exp, args, destination)
-  else:
-    instance.invokePreparedLift(exp, args, 0, destination)
+  withFreshContext(instance.execution):
+    template invokeDirect() =
+      if exp.signature.parameterResources() != {}:
+        result = instance.invokeLiftedResources(exp, args, destination)
+      else:
+        result = instance.invokePreparedLift(exp, args, 0, destination)
+    when defined(wasmComponentThreads):
+      withDirectGuestThread(instance): invokeDirect()
+    else: invokeDirect()
 
-proc invokeFunction(instance: ComponentInstance, exp: ComponentExport,
-    args: openArray[ComponentValue], guestEntry: bool,
-    destination: ptr LoweredResult): seq[ComponentValue] =
+proc resolveInvocationTarget(instance: ComponentInstance, exp: ptr ComponentExport):
+    tuple[owner: ComponentInstance, entry: ptr ComponentExport] =
   var owner = instance
-  var entry = unsafeAddr exp
+  var entry = exp
   while true:
     case entry.target
     of ctCore: break
@@ -8281,6 +10337,12 @@ proc invokeFunction(instance: ComponentInstance, exp: ComponentExport,
       if target == nil: break
       owner = cast[ComponentInstance](target.owner)
       entry = target.entry
+  (owner, entry)
+
+proc invokeFunction(instance: ComponentInstance, exp: ComponentExport,
+    args: openArray[ComponentValue], guestEntry: bool,
+    destination: ptr LoweredResult): seq[ComponentValue] =
+  let (owner, entry) = instance.resolveInvocationTarget(unsafeAddr exp)
   if owner.isLocked:
     componentFail("component store locked after trap")
   if args.len != entry.signature.params.len:
@@ -8318,35 +10380,8 @@ proc invokeFunction(instance: ComponentInstance, exp: ComponentExport,
       owner.lockStore()
       raise
 
-proc invoke*(instance: ComponentInstance, name: string,
-             args: openArray[ComponentValue]): seq[ComponentValue] =
-  ## Invoke the typed export directly, following any component function aliases
-  ## to the instance where the function was defined.
-  if instance != nil:
-    if instance.isLocked:
-      componentFail("component store locked after trap")
-    for i in 0 ..< instance.exports.len:
-      if instance.exports[i].name == name:
-        return instance.invokeFunction(instance.exports[i], args)
-  componentFail("unknown component export")
-
-proc invokeInterface*(instance: ComponentInstance, name, methodName: string,
-                      args: openArray[ComponentValue]): seq[ComponentValue] =
-  ## Invoke a typed function exported under the named instance.
-  if instance != nil and instance.links != nil:
-    if instance.isLocked: componentFail("component store locked after trap")
-    for index in 0 ..< instance.links.interfaceExportCount():
-      let iface = instance.links.exportedInterface((index + 1).uint16)
-      if iface.name != name: continue
-      for i in 0 ..< iface.methods.len:
-        if iface.methods[i].name == methodName:
-          return instance.invokeFunction(iface.methods[i], args)
-      componentFail("unknown component interface function")
-  componentFail("unknown component interface")
-
-proc invokeInterface*(instance: ComponentInstance, path: openArray[string], methodName: string,
-                      args: openArray[ComponentValue]): seq[ComponentValue] =
-  ## Invoke a function under a path of instance exports.
+proc exportedComponentMethod(instance: ComponentInstance, path: openArray[string],
+    methodName: string): ptr ComponentExport =
   if instance == nil or instance.links == nil or path.len == 0:
     componentFail("unknown component interface")
   if instance.isLocked: componentFail("component store locked after trap")
@@ -8364,6 +10399,1610 @@ proc invokeInterface*(instance: ComponentInstance, path: openArray[string], meth
           break
     if next == nil: componentFail("unknown nested component interface: " & path[i])
     surface = next
-  for methodExport in surface.methods:
-    if methodExport.name == methodName: return instance.invokeFunction(methodExport, args)
+  for i, methodExport in surface.methods:
+    if methodExport.name == methodName: return addr surface.methods[i]
   componentFail("unknown component interface function")
+
+when defined(wasmComponentAsyncCallbacks):
+  const RunnableCallback = {ccsReady, ccsYielded, ccsWaiting, ccsCoreWaiting} +
+    (when defined(wasmComponentThreads): {ccsThreadsWaiting} else: {})
+  const TaskCancelledEvent = 6'u32
+
+  type ComponentAsyncEvent = tuple[code, handle, state: uint32]
+
+  proc resolved(task: ComponentSubtask): bool =
+    task.state notin {cstStarting, cstStarted}
+
+  proc publishSubtaskState(task: ComponentSubtask, state: ComponentSubtaskState) =
+    task.state = state
+    task.eventPending = task.handle != 0
+
+  proc deliverResolution(task: ComponentSubtask) =
+    task.lenders = nil
+    task.delivered = true
+
+  proc asyncSlot(instance: ComponentInstance, handle: uint32): ptr ComponentAsyncSlot =
+    if handle == 0 or handle > instance.asyncSlots.len.uint32:
+      componentFail("invalid canonical async handle")
+    addr instance.asyncSlots[handle.int - 1]
+
+  proc waitableSet(instance: ComponentInstance, handle: uint32): ComponentWaitSet =
+    result = instance.asyncSlot(handle).waitSet
+    if result == nil: componentFail("invalid canonical callback waitable set")
+
+  proc subtaskAt(instance: ComponentInstance, handle: uint32): ComponentSubtask =
+    result = instance.asyncSlot(handle).subtask
+    if result == nil: componentFail("invalid canonical subtask handle")
+
+  proc newAsyncSlot(instance: ComponentInstance, value: sink ComponentAsyncSlot): uint32 =
+    instance.initCanonicalHandles()
+    if not instance.resources.table.newAsyncHandle(result):
+      componentFail("component async handle capacity exceeded")
+    if result > instance.asyncSlots.len.uint32: instance.asyncSlots.setLen(result.int)
+    instance.asyncSlots[result.int - 1] = move value
+
+  proc releaseAsyncSlot(instance: ComponentInstance, handle: uint32) =
+    if not instance.resources.table.dropAsyncHandle(handle):
+      componentFail("invalid canonical async handle")
+    instance.asyncSlots[handle.int - 1] = ComponentAsyncSlot()
+
+  proc pendingEvent(instance: ComponentInstance, waitSet: uint32): ptr ComponentAsyncSlot =
+    for slot in instance.asyncSlots.mitems:
+      let task = slot.subtask
+      if task != nil and task.joined == waitSet and task.eventPending:
+        return addr slot
+      when ComponentEndpointsEnabled:
+        let endpoint = slot.endpoint
+        if endpoint != nil and endpoint.joined == waitSet and endpoint.eventPending:
+          return addr slot
+
+  proc takeSubtaskEvent(task: ComponentSubtask): ComponentAsyncEvent =
+    task.eventPending = false
+    if task.resolved(): task.deliverResolution()
+    (1'u32, task.handle, task.state.ord.uint32)
+
+  when ComponentEndpointsEnabled:
+    proc takeEndpointEvent(endpoint: ComponentEndpoint): ComponentAsyncEvent =
+      let isStream = endpoint.shape.kind == cpStream
+      result.code = (if isStream: 2'u32 else: 4'u32) + endpoint.writable.uint32
+      result.handle = endpoint.handle
+      if not isStream and endpoint.eventProgress != 0:
+        endpoint.state = fcDone
+      elif endpoint.other == nil:
+        endpoint.state = fcDone
+        result.state = 1
+      else:
+        if endpoint.state == fcCancelling: result.state = 2
+        endpoint.state = fcIdle
+      if isStream: result.state = result.state or (endpoint.eventProgress shl 4)
+      endpoint.eventPending = false
+      endpoint.buffer.active = false
+      when defined(wasmComponentHostEndpoints): endpoint.buffer.host = nil
+
+  proc takeEvent(instance: ComponentInstance, waitSet: uint32): ComponentAsyncEvent =
+    let slot = instance.pendingEvent(waitSet)
+    if slot == nil: return
+    when ComponentEndpointsEnabled:
+      if slot.endpoint != nil: return slot.endpoint.takeEndpointEvent()
+    slot.subtask.takeSubtaskEvent()
+
+  proc joinAsyncWaitable(instance: ComponentInstance, joined: var uint32, id: uint32) =
+    let next = if id == 0: nil else: instance.waitableSet(id)
+    if joined != 0: dec instance.waitableSet(joined).members
+    joined = id
+    if next != nil: inc next.members
+
+  proc joinWaitable(instance: ComponentInstance, task: ComponentSubtask, id: uint32) =
+    if task.cancelling: componentFail("canonical subtask is being cancelled")
+    when defined(wasmComponentStackful):
+      if task.cancelWaiter != nil and task.cancelWaiter[]:
+        componentFail("canonical subtask is being cancelled")
+    instance.joinAsyncWaitable(task.joined, id)
+
+  when ComponentEndpointsEnabled:
+    func sameEndpointType(left, right: CanonicalSlot): bool =
+      if left.kind != right.kind: return false
+      if left.listElement == right.listElement: return true
+      left.listElement != nil and right.listElement != nil and
+        left.listElement[] == right.listElement[]
+
+    proc endpointResourceIdentity(instance: ComponentInstance,
+        shape: CanonicalSlot): seq[EndpointResourceIdentity] =
+      if ruOwn notin shape.resources: return
+      var handles: seq[uint16]
+      collectResourceTypes(shape, handles)
+      for handle in handles:
+        let index = resourceIndex(instance.handleTypes, handle.uint32)
+        if index < 0: componentFail("unknown canonical endpoint payload resource type")
+        let binding = instance.resourceOrigin(index.uint32)
+        let definer = cast[ComponentInstance](binding.owner)
+        result.add((definer.resources, binding.resourceIndex))
+
+    proc endpointAt(instance: ComponentInstance, handle: uint32,
+        shape: CanonicalSlot, writable: bool): ComponentEndpoint =
+      result = instance.asyncSlot(handle).endpoint
+      if result == nil or result.writable != writable or
+          not sameEndpointType(result.shape[], shape):
+        componentFail("canonical " & endpointName(shape.kind) & " endpoint type mismatch")
+      if instance.endpointResourceIdentity(result.shape[]) != instance.endpointResourceIdentity(shape):
+        componentFail("canonical " & endpointName(shape.kind) & " endpoint type mismatch")
+
+    proc liftEndpointHandle(instance: ComponentInstance, slot: CanonicalSlot,
+                          handle: uint32): ComponentValue =
+      let endpoint = instance.endpointAt(handle, slot, writable = false)
+      if endpoint.state != fcIdle or endpoint.joined != 0:
+        componentFail("canonical " & endpointName(slot.kind) &
+          " transfer requires an idle, unjoined reader")
+      let token = ComponentEndpointValue(endpoint: endpoint,
+        payloadResources: instance.endpointResourceIdentity(slot))
+      endpoint.owner = nil
+      endpoint.handle = 0
+      instance.releaseAsyncSlot(handle)
+      ComponentValue(kind: slot.kind, endpoint: token)
+
+    proc validateEndpointValue(instance: ComponentInstance, slot: CanonicalSlot,
+                             value: ComponentValue) =
+      let token = value.endpoint
+      if token == nil or token.endpoint == nil:
+        componentFail("canonical " & endpointName(slot.kind) & " endpoint was already consumed or is invalid")
+      let endpoint = token.endpoint
+      if endpoint.owner != nil or endpoint.writable or endpoint.state != fcIdle or
+          not sameEndpointType(endpoint.shape[], slot) or
+          token.payloadResources != instance.endpointResourceIdentity(slot):
+        componentFail("canonical " & endpointName(slot.kind) & " endpoint type or owner mismatch")
+
+    proc dropLiftedEndpoint(value: ComponentValue, kind: ComponentPrim) =
+      if value.kind != kind or value.endpoint == nil or value.endpoint.endpoint == nil:
+        componentFail("canonical " & endpointName(kind) & " endpoint was already consumed or is invalid")
+      if value.endpoint.endpoint.state in {fcCopying, fcCancelling}:
+        componentFail("cannot drop a pending canonical " & endpointName(kind) & " endpoint")
+      value.endpoint.endpoint[].detachEndpoint()
+      value.endpoint.endpoint = nil
+      value.endpoint.payloadResources.setLen(0)
+
+    when defined(wasmComponentFutures):
+      proc dropComponentFuture*(value: ComponentValue) =
+        ## Release an unconsumed readable future held by the embedding.
+        value.dropLiftedEndpoint(cpFuture)
+
+    when defined(wasmComponentStreams):
+      proc dropComponentStream*(value: ComponentValue) =
+        ## Release an unconsumed readable stream held by the embedding.
+        value.dropLiftedEndpoint(cpStream)
+
+    proc lowerEndpointHandle(access: AbiAccess, slot: CanonicalSlot,
+                           value: ComponentValue): uint32 =
+      if access.resourceOwner == nil:
+        componentFail("canonical endpoint lowering requires an active component")
+      let instance = cast[ComponentInstance](access.resourceOwner)
+      instance.validateEndpointValue(slot, value)
+      let endpoint = value.endpoint.endpoint
+      result = instance.newAsyncSlot(ComponentAsyncSlot(endpoint: endpoint))
+      when defined(wasmComponentHostEndpoints):
+        if access.endpointMoves != nil:
+          access.endpointMoves[].add(EndpointLoweredHandle(handle: result, isResource: false,
+            token: value.endpoint, endpoint: endpoint, shape: endpoint.shape,
+            payloadResources: value.endpoint.payloadResources))
+      endpoint.owner = access.resourceOwner
+      endpoint.handle = result
+      endpoint.shape = newSlot(slot)
+      # Every lift creates a separate ticket. A copy of an older value
+      # remains consumed even after the endpoint crosses another boundary.
+      value.endpoint.endpoint = nil
+      value.endpoint.payloadResources.setLen(0)
+
+    proc hasEndpointWaiter(endpoint: ComponentEndpoint): bool =
+      when defined(wasmComponentStackful):
+        endpoint.syncWaiter != nil and endpoint.syncWaiter[]
+      else: false
+
+    const EndpointNumbers = {cpU8, cpS8, cpU16, cpS16, cpU32, cpS32, cpU64, cpS64, cpF32, cpF64}
+    const MaxEndpointBufferLength = (1'u32 shl 28) - 1
+
+    func remaining(buffer: EndpointGuestBuffer): uint32 =
+      buffer.count - buffer.progress
+
+    proc notifyEndpoint(endpoint: ptr ComponentEndpointState, progress: uint32) =
+      endpoint.eventProgress = progress
+      endpoint.eventPending = true
+
+    func bufferOffset(buffer: EndpointGuestBuffer, stride: uint64): uint64 =
+      buffer.offset.uint64 + buffer.progress.uint64 * stride
+
+    proc liftEndpointBuffer(writer: ptr ComponentEndpointState, buffer: EndpointGuestBuffer,
+        count: uint32, stride: uint64): ComponentValue =
+      let source = cast[ComponentInstance](writer.owner)
+      let sourceShape = writer.shape.listElement
+      var budget = listBudget()
+      result = readGenericList(source.vm.store.mems[buffer.memoryAddress],
+        buffer.bufferOffset(stride), count, cpList, sourceShape, buffer.encoding, addr budget)
+      if sourceShape.resources != {}:
+        source.decodeOwnedResult(CanonicalSlot(kind: cpList, listElement: sourceShape,
+          resources: sourceShape.resources), result)
+
+    when defined(wasmComponentHostEndpoints):
+      proc rollbackEndpointLowering(dest: ComponentInstance, moves: var seq[EndpointLoweredHandle]) =
+        for i in countdown(moves.high, 0):
+          let receipt = addr moves[i]
+          when defined(wasmComponentErrorContext):
+            if receipt.isErrorContext:
+              if not dest.resources.table.dropErrorContextHandle(receipt.handle):
+                componentFail("could not roll back component error-context handle")
+              continue
+          if receipt.isResource:
+            var representation: uint64
+            let status = dest.resources.table.takeOwnedRepresentation(
+              receipt.handle, receipt.resourceType, representation)
+            if status != crOk: componentFail("could not roll back component resource handle")
+            receipt.resource.owner = move receipt.definer
+            receipt.resource.graph = move receipt.graph
+            receipt.resource.live = true
+            inc receipt.resource.owner.outstandingOwners
+          else:
+            dest.releaseAsyncSlot(receipt.handle)
+            receipt.endpoint.owner = nil
+            receipt.endpoint.handle = 0
+            receipt.endpoint.shape = move receipt.shape
+            receipt.token.endpoint = move receipt.endpoint
+            receipt.token.payloadResources = move receipt.payloadResources
+
+    proc lowerEndpointBuffer(reader: ptr ComponentEndpointState, buffer: EndpointGuestBuffer,
+        values: var ComponentValue, count: uint32, stride: uint64, transactional = false) =
+      let dest = cast[ComponentInstance](reader.owner)
+      let payload = reader.shape.listElement
+      if payload.resources != {}:
+        let destList = CanonicalSlot(kind: cpList, listElement: payload,
+          resources: payload.resources)
+        dest.requireHandleCapacity(dest.validateHostResourceResult(destList, values))
+      var access = AbiAccess(vm: addr dest.vm, execution: dest.execution,
+        memoryAddress: buffer.memoryAddress, reallocAddress: buffer.reallocAddress,
+        encoding: buffer.encoding, resourceOwner: reader.owner)
+      let offset = buffer.bufferOffset(stride)
+      var budget = listBudget()
+      (addr budget).charge(count.uint64, count.uint64 * stride)
+      template storeValues() =
+        for i, value in values.fields:
+          writeAbiArgument(access, offset + i.uint64 * stride, payload[], value, addr budget)
+      when defined(wasmComponentHostEndpoints):
+        if transactional and payload.resources != {}:
+          var moves: seq[EndpointLoweredHandle]
+          access.endpointMoves = addr moves
+          try:
+            storeValues()
+          except CatchableError:
+            dest.rollbackEndpointLowering(moves)
+            raise
+          return
+      storeValues()
+
+    proc copyEndpointElements(reader, writer: ptr ComponentEndpointState,
+        incoming, outgoing: EndpointGuestBuffer, count: uint32) =
+      let payload = reader.shape.listElement
+      if payload == nil: return
+      let source = cast[ComponentInstance](writer.owner)
+      let dest = cast[ComponentInstance](reader.owner)
+      let stride = canonicalSlotLayout(payload[]).size.uint64
+      when defined(wasmComponentHostEndpoints):
+        if outgoing.host != nil or incoming.host != nil:
+          var values: ComponentValue
+          if outgoing.host == nil:
+            values = liftEndpointBuffer(writer, outgoing, count, stride)
+          else:
+            values = ComponentValue(kind: cpList, fields: newSeqOfCap[ComponentValue](count.int))
+            for i in 0 ..< count.int:
+              values.fields.add(outgoing.host.values[outgoing.progress.int + i])
+          if incoming.host == nil:
+            lowerEndpointBuffer(reader, incoming, values, count, stride, transactional = true)
+          else:
+            for value in values.fields.mitems: incoming.host.values.add(move value)
+          if outgoing.host != nil:
+            for i in 0 ..< count.int:
+              reset(outgoing.host.values[outgoing.progress.int + i])
+          return
+      let src = outgoing.bufferOffset(stride)
+      let dst = incoming.bufferOffset(stride)
+      if payload.kind in EndpointNumbers:
+        let backwards = source == dest and incoming.memoryAddress == outgoing.memoryAddress and
+          dst > src and dst - src < count.uint64 * stride
+        for i in 0 ..< count:
+          let displacement = (if backwards: count - 1 - i else: i).uint64 * stride
+          let value = readAbiScalar(source.vm.store.mems[outgoing.memoryAddress],
+            src + displacement, payload.kind)
+          writeAbiInt(dest.vm.store.mems[incoming.memoryAddress], dst + displacement,
+            stride.int, value.bits)
+        return
+      var values = liftEndpointBuffer(writer, outgoing, count, stride)
+      lowerEndpointBuffer(reader, incoming, values, count, stride)
+
+    proc beginEndpointCopy(endpoint: ptr ComponentEndpointState, pending: EndpointGuestBuffer) =
+      endpoint.state = fcCopying
+      let other = endpoint.other
+      if other == nil: return  # Its drop already placed an event on this end.
+      if not other.buffer.active:
+        endpoint.buffer = pending
+        return
+      let payload = endpoint.shape.listElement
+      if endpoint.owner != nil and endpoint.owner == other.owner and payload != nil and
+          payload.kind notin EndpointNumbers:
+        componentFail("a local " & endpointName(endpoint.shape.kind) &
+          " rendezvous requires a unit or numeric payload")
+      let count = min(pending.remaining(), other.buffer.remaining())
+      if count != 0:
+        if endpoint.writable: copyEndpointElements(other, endpoint, other.buffer, pending, count)
+        else: copyEndpointElements(endpoint, other, pending, other.buffer, count)
+        other.buffer.progress += count
+        other.notifyEndpoint(other.buffer.progress)
+        other.buffer.active = other.buffer.remaining() != 0
+        endpoint.notifyEndpoint(pending.progress + count)
+      elif pending.remaining() != 0 or (not endpoint.writable and other.buffer.remaining() == 0):
+        # A pending zero-length peer is notified. When both are zero the
+        # writer is always the one that is notified first.
+        other.notifyEndpoint(0)
+        other.buffer.active = false
+        endpoint.buffer = pending
+      else:
+        endpoint.notifyEndpoint(0)
+
+    proc copyEndpoint(instance: ComponentInstance, endpoint: ComponentEndpoint,
+        buffer: EndpointGuestBuffer, asynchronous: bool): seq[WasmValue] =
+      let kind = endpoint.shape.kind
+      if endpoint.state != fcIdle:
+        componentFail("canonical " & endpointName(kind) & " endpoint is not idle")
+      if not asynchronous and endpoint.joined != 0:
+        componentFail("synchronous " & endpointName(kind) & " copy cannot use a joined endpoint")
+      if buffer.count > MaxEndpointBufferLength:
+        componentFail("canonical stream buffer length out of range")
+      let payload = endpoint.shape.listElement
+      if payload != nil:
+        let layout = canonicalSlotLayout(payload[])
+        if buffer.offset.uint64 mod layout.alignment.uint64 != 0:
+          componentFail("unaligned canonical " & endpointName(kind) & " buffer")
+        let bytes = buffer.count.uint64 * layout.size.uint64
+        if bytes > uint32.high: componentFail("canonical endpoint buffer size out of range")
+        instance.vm.store.mems[buffer.memoryAddress].checkMemoryRange(
+          buffer.offset.uint64, bytes.uint32)
+      (addr endpoint[]).beginEndpointCopy(buffer)
+      if endpoint.eventPending:
+        return @[wasmI32(cast[int32](endpoint.takeEndpointEvent().state))]
+      if asynchronous: return @[wasmI32(-1)]
+      when defined(wasmComponentStackful):
+        if instance.vm.canSuspendHostCall():
+          let registration = new(ref ComponentCoreReservation)
+          new(registration.exclusive)
+          registration.exclusive[] = true
+          endpoint.syncWaiter = registration.exclusive
+          return instance.vm.suspendHostCall(WasmHostWait(
+            ready: proc(): bool = endpoint.eventPending,
+            finish: proc(): seq[WasmValue] =
+              registration.exclusive[] = false
+              @[wasmI32(cast[int32](endpoint.takeEndpointEvent().state))]))
+      componentFail("cannot block a synchronous task before returning")
+
+    proc cancelEndpointCopy(endpoint: ComponentEndpoint) =
+      endpoint.state = fcCancelling
+      if not endpoint.eventPending: (addr endpoint[]).notifyEndpoint(0)
+
+    when defined(wasmComponentHostEndpoints):
+      type HostPayloadResources = seq[tuple[index: uint16, identity: EndpointResourceIdentity]]
+
+      proc requireHostEndpoint(token: ComponentHostEndpoint): ComponentEndpoint =
+        if token == nil or token.endpoint == nil or token.endpoint.owner != nil:
+          componentFail("invalid or consumed host endpoint")
+        token.endpoint
+
+      proc hostGuestPeer(endpoint: ComponentEndpoint): ComponentInstance =
+        if endpoint.other == nil or endpoint.other.owner == nil: return nil
+        result = cast[ComponentInstance](endpoint.other.owner)
+        if result.isLocked:
+          # Dropping the guest end publishes a notification on the host end.
+          endpoint.other[].detachEndpoint()
+          result = nil
+
+      proc hostEndpoint*(value: ComponentValue): ComponentHostEndpoint =
+        ## Any alias obtained here shares the readable value's ownership.
+        if not endpointEnabled(value.kind) or value.endpoint == nil:
+          componentFail("expected a readable endpoint value")
+        discard value.endpoint.requireHostEndpoint()
+        value.endpoint
+
+      proc newHostPair(shape: ref CanonicalSlot, resources: seq[EndpointResourceIdentity]):
+          tuple[readable: ComponentValue, writable: ComponentHostEndpoint] =
+        if not endpointEnabled(shape.kind): componentFail("expected an enabled endpoint type")
+        let reader = ComponentEndpoint(shape: shape)
+        let writer = ComponentEndpoint(shape: shape, writable: true)
+        reader.other = addr writer[]
+        writer.other = addr reader[]
+        (ComponentValue(kind: shape.kind, endpoint: ComponentEndpointValue(
+          endpoint: reader, payloadResources: resources)),
+          ComponentEndpointValue(endpoint: writer, payloadResources: resources))
+
+      proc newComponentEndpointPair*(kind: ComponentPrim):
+          tuple[readable: ComponentValue, writable: ComponentHostEndpoint] =
+        ## Create a unit future or stream.
+        newHostPair(newSlot(CanonicalSlot(kind: kind, resources: {ruEndpoint})), @[])
+
+      proc newComponentEndpointPair*(kind, element: ComponentPrim):
+          tuple[readable: ComponentValue, writable: ComponentHostEndpoint] =
+        ## Create an endpoint with a primitive payload.
+        if element notin PrimitiveValues or (kind == cpStream and element == cpChar) or
+            (element == cpErrorContext and not defined(wasmComponentErrorContext)):
+          componentFail("invalid primitive endpoint payload")
+        let payload = plainValueSlot(element)
+        newHostPair(newSlot(CanonicalSlot(kind: kind, resources: {ruEndpoint} + payload.resources,
+          listElement: newSlot(payload))), @[])
+
+      proc newComponentEndpointPair*(instance: ComponentInstance, name: string,
+          parameter: int, path: openArray[string] = []):
+          tuple[readable: ComponentValue, writable: ComponentHostEndpoint] =
+        ## Use the declared type of an export parameter, or its result at -1.
+        if instance == nil or instance.isLocked: componentFail("component cannot provide an endpoint type")
+        var exportEntry: ptr ComponentExport
+        if path.len != 0:
+          exportEntry = instance.exportedComponentMethod(path, name)
+        else:
+          for i, entry in instance.exports:
+            if entry.name == name:
+              exportEntry = addr instance.exports[i]
+              break
+        if exportEntry == nil: componentFail("unknown component export")
+        let (owner, entry) = instance.resolveInvocationTarget(exportEntry)
+        let sig = addr entry.signature
+        let slot = if parameter == -1 and sig.hasResult: resultSlot(sig[])
+          elif parameter >= 0 and parameter < sig.params.len: parameterSlot(sig[], parameter)
+          else: componentFail("component endpoint signature index out of range")
+        if not endpointEnabled(slot.kind): componentFail("expected an enabled endpoint type")
+        newHostPair(newSlot(slot), owner.endpointResourceIdentity(slot))
+
+      proc hostResourceIdentity(resources: HostPayloadResources, index: uint16):
+          EndpointResourceIdentity =
+        for item in resources:
+          if item.index == index: return item.identity
+        componentFail("unknown host endpoint resource type")
+
+      proc validateBufferedResource(slot: CanonicalSlot, value: ComponentValue,
+          resources: HostPayloadResources, prepared: var PreparedResources) =
+        when defined(wasmComponentErrorContext):
+          if slot.kind == cpErrorContext:
+            if value.errorContext == nil: componentFail("invalid component error-context value")
+            return
+        if slot.kind in {cpFuture, cpStream}:
+          let token = value.hostEndpoint()
+          let endpoint = token.requireHostEndpoint()
+          if endpoint.state != fcIdle or endpoint.writable or not sameEndpointType(endpoint.shape[], slot):
+            componentFail("host endpoint payload type or state mismatch")
+          var indices: seq[uint16]
+          collectResourceTypes(slot, indices)
+          var expected: seq[EndpointResourceIdentity]
+          for index in indices: expected.add(resources.hostResourceIdentity(index))
+          if token.payloadResources != expected or token in prepared.endpointValues:
+            componentFail("host endpoint payload resource identity or ownership mismatch")
+          prepared.endpointValues.add(token)
+          return
+        let owner = value.resource
+        if slot.kind != cpOwnedResource or not value.ownsResource or owner == nil or
+            not owner.live or owner.owner == nil or owner.owner.isLocked or owner.lends != 0 or
+            owner in prepared.owners or (owner.owner.resources, owner.resourceIndex) !=
+              resources.hostResourceIdentity(slot.resourceType):
+          componentFail("host endpoint resource payload type or ownership mismatch")
+        prepared.owners.add(owner)
+
+      proc checkHostPayload(slot: CanonicalSlot, value: ComponentValue, budget: ptr AbiListBudget) =
+        if value.kind != slot.kind: componentFail("host endpoint payload type mismatch")
+        case slot.kind
+        of cpRecord, cpTuple:
+          if value.fields.len != slot.recordShape.fields.len:
+            componentFail("host endpoint record field count mismatch")
+          budget.charge(value.fields.len.uint64, 0)
+          for i, field in slot.recordShape.fields:
+            checkHostPayload(fieldSlot(field), value.fields[i], budget)
+        of cpFixedList, cpList, cpMap:
+          if slot.kind == cpFixedList: requireFixedListLength(slot, value)
+          let stride = canonicalSlotLayout(slot.listElement[]).size.uint64
+          budget.charge(value.fields.len.uint64, value.fields.len.uint64 * stride)
+          for field in value.fields: checkHostPayload(slot.listElement[], field, budget)
+        of cpOption, cpVariant, cpEnum, cpResult:
+          if value.caseIndex >= slot.cases.len.uint32:
+            componentFail("host endpoint variant case out of range")
+          let selected = slot.cases[value.caseIndex.int]
+          if value.fields.len != selected.hasPayload.int:
+            componentFail("host endpoint variant payload count mismatch")
+          if selected.hasPayload:
+            budget.charge(1, 0)
+            checkHostPayload(caseSlot(selected), value.fields[0], budget)
+        of cpFlags:
+          if (value.bits and not flagMask(slot.cases.len).uint64) != 0:
+            componentFail("host endpoint flags out of range")
+        of cpString:
+          if value.text.len > MaxComponentStringBytes or not validWasmName(value.text):
+            componentFail("invalid host endpoint string")
+          budget.charge(0, value.text.len.uint64)
+        of cpBytes:
+          if value.bytes.len > MaxComponentByteListBytes: componentFail("host endpoint byte list limit")
+          budget.charge(0, value.bytes.len.uint64)
+        of cpU32List, cpU64List:
+          let width = if slot.kind == cpU32List: 4 else: 8
+          let kind = if slot.kind == cpU32List: cpU32 else: cpU64
+          let bytes = value.fields.len.uint64 * width.uint64
+          if bytes > MaxComponentByteListBytes.uint64: componentFail("host endpoint integer list limit")
+          budget.charge(value.fields.len.uint64, bytes)
+          for item in value.fields:
+            if item.kind != kind: componentFail("host endpoint integer list type mismatch")
+            discard lower(item)
+        of cpOwnedResource, cpFuture, cpStream, cpErrorContext: discard
+        else: discard lower(value)
+
+      proc moveBufferedResource(slot: CanonicalSlot, value: var ComponentValue) =
+        # Only the buffer owns these values after submission. On cancel or
+        # partial completion the unused suffix transfers back to the caller.
+        if slot.kind == cpErrorContext: return
+        if slot.kind in {cpFuture, cpStream}:
+          let original = value.endpoint
+          value.endpoint = ComponentEndpointValue(endpoint: move original.endpoint,
+            payloadResources: move original.payloadResources)
+        else:
+          let original = value.resource
+          value.resource = ComponentOwnedValue(owner: move original.owner,
+            graph: move original.graph, resourceIndex: original.resourceIndex,
+            representation: original.representation, live: true)
+          original.live = false   # The owner's outstanding count moves with the value.
+
+      proc snapshotHostValues(token: ComponentHostEndpoint, payload: CanonicalSlot,
+          source: openArray[ComponentValue]): seq[ComponentValue] =
+        result = @source
+        var budget = listBudget()
+        let stride = canonicalSlotLayout(payload).size.uint64
+        (addr budget).charge(source.len.uint64, source.len.uint64 * stride)
+        for value in result: checkHostPayload(payload, value, addr budget)
+        if payload.resources == {}: return
+        var indices: seq[uint16]
+        collectResourceTypes(payload, indices)
+        var resources: HostPayloadResources
+        for i, index in indices:
+          resources.add((index, token.payloadResources[i]))
+        var prepared: PreparedResources
+        let validate = proc(slot: CanonicalSlot, value: var ComponentValue) =
+          validateBufferedResource(slot, value, resources, prepared)
+        for value in result.mitems: visitResourceLeaves(payload, value, validate)
+        for value in result.mitems: visitResourceLeaves(payload, value, moveBufferedResource)
+
+      proc pollComponentEndpoint*(token: ComponentHostEndpoint): ComponentEndpointResult =
+        ## Consumes one notification. A pending result does not release the buffer.
+        let endpoint = token.requireHostEndpoint()
+        discard endpoint.hostGuestPeer()
+        if not endpoint.eventPending:
+          result.status = if endpoint.state == fcCopying: cesPending else: cesIdle
+          return
+        let progress = endpoint.eventProgress
+        let code = endpoint.takeEndpointEvent().state and 0x0f
+        result.count = progress
+        result.status = case code
+          of 0: cesCompleted
+          of 1: cesDropped
+          else: cesCancelled
+        let operation = move token.operation
+        if operation == nil: return
+        if endpoint.writable:
+          for i in progress.int ..< operation.values.len:
+            result.values.add(move operation.values[i])
+        else:
+          result.values = move operation.values
+
+      proc prepareHostCopy(token: ComponentHostEndpoint, writable: bool,
+          count: uint32): ComponentEndpoint =
+        result = token.requireHostEndpoint()
+        if result.state != fcIdle or result.writable != writable:
+          componentFail("host endpoint copy requires an idle endpoint in the requested direction")
+        if count > MaxEndpointBufferLength or (result.shape.kind == cpFuture and count != 1):
+          componentFail("invalid host endpoint copy length")
+        if result.shape.listElement != nil and count > MaxGenericListValues.uint32:
+          componentFail("host endpoint buffer exceeds profile limit")
+        let peer = result.hostGuestPeer()
+        if peer != nil and not peer.execution.mayLeave:
+          componentFail("host endpoint cannot enter canonical realloc or post-return")
+
+      proc beginHostCopy(token: ComponentHostEndpoint, endpoint: ComponentEndpoint,
+          count: uint32, buffer: ComponentHostBuffer): ComponentEndpointResult =
+        token.operation = buffer
+        try:
+          (addr endpoint[]).beginEndpointCopy(
+            EndpointGuestBuffer(count: count, active: true, host: buffer))
+        except CatchableError as error:
+          if endpoint.other != nil and endpoint.other.owner != nil:
+            cast[ComponentInstance](endpoint.other.owner).lockStore()
+          endpoint[].detachEndpoint()
+          (addr endpoint[]).notifyEndpoint(0)
+          if error of WasmTrap: componentFail("component endpoint copy trap: " & error.msg)
+          raise
+        token.pollComponentEndpoint()
+
+      proc readComponentEndpoint*(token: ComponentHostEndpoint,
+          count = 1'u32): ComponentEndpointResult =
+        let endpoint = token.prepareHostCopy(false, count)
+        let buffer = ComponentHostBuffer()
+        if endpoint.shape.listElement != nil:
+          buffer.values = newSeqOfCap[ComponentValue](count.int)
+        token.beginHostCopy(endpoint, count, buffer)
+
+      proc writeComponentEndpoint*(token: ComponentHostEndpoint,
+          values: openArray[ComponentValue]): ComponentEndpointResult =
+        if values.len > MaxGenericListValues: componentFail("host endpoint buffer exceeds profile limit")
+        let endpoint = token.prepareHostCopy(true, values.len.uint32)
+        let payload = endpoint.shape.listElement
+        if payload == nil: componentFail("use writeComponentUnits for a unit payload")
+        let buffer = ComponentHostBuffer(values: token.snapshotHostValues(payload[], values))
+        token.beginHostCopy(endpoint, values.len.uint32, buffer)
+
+      proc writeComponentUnits*(token: ComponentHostEndpoint,
+          count = 1'u32): ComponentEndpointResult =
+        let endpoint = token.prepareHostCopy(true, count)
+        if endpoint.shape.listElement != nil: componentFail("expected a unit endpoint payload")
+        token.beginHostCopy(endpoint, count, ComponentHostBuffer())
+
+      proc cancelComponentEndpoint*(token: ComponentHostEndpoint): ComponentEndpointResult =
+        let endpoint = token.requireHostEndpoint()
+        if endpoint.state != fcCopying: componentFail("host endpoint has no copy to cancel")
+        endpoint.cancelEndpointCopy()
+        token.pollComponentEndpoint()
+
+      proc closeComponentEndpoint*(token: ComponentHostEndpoint) =
+        ## A pending copy must be consumed or cancelled before explicit close.
+        let endpoint = token.requireHostEndpoint()
+        if endpoint.state in {fcCopying, fcCancelling}:
+          componentFail("cannot close a pending host endpoint")
+        endpoint[].detachEndpoint()
+        token.endpoint = nil
+        token.payloadResources.setLen(0)
+
+    proc dropEndpoint(instance: ComponentInstance, endpoint: ComponentEndpoint) =
+      instance.joinAsyncWaitable(endpoint.joined, 0)
+      endpoint[].detachEndpoint()
+      instance.releaseAsyncSlot(endpoint.handle)
+
+    proc forwardEndpoint(instance: ComponentInstance, reader, writer: ComponentEndpoint) =
+      if reader.state != fcIdle or writer.state != fcIdle or reader.joined != 0 or writer.joined != 0:
+        componentFail("canonical " & endpointName(reader.shape.kind) &
+          " forward requires idle, unjoined endpoints")
+      let source = reader.other
+      let dest = writer.other
+      if source == nil or dest == nil or source == addr writer[]:
+        instance.dropEndpoint(reader)
+        instance.dropEndpoint(writer)
+        return
+      reader.other = nil
+      writer.other = nil
+      source.other = dest
+      dest.other = source
+      if source.buffer.active and dest.buffer.active:
+        let first = if dest.buffer.remaining() < source.buffer.remaining(): dest else: source
+        let buffer = first.buffer
+        first.buffer.active = false
+        first.beginEndpointCopy(buffer)
+      instance.releaseAsyncSlot(reader.handle)
+      instance.releaseAsyncSlot(writer.handle)
+
+    proc makeEndpointBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc =
+      let owner = cast[pointer](instance)
+      let kind = lowering.kind
+      let shape = lowering.endpointShape
+      let asynchronous = lowering.asyncCancel
+      let memoryAddress = if lowering.memoryInstance == 0: -1
+        else: instance.coreExport(lowering.memoryInstance, lowering.memoryName, ekMemory)
+      let reallocAddress = if lowering.reallocSource == 0: -1
+        else: instance.coreExport(lowering.reallocSource, lowering.reallocName, ekFunc)
+      let encoding = lowering.stringEncoding
+      result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+        let inst = cast[ComponentInstance](owner)
+        if not inst.execution.mayLeave:
+          componentFail("canonical " & endpointName(shape.kind) & " builtin cannot leave")
+        if kind == clEndpointNew:
+          inst.initCanonicalHandles()
+          if not inst.resources.table.hasResourceCapacity(2):
+            componentFail("component async handle capacity exceeded")
+          let reader = ComponentEndpoint(shape: shape, owner: owner)
+          let writer = ComponentEndpoint(shape: shape, owner: owner, writable: true)
+          reader.handle = inst.newAsyncSlot(ComponentAsyncSlot(endpoint: reader))
+          writer.handle = inst.newAsyncSlot(ComponentAsyncSlot(endpoint: writer))
+          reader.other = addr writer[]
+          writer.other = addr reader[]
+          return @[wasmI64(cast[int64](reader.handle.uint64 or (writer.handle.uint64 shl 32)))]
+        let writable = kind in {clEndpointWrite, clEndpointCancelWrite, clEndpointDropWritable}
+        let endpoint = inst.endpointAt(args[0].i32.uint32, shape[], writable)
+        case kind
+        of clEndpointRead, clEndpointWrite:
+          let count = if shape.kind == cpStream: args[2].i32.uint32 else: 1'u32
+          return inst.copyEndpoint(endpoint, EndpointGuestBuffer(memoryAddress: memoryAddress,
+            reallocAddress: reallocAddress, offset: args[1].i32.uint32, encoding: encoding,
+            count: count, active: true), asynchronous)
+        of clEndpointCancelRead, clEndpointCancelWrite:
+          if endpoint.state != fcCopying or endpoint.hasEndpointWaiter() or
+              (not asynchronous and endpoint.joined != 0):
+            componentFail("canonical " & endpointName(shape.kind) & " copy cannot be cancelled")
+          endpoint.cancelEndpointCopy()
+          return @[wasmI32(cast[int32](endpoint.takeEndpointEvent().state))]
+        of clEndpointDropReadable, clEndpointDropWritable:
+          if endpoint.state in {fcCopying, fcCancelling}:
+            componentFail("cannot drop a pending canonical " & endpointName(shape.kind) & " endpoint")
+          if shape.kind == cpFuture and writable and endpoint.state != fcDone:
+            componentFail("cannot drop future write end without first writing a value")
+          inst.dropEndpoint(endpoint)
+        of clEndpointForward:
+          inst.forwardEndpoint(endpoint, inst.endpointAt(args[1].i32.uint32, shape[], true))
+        else: componentFail("invalid canonical endpoint builtin")
+
+  proc leaveWait(registration: var ComponentWaitRegistration) =
+    if registration.waitSet == nil: return
+    dec registration.waitSet.waiters
+    registration.waitSet = nil
+    registration.id = 0
+
+  proc storeWaitableEvent(instance: ComponentInstance, memoryAddress: int,
+      offset: uint64, event: ComponentAsyncEvent): seq[WasmValue] =
+    if (offset and 3) != 0: componentFail("unaligned canonical waitable event area")
+    let memory = addr instance.vm.store.mems[memoryAddress]
+    memory[].checkMemoryRange(offset, 8)
+    writeAbiInt(memory[], offset, 4, event.handle)
+    writeAbiInt(memory[], offset + 4, 4, event.state)
+    @[wasmI32(event.code.int32)]
+
+  when defined(wasmComponentStackful):
+    proc waitForSubtaskCancel(instance: ComponentInstance,
+        task: ComponentSubtask): seq[WasmValue] =
+      let registration = new(ref ComponentCoreReservation)
+      new(registration.exclusive)
+      registration.exclusive[] = true
+      task.cancelWaiter = registration.exclusive
+      instance.vm.suspendHostCall(WasmHostWait(
+        ready: proc(): bool = task.resolved(),
+        finish: proc(): seq[WasmValue] =
+          registration.exclusive[] = false
+          @[wasmI32(task.takeSubtaskEvent().state.int32)]))
+
+    proc waitForSet(instance: ComponentInstance, memoryAddress: int,
+        id: uint32, offset: uint64): seq[WasmValue] =
+      let set = instance.waitableSet(id)
+      if instance.pendingEvent(id) != nil:
+        return instance.storeWaitableEvent(memoryAddress, offset, instance.takeEvent(id))
+      if not instance.vm.canSuspendHostCall():
+        componentFail("cannot block a synchronous task before returning")
+      let registration = new(ref ComponentWaitRegistration)
+      inc set.waiters
+      registration.id = id
+      registration.waitSet = set
+      let owner = cast[pointer](instance)
+      instance.vm.suspendHostCall(WasmHostWait(
+        ready: proc(): bool =
+          cast[ComponentInstance](owner).pendingEvent(registration.id) != nil,
+        finish: proc(): seq[WasmValue] =
+          let inst = cast[ComponentInstance](owner)
+          let id = registration.id
+          registration[].leaveWait()
+          inst.storeWaitableEvent(memoryAddress, offset, inst.takeEvent(id))))
+
+  proc cancelSubtask(task: ComponentSubtask, asynchronous: bool): int32
+
+  when defined(wasmComponentThreads):
+    proc guestThreadReady(thread: ComponentGuestThread, switching = false): bool
+
+    proc pauseGuestThread(instance: ComponentInstance, yielding: bool,
+                         next: ComponentGuestThread = nil): seq[WasmValue] =
+      if not instance.vm.canSuspendHostCall():
+        componentFail("cannot block a synchronous task before returning")
+      let thread = instance.execution.thread
+      thread.state = if yielding: cgtReady else: cgtSuspended
+      if next != nil:
+        next.state = cgtReady
+        instance.links.store.switchTarget = next
+      let saved = cast[pointer](thread)
+      instance.vm.suspendHostCall(WasmHostWait(
+        ready: proc(): bool = cast[ComponentGuestThread](saved).state in {cgtReady, cgtRunning},
+        finish: proc(): seq[WasmValue] = @[wasmI32(0)]))
+
+    proc makeThreadBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc =
+      let owner = cast[pointer](instance)
+      let kind = lowering.kind
+      let closureType = lowering.threadClosure
+      let tableAddress = if kind == clThreadNewIndirect:
+          instance.coreExport(lowering.threadTable, lowering.threadTableName, ekTable)
+        else: -1
+      when defined(wasmComponentThreadSpawn):
+        let signature = lowering.threadSignature
+      result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+        if kind == clThreadAvailableParallelism:
+          return @[wasmI32(1)]
+        let inst = cast[ComponentInstance](owner)
+        let thread = inst.execution.thread
+        if not inst.execution.mayLeave or thread == nil:
+          componentFail("canonical thread builtin has no active guest thread")
+        case kind
+        of clThreadIndex:
+          return @[wasmI32(thread.id.int32)]
+        of clThreadNewIndirect, clThreadSpawnRef:
+          let spawning = kind == clThreadSpawnRef
+          let value = if spawning: args[0] else:
+            block:
+              let index = args[0].i32.uint32
+              let table = addr inst.vm.store.tables[tableAddress]
+              if index >= table.elems.len.uint32:
+                componentFail("canonical thread table index out of bounds")
+              table.elems[index.int]
+          if value.kind != wvkFuncRef or value.funcRef < 0:
+            if spawning: componentFail("canonical thread.spawn-ref target is null")
+            componentFail("canonical thread table entry is null")
+          let address = value.funcRef.int
+          if address >= inst.vm.store.funcs.len:
+            componentFail("invalid canonical thread table function reference")
+          let function = addr inst.vm.store.funcs[address]
+          if spawning:
+            when defined(wasmComponentThreadSpawn):
+              if not function.funcType.matchesCoreFunctionType(signature[]):
+                componentFail("canonical thread.spawn-ref target has the wrong function type")
+            else: componentFail("canonical thread spawning is disabled")
+          elif function.funcType.params != @[closureType] or function.funcType.results.len != 0:
+            componentFail("canonical thread table entry has the wrong function type")
+          let newThread = ComponentGuestThread(invocation: thread.invocation,
+            core: ComponentCoreTurn(address: address), closure: args[1],
+            state: if spawning: cgtReady else: cgtSuspended)
+          if not inst.registerThread(newThread):
+            if spawning: componentFail("canonical thread.spawn-ref capacity exceeded")
+            return @[wasmI32(-1)]
+          inc thread.invocation.explicitThreads
+          return @[wasmI32(newThread.id.int32)]
+        of clThreadSuspend:
+          return inst.pauseGuestThread(false)
+        of clThreadResumeLater, clThreadSuspendResume, clThreadYieldResume,
+            clThreadSuspendPromote, clThreadYieldPromote:
+          let target = inst.threadAt(args[0].i32.uint32)
+          if target == nil: componentFail("unknown canonical thread index")
+          if target == thread: componentFail("cannot switch to the current canonical thread")
+          let promote = kind in {clThreadSuspendPromote, clThreadYieldPromote}
+          if not promote and target.state != cgtSuspended:
+            componentFail("canonical thread is not suspended")
+          if kind == clThreadResumeLater:
+            target.state = cgtReady
+          else:
+            let next = if not promote or target.guestThreadReady(switching = true): target else: nil
+            return inst.pauseGuestThread(kind in {clThreadYieldResume, clThreadYieldPromote}, next)
+        else: componentFail("invalid canonical thread builtin")
+
+  proc makeAsyncBuiltin(instance: ComponentInstance, lowering: CoreLowering): HostFunc =
+    let owner = cast[pointer](instance)
+    let kind = lowering.kind
+    let asynchronous = lowering.asyncCancel
+    let memoryAddress = if lowering.memoryInstance == 0: -1
+      else: instance.coreExport(lowering.memoryInstance, lowering.memoryName, ekMemory)
+    result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+      let inst = cast[ComponentInstance](owner)
+      if kind notin {clBackpressureInc, clBackpressureDec} and not inst.execution.mayLeave:
+        componentFail("canonical async builtin cannot leave")
+      case kind
+      of clWaitableSetNew:
+        return @[wasmI32(inst.newAsyncSlot(ComponentAsyncSlot(waitSet: ComponentWaitSet())).int32)]
+      of clWaitableSetDrop:
+        let id = args[0].i32.uint32
+        let waitSet = inst.waitableSet(id)
+        if waitSet.members != 0 or waitSet.waiters != 0:
+          componentFail("canonical waitable set is in use")
+        inst.releaseAsyncSlot(id)
+      of clWaitableJoin:
+        let handle = args[0].i32.uint32
+        let id = args[1].i32.uint32
+        when ComponentEndpointsEnabled:
+          let endpoint = inst.asyncSlot(handle).endpoint
+          if endpoint != nil:
+            if endpoint.hasEndpointWaiter():
+              componentFail("cannot join a synchronously awaited canonical " &
+                endpointName(endpoint.shape.kind))
+            inst.joinAsyncWaitable(endpoint.joined, id)
+            return
+        inst.joinWaitable(inst.subtaskAt(handle), id)
+      of clWaitableSetPoll:
+        let id = args[0].i32.uint32
+        discard inst.waitableSet(id)
+        let offset = args[1].i32.uint32.uint64
+        return inst.storeWaitableEvent(memoryAddress, offset, inst.takeEvent(id))
+      of clWaitableSetWait:
+        when defined(wasmComponentStackful):
+          return inst.waitForSet(memoryAddress, args[0].i32.uint32, args[1].i32.uint32.uint64)
+        else: componentFail("invalid canonical async builtin")
+      of clThreadYield:
+        when defined(wasmComponentStackful):
+          if inst.vm.canSuspendHostCall():
+            when defined(wasmComponentThreads):
+              if inst.execution.thread != nil: return inst.pauseGuestThread(true)
+            return inst.vm.suspendHostCall(WasmHostWait(
+              ready: proc(): bool = true,
+              finish: proc(): seq[WasmValue] = @[wasmI32(0)]))
+          return @[wasmI32(0)]
+        else: componentFail("invalid canonical async builtin")
+      of clTaskCancel:
+        let task = inst.execution.callbackTask
+        if task == nil or task.resolution != ccrCancelDelivered:
+          componentFail("canonical task.cancel requires a delivered cancellation")
+        inst.checkTaskBorrows()
+        cast[ComponentSubtask](task.subtask).publishSubtaskState(cstCancelledBeforeReturn)
+        task.resolution = ccrCancelled
+      of clSubtaskCancel:
+        let task = inst.subtaskAt(args[0].i32.uint32)
+        let state = task.cancelSubtask(asynchronous)
+        when defined(wasmComponentStackful):
+          if state == -1 and not asynchronous:
+            return inst.waitForSubtaskCancel(task)
+        return @[wasmI32(state)]
+      of clSubtaskDrop:
+        let id = args[0].i32.uint32
+        let task = inst.subtaskAt(id)
+        if not task.delivered: componentFail("canonical subtask result has not been delivered")
+        inst.joinWaitable(task, 0)
+        task.handle = 0
+        inst.releaseAsyncSlot(id)
+      of clBackpressureInc:
+        if inst.backpressure == uint16.high: componentFail("canonical backpressure overflow")
+        inc inst.backpressure
+      of clBackpressureDec:
+        if inst.backpressure == 0: componentFail("canonical backpressure underflow")
+        dec inst.backpressure
+      else: componentFail("invalid canonical async builtin")
+
+  proc queueCallback(instance: ComponentInstance, exported: ptr ComponentExport,
+      args: openArray[ComponentValue]): ComponentInvocation =
+    let (owner, entry) = instance.resolveInvocationTarget(exported)
+    if not entry[].scheduledLift(): componentFail("component export is not a polled canonical lift")
+    if args.len != entry.signature.params.len: componentFail("component argument count mismatch")
+    checkArgumentKinds(entry.signature, args)
+    var task = CanonicalCallbackTask(memoryAddress: -1, encoding: entry.stringEncoding)
+    if entry.coreSources[clsMemory] != 0:
+      task.memoryAddress = owner.coreExport(entry.coreSources[clsMemory], entry.memoryName, ekMemory)
+    result = ComponentInvocation(owner: cast[pointer](owner),
+      entry: entry[], args: @args, task: move task)
+    result.task.signature = addr result.entry.signature
+
+  proc hasCallbackExport*(instance: ComponentInstance, name: string): bool =
+    ## True for an async export that can be driven using pollCallback.
+    if instance == nil: return false
+    for i, exported in instance.exports:
+      if exported.name == name:
+        return instance.resolveInvocationTarget(addr instance.exports[i]).entry[].scheduledLift()
+
+  proc beginCallback*(instance: ComponentInstance, name: string,
+      args: openArray[ComponentValue]): ComponentCallback =
+    ## Queue a typed callback invocation. Guest execution begins on poll.
+    if instance == nil: componentFail("unknown component export")
+    if instance.isLocked: componentFail("component store locked after trap")
+    for i, exported in instance.exports:
+      if exported.name == name:
+        return ComponentCallback(graph: instance,
+          invocation: instance.queueCallback(addr instance.exports[i], args))
+    componentFail("unknown component export")
+
+  proc beginCallback*(instance: ComponentInstance, path: openArray[string], name: string,
+      args: openArray[ComponentValue]): ComponentCallback =
+    ComponentCallback(graph: instance,
+      invocation: instance.queueCallback(instance.exportedComponentMethod(path, name), args))
+
+  when defined(wasmComponentStackful):
+    proc coreTurnAvailable(instance: ComponentInstance, invocation: ComponentInvocation = nil): bool =
+      let exclusive = instance.pausedExclusive
+      exclusive == nil or not exclusive[] or
+        (invocation != nil and (invocation.entry.stackful or
+          (invocation.core != nil and invocation.core.reservation.exclusive == exclusive)))
+
+    proc resumeGuestCore(turn: ComponentCoreTurn, instance: ComponentInstance,
+        args: openArray[WasmValue], lanes: var seq[WasmValue]): bool =
+      instance.vm.swapWasmExecutionArena(turn.arena)
+      defer: instance.vm.swapWasmExecutionArena(turn.arena)
+      while true:
+        lanes = instance.vm.executeSlice(turn.address, args, turn.continuation, uint32.high)
+        case turn.continuation.status
+        of wesComplete: return true
+        of wesHostBlocked, wesAtomicBlocked, wesYielded: return false
+        of wesMemoryBlocked:
+          when defined(wasmChunkedMemory):
+            if instance.vm.serviceExecutionMemoryFault(turn.continuation) == lmOk: continue
+          componentFail("canonical core memory fault could not be serviced")
+        else: componentFail("invalid canonical core continuation state")
+
+    proc runCoreTurn(invocation: ComponentInvocation, instance: ComponentInstance,
+        address: int, args: openArray[WasmValue], lanes: var seq[WasmValue]): bool =
+      if invocation.core == nil:
+        invocation.core = ComponentCoreTurn(arena: initWasmExecutionArena(), address: address)
+      let turn = invocation.core
+      when defined(wasmComponentThreads):
+        # Readiness can be queried by a promotion from inside this turn.
+        if not invocation.entry.stackful and turn.reservation.exclusive == nil:
+          new(turn.reservation.exclusive)
+          turn.reservation.exclusive[] = true
+          instance.pausedExclusive = turn.reservation.exclusive
+      if turn.resumeGuestCore(instance, args, lanes):
+        invocation.core = nil
+        return true
+      when not defined(wasmComponentThreads):
+        if not invocation.entry.stackful and turn.reservation.exclusive == nil:
+          new(turn.reservation.exclusive)
+          turn.reservation.exclusive[] = true
+          instance.pausedExclusive = turn.reservation.exclusive
+      invocation.state = ccsCoreWaiting
+
+  proc callbackRunnable(invocation: ComponentInvocation, guestTurn = false): bool =
+    let instance = cast[ComponentInstance](invocation.owner)
+    if invocation.state notin RunnableCallback or
+        (not guestTurn and instance.activeEntries != 0 and not invocation.entry.stackfulLift()):
+      return false
+    when defined(wasmComponentStackful):
+      if not instance.coreTurnAvailable(invocation): return false
+    case invocation.state
+    of ccsReady: instance.backpressure == 0 and
+      (instance.execution.context == nil or invocation.entry.stackfulLift())
+    of ccsWaiting:
+      invocation.task.resolution == ccrCancelPending or
+        instance.pendingEvent(invocation.waiting.id) != nil
+    of ccsCoreWaiting:
+      when defined(wasmComponentStackful):
+        instance.vm.executionRunnable(invocation.core.continuation)
+      else: false
+    of ccsThreadsWaiting: false
+    else: true
+
+  when defined(wasmComponentThreads):
+    proc guestThreadReady(thread: ComponentGuestThread, switching = false): bool =
+      if thread.implicit and thread.directResults == nil:
+        return thread.state in {cgtReady, cgtWaiting} and
+          thread.invocation.callbackRunnable(guestTurn = switching)
+      case thread.state
+      of cgtReady: true
+      of cgtWaiting:
+        let instance = cast[ComponentInstance](thread.owner)
+        instance.vm.executionRunnable(thread.core.continuation)
+      else: false
+
+    proc settleGuestThreadTask(invocation: ComponentInvocation) =
+      if invocation.state == ccsThreadsWaiting and invocation.explicitThreads == 0:
+        invocation.state = if invocation.task.resolution in {ccrReturned, ccrCancelled}:
+          ccsComplete else: ccsUnresolved
+
+    proc finishImplicitThread(instance: ComponentInstance, thread: ComponentGuestThread) =
+      let invocation = thread.invocation
+      if invocation.state in {ccsComplete, ccsUnresolved, ccsTrapped}:
+        instance.retireThread(thread)
+        invocation.implicitId = 0
+        if invocation.state != ccsTrapped and invocation.explicitThreads != 0:
+          invocation.state = ccsThreadsWaiting
+      elif thread.state == cgtRunning: thread.state = cgtWaiting
+
+  proc pinTaskBorrows(instance: ComponentInstance, prepared: var PreparedResources):
+      TaskBorrowScope =
+    if prepared.borrows.len == 0: return nil
+    let resources = instance.resources
+    var id = 0'u32
+    if prepared.foreignBorrows != 0:
+      # Keep stackful scopes disjoint from the small synchronous nesting IDs.
+      const FirstTaskScope = 0x80000000'u32
+      while true:
+        resources.nextBorrowScope =
+          if resources.nextBorrowScope < FirstTaskScope or resources.nextBorrowScope == uint32.high:
+            FirstTaskScope
+          else: resources.nextBorrowScope + 1
+        id = resources.nextBorrowScope
+        if resources.findBorrowScope(id) == nil: break
+    prepared.pinBorrowArguments()
+    result = TaskBorrowScope(resources: resources, id: id, pins: move prepared.borrows)
+    resources.taskBorrowScopes.add(cast[pointer](result))
+
+  proc pollCallbackCore(invocation: ComponentInvocation, guestTurn = false): ComponentCallbackState =
+    ## A blocking host import saves guest frames in the current turn's arena.
+    if invocation.state notin RunnableCallback: return invocation.state
+    let instance = cast[ComponentInstance](invocation.owner)
+    if instance.isLocked: componentFail("component store locked after trap")
+    if not instance.execution.mayLeave or
+        (not guestTurn and instance.activeEntries != 0 and not invocation.entry.stackfulLift()):
+      componentFail("canonical callback cannot enter an active component")
+    if not invocation.callbackRunnable(guestTurn): return invocation.state
+    let entry = addr invocation.entry
+    var prepared: PreparedResources
+    if invocation.state == ccsReady and entry.signature.parameterResources() != {}:
+      prepared = instance.collectHostResources(entry.signature, invocation.args)
+      instance.requireHandleCapacity(prepared.preparedHandleCount())
+    let store = instance.links.store
+    if store.activeCallbackTurns.int >= MaxComponentCallDepth:
+      componentFail("component callback depth exceeds profile limit")
+    inc instance.activeEntries
+    inc store.activeCallbackTurns
+    let execution = instance.execution
+    let previous = execution.context
+    let previousTask = execution.callbackTask
+    let previousScope = execution.borrowScope
+    when defined(wasmComponentThreads):
+      let previousThread = execution.thread
+      let previousSecond = execution.contextSecond
+      if invocation.implicitId == 0:
+        let thread = ComponentGuestThread(implicit: true, invocation: invocation)
+        if not instance.registerThread(thread):
+          dec instance.activeEntries
+          dec store.activeCallbackTurns
+          componentFail("component guest thread capacity exceeded")
+        invocation.implicitId = thread.id
+      let thread = instance.threadAt(invocation.implicitId)
+      thread.state = cgtRunning
+      execution.thread = thread
+      execution.contextSecond = addr thread.contextSecond
+    if invocation.state == ccsReady and prepared.borrows.len != 0:
+      invocation.borrows = instance.pinTaskBorrows(prepared)
+    execution.context = addr invocation.context
+    execution.callbackTask = if entry[].usesAsyncLiftAbi(): addr invocation.task else: nil
+    execution.borrowScope = if invocation.borrows == nil: 0'u32 else: invocation.borrows.id
+    defer:
+      execution.callbackTask = previousTask
+      execution.borrowScope = previousScope
+      execution.context = previous
+      when defined(wasmComponentThreads):
+        execution.thread = previousThread
+        execution.contextSecond = previousSecond
+        instance.finishImplicitThread(thread)
+      dec instance.activeEntries
+      dec store.activeCallbackTurns
+    try:
+      var lanes: seq[WasmValue]
+      var callbackAddress = -1
+      template executeCore(address: int, args: untyped) =
+        when defined(wasmComponentStackful):
+          if not invocation.runCoreTurn(instance, address, args, lanes): return invocation.state
+        else:
+          lanes = instance.vm.execute(address, args)
+      if invocation.state == ccsCoreWaiting:
+        executeCore(-1, [])
+      elif invocation.state == ccsReady:
+        let address = instance.coreExport(entry.coreSources[clsFunction], entry.coreName, ekFunc)
+        let args = instance.prepareCoreArguments(entry[], invocation.args)
+        invocation.args.setLen(0)
+        executeCore(address, args)
+      else:
+        callbackAddress = instance.coreExport(entry.callbackSource, entry.callbackName, ekFunc)
+        var event: ComponentAsyncEvent
+        if invocation.task.resolution == ccrCancelPending:
+          invocation.task.resolution = ccrCancelDelivered
+          event.code = TaskCancelledEvent
+        elif invocation.state == ccsWaiting:
+          event = instance.takeEvent(invocation.waiting.id)
+        invocation.waiting.leaveWait()
+        executeCore(callbackAddress, [wasmI32(event.code.int32),
+          wasmI32(event.handle.int32), wasmI32(event.state.int32)])
+      when defined(wasmComponentStackful):
+        if not entry[].usesAsyncLiftAbi():
+          instance.checkTaskBorrows()
+          invocation.task.values = instance.liftCoreResults(entry[], lanes)
+          invocation.task.returnTaskResult()
+          instance.finishLift(entry[], lanes)
+          invocation.state = ccsComplete
+          return invocation.state
+      if entry[].stackfulLift():
+        if lanes.len != 0: componentFail("invalid canonical stackful core result")
+        invocation.state = if invocation.task.resolution in {ccrReturned, ccrCancelled}:
+          ccsComplete else: ccsUnresolved
+        return invocation.state
+      template callbackCode(): uint32 =
+        if lanes.len != 1 or lanes[0].kind != wvkI32:
+          componentFail("invalid canonical callback result")
+        lanes[0].i32.uint32 and 0xF
+      var code = callbackCode()
+      if (code == 1 or code == 2) and invocation.task.resolution == ccrCancelPending:
+        # A nested core call may request cancellation during this turn. Deliver
+        # it before releasing exclusivity or checking the returned wait set.
+        if callbackAddress < 0:
+          callbackAddress = instance.coreExport(entry.callbackSource, entry.callbackName, ekFunc)
+        invocation.task.resolution = ccrCancelDelivered
+        executeCore(callbackAddress, [wasmI32(TaskCancelledEvent.int32), wasmI32(0), wasmI32(0)])
+        code = callbackCode()
+      case code
+      of 0:
+        invocation.state = if invocation.task.resolution in {ccrReturned, ccrCancelled}:
+          ccsComplete else: ccsUnresolved
+      of 1: invocation.state = ccsYielded
+      of 2:
+        let id = lanes[0].i32.uint32 shr 4
+        let waitSet = instance.waitableSet(id)
+        inc waitSet.waiters
+        invocation.waiting.id = id
+        invocation.waiting.waitSet = waitSet
+        invocation.state = ccsWaiting
+      else: componentFail("invalid canonical callback code")
+    except CatchableError as err:
+      when defined(wasmComponentStackful): invocation.core = nil
+      invocation.borrows = nil
+      invocation.waiting.leaveWait()
+      invocation.args.setLen(0)
+      invocation.task.values.setLen(0)
+      invocation.state = ccsTrapped
+      instance.lockStore()
+      if err of WasmTrap: componentFail("component core trap: " & err.msg)
+      raise
+    invocation.state
+
+  when defined(wasmComponentThreads):
+    proc runScheduledGuestThread(thread: ComponentGuestThread) =
+      let instance = cast[ComponentInstance](thread.owner)
+      let invocation = thread.invocation
+      if thread.implicit and thread.directResults == nil:
+        discard invocation.pollCallbackCore(guestTurn = true)
+        return
+      let store = instance.links.store
+      let execution = instance.execution
+      if not execution.mayLeave or store.activeCallbackTurns.int >= MaxComponentCallDepth:
+        componentFail("canonical guest thread cannot enter the component")
+      inc instance.activeEntries
+      inc store.activeCallbackTurns
+      let previous = execution.context
+      let previousTask = execution.callbackTask
+      let previousScope = execution.borrowScope
+      let previousThread = execution.thread
+      let previousSecond = execution.contextSecond
+      execution.thread = thread
+      execution.context = addr thread.context
+      execution.contextSecond = addr thread.contextSecond
+      execution.callbackTask = if invocation.entry.usesAsyncLiftAbi(): addr invocation.task else: nil
+      execution.borrowScope = if invocation.borrows == nil: 0'u32 else: invocation.borrows.id
+      let entering = thread.core.continuation.status == wesReady
+      thread.state = cgtRunning
+      defer:
+        execution.thread = previousThread
+        execution.context = previous
+        execution.contextSecond = previousSecond
+        execution.callbackTask = previousTask
+        execution.borrowScope = previousScope
+        dec instance.activeEntries
+        dec store.activeCallbackTurns
+      try:
+        if thread.directResults != nil:
+          if thread.core.resumeGuestCore(instance, [], thread.directResults[]):
+            thread.state = cgtFinished
+          elif thread.state == cgtRunning: thread.state = cgtWaiting
+          return
+        var lanes: seq[WasmValue]
+        if entering: thread.core.arena = initWasmExecutionArena()
+        let finished = if entering: thread.core.resumeGuestCore(instance, [thread.closure], lanes)
+          else: thread.core.resumeGuestCore(instance, [], lanes)
+        if finished:
+          instance.retireThread(thread)
+          dec invocation.explicitThreads
+          invocation.settleGuestThreadTask()
+        elif thread.state == cgtRunning: thread.state = cgtWaiting
+      except CatchableError as error:
+        invocation.state = ccsTrapped
+        instance.lockStore()
+        if error of WasmTrap: componentFail("component core trap: " & error.msg)
+        raise
+
+    proc drainGuestThreadSwitches(store: ComponentLinkStore) =
+      while store.switchTarget != nil:
+        let thread = move store.switchTarget
+        thread.runScheduledGuestThread()
+
+    proc invokeSynchronousGuestCore(instance: ComponentInstance, address: int,
+        args: openArray[WasmValue]): seq[WasmValue] =
+      ## Only this instance's ready threads can make progress for a sync lift.
+      let thread = instance.execution.thread
+      let store = instance.links.store
+      thread.core = ComponentCoreTurn(arena: initWasmExecutionArena(), address: address)
+      thread.directResults = addr result
+      defer:
+        when WasmAtomicWaitEnabled:
+          if thread.core.continuation.status == wesAtomicBlocked:
+            instance.vm.swapWasmExecutionArena(thread.core.arena)
+            try: instance.vm.abortExecution(thread.core.continuation)
+            finally: instance.vm.swapWasmExecutionArena(thread.core.arena)
+        thread.directResults = nil
+        thread.core = nil
+      if thread.core.resumeGuestCore(instance, args, result): return
+      if thread.state == cgtRunning: thread.state = cgtWaiting
+      store.drainGuestThreadSwitches()
+      while thread.state != cgtFinished:
+        var next: ComponentGuestThread
+        let count = store.guestThreads.len
+        for step in 0 ..< count:
+          let index = (store.nextGuestThread + step) mod count
+          let candidate = store.guestThreads[index]
+          if candidate.owner == thread.owner and candidate.guestThreadReady(switching = true):
+            store.nextGuestThread = index + 1
+            next = candidate
+            break
+        if next == nil: componentFail("cannot block a synchronous task before returning")
+        next.runScheduledGuestThread()
+        store.drainGuestThreadSwitches()
+
+  proc pollCallbackTurn(invocation: ComponentInvocation): ComponentCallbackState =
+    result = invocation.pollCallbackCore()
+    when defined(wasmComponentThreads):
+      let inst = cast[ComponentInstance](invocation.owner)
+      inst.links.store.drainGuestThreadSwitches()
+      result = invocation.state
+
+  proc callbackResultReady(invocation: ComponentInvocation): bool =
+    invocation != nil and invocation.task.resolution == ccrReturned and not invocation.resultTaken and
+      invocation.state != ccsTrapped
+
+  proc takeCallbackResult(invocation: ComponentInvocation): seq[ComponentValue] =
+    if not invocation.callbackResultReady(): componentFail("component callback result unavailable")
+    invocation.resultTaken = true
+    invocation.borrows = nil
+    move invocation.task.values
+
+  proc callbackResultReady*(handle: ComponentCallback): bool =
+    handle != nil and handle.invocation.callbackResultReady()
+
+  proc takeCallbackResult*(handle: ComponentCallback): seq[ComponentValue] =
+    if handle == nil: componentFail("invalid component callback")
+    handle.invocation.takeCallbackResult()
+
+  proc accessForLowering(lowering: ComponentScheduledLowering): AbiAccess =
+    let caller = cast[ComponentInstance](lowering.caller)
+    AbiAccess(vm: addr caller.vm, execution: caller.execution,
+      memoryAddress: lowering.memoryAddress, reallocAddress: lowering.reallocAddress,
+      encoding: lowering.encoding, resourceOwner: lowering.caller)
+
+  proc resolveSubtask(task: ComponentSubtask, values: var seq[ComponentValue]) =
+    let lowering = task.lowering
+    let sig = addr lowering.signature
+    when defined(wasmComponentStackful):
+      if lowering.synchronous:
+        let access = lowering.accessForLowering()
+        var destination = LoweredResult(access: unsafeAddr access, signature: sig,
+          returnPointer: task.returnPointer, values: addr task.flatResults)
+        resolveLoweredResult(addr destination, values)
+        task.publishSubtaskState(cstReturned)
+        return
+    if values.len != sig.hasResult.int or
+        (sig.hasResult and values[0].kind != sig.resultType):
+      componentFail("canonical async result mismatch")
+    if sig[].asyncResultArea():
+      let access = lowering.accessForLowering()
+      let slot = resultSlot(sig[])
+      let layout = canonicalSlotLayout(slot)
+      let offset = task.returnPointer.uint64
+      if (offset and (layout.alignment - 1).uint64) != 0:
+        componentFail("unaligned canonical async return area")
+      access.vm[].store.mems[access.memoryAddress].checkMemoryRange(offset, layout.size.uint32)
+      if slot.resources != {}:
+        let caller = cast[ComponentInstance](lowering.caller)
+        caller.requireHandleCapacity(caller.validateHostResourceResult(slot, values[0]))
+      writeAbiArgument(access, offset, slot, values[0])
+    task.publishSubtaskState(cstReturned)
+
+  proc resolveScheduledCallee(lowering: ComponentScheduledLowering):
+      tuple[owner: ComponentInstance, entry: ptr ComponentExport] =
+    let target = lowering.target
+    if target != nil:
+      return cast[ComponentInstance](target.owner).resolveInvocationTarget(target.entry)
+
+  proc canStartScheduledLift(callee: ComponentInstance, entry: ptr ComponentExport): bool =
+    if callee == nil: return true
+    when defined(wasmComponentStackful):
+      if entry.target == ctImport: return true
+    if callee.backpressure != 0 or not callee.execution.mayLeave: return false
+    if entry[].stackfulLift(): return true
+    if callee.activeEntries != 0 or callee.execution.context != nil: return false
+    when defined(wasmComponentStackful):
+      callee.coreTurnAvailable()
+    else:
+      true
+
+  proc subtaskRunnable(task: ComponentSubtask): bool =
+    if task.state == cstStarting:
+      let (callee, entry) = task.lowering.resolveScheduledCallee()
+      if callee == nil: return true
+      if not callee.canStartScheduledLift(entry): return false
+      for pending in callee.links.store.pendingSubtasks:
+        if pending == task: break
+        if pending.state == cstStarting:
+          let (earlier, earlierEntry) = pending.lowering.resolveScheduledCallee()
+          # Preserve FIFO among entrants that can acquire their required lock.
+          if earlier == callee and earlier.canStartScheduledLift(earlierEntry):
+            return false
+      return true
+    task.call != nil and (task.call.callbackRunnable() or
+      (when defined(wasmComponentThreads): task.call.state notin RunnableCallback else: false))
+
+  proc startSubtask(task: ComponentSubtask) {.noinline.} =
+    let lowering = task.lowering
+    let caller = cast[ComponentInstance](lowering.caller)
+    let access = lowering.accessForLowering()
+    let asynchronous = when defined(wasmComponentStackful): not lowering.synchronous else: true
+    var args = readLoweredArguments(access, lowering.signature, task.arguments,
+      task.returnPointer, asyncAbi = asynchronous)
+    task.arguments.setLen(0)
+    if lowering.signature.parameterResources() != {}:
+      if ruBorrow in lowering.signature.parameterResources():
+        task.lenders = ResourceLendBatch(resources: caller.resources)
+        caller.resources.lendBatches.add(cast[pointer](task.lenders))
+      var lends: seq[ResourceLend]
+      let decode = proc(slot: CanonicalSlot, value: var ComponentValue) =
+        if task.lenders != nil:
+          caller.decodeResourceLeaf(slot, value, task.lenders.lends, scheduled = true)
+        else:
+          caller.decodeResourceLeaf(slot, value, lends)
+      for i in 0 ..< args.len:
+        visitResourceLeaves(parameterSlot(lowering.signature, i), args[i], decode)
+    task.publishSubtaskState(cstStarted)
+    let (callee, entry) = lowering.resolveScheduledCallee()
+    if entry != nil and entry[].scheduledLift():
+      task.call = callee.queueCallback(entry, args)
+      task.call.task.subtask = cast[pointer](task)
+    else:
+      var values = if entry == nil: lowering.callback(args)
+        else: callee.invokeFunction(entry[], args, guestEntry = true)
+      task.resolveSubtask(values)
+
+  proc advanceSubtask(task: ComponentSubtask) =
+    if task.state == cstStarting: task.startSubtask()
+    if task.call == nil: return
+    let state = task.call.pollCallbackTurn()
+    if task.resolved(): task.call.borrows = nil
+    if state notin RunnableCallback:
+      if state == ccsUnresolved: task.unresolvedBorrows = move task.call.borrows
+      task.call = nil
+
+  proc removeSubtask(store: ComponentLinkStore, task: ComponentSubtask) =
+    for i, pending in store.pendingSubtasks:
+      if pending == task:
+        store.pendingSubtasks.delete(i)
+        if i < store.nextSubtask: dec store.nextSubtask
+        return
+
+  proc cancelSubtask(task: ComponentSubtask, asynchronous: bool): int32 =
+    if task.delivered or task.cancellationRequested or task.joined != 0:
+      componentFail("canonical subtask cannot be cancelled")
+    if not task.resolved():
+      let caller = cast[ComponentInstance](task.lowering.caller)
+      task.cancellationRequested = true
+      task.cancelling = true
+      defer: task.cancelling = false
+      if task.state == cstStarting:
+        task.arguments.setLen(0)
+        task.publishSubtaskState(cstCancelledBeforeStart)
+      elif task.call != nil:
+        task.call.task.resolution = ccrCancelPending
+        if task.call.state in {ccsYielded, ccsWaiting} and task.call.callbackRunnable():
+          # Resume only the cancelled child during OnCancel.
+          task.advanceSubtask()
+      if not task.resolved():
+        if not asynchronous:
+          when defined(wasmComponentStackful):
+            if caller.vm.canSuspendHostCall(): return -1
+          componentFail("blocking canonical subtask.cancel requires stackful suspension")
+        return -1
+      if task.call == nil: caller.links.store.removeSubtask(task)
+    int32(task.takeSubtaskEvent().state)
+
+  proc makeScheduledLowering(lowering: ComponentScheduledLowering): HostFunc =
+    result = proc(args: openArray[WasmValue]): seq[WasmValue] =
+      let caller = cast[ComponentInstance](lowering.caller)
+      if not caller.execution.mayLeave:
+        when defined(wasmComponentStackful):
+          if lowering.synchronous:
+            componentFail("canonical host call during realloc or post-return")
+        componentFail("canonical async lower cannot leave")
+      let store = caller.links.store
+      if store.pendingSubtasks.len + store.startingSubtasks >= MaxComponentAsyncTasks:
+        componentFail("component async task capacity exceeded")
+      let task = ComponentSubtask(lowering: lowering, arguments: @args)
+      if task.subtaskRunnable():
+        inc store.startingSubtasks
+        defer: dec store.startingSubtasks
+        task.advanceSubtask()
+      let keepRunning = task.state == cstStarting or task.call != nil
+      when defined(wasmComponentStackful):
+        if lowering.synchronous:
+          if not task.resolved() and not caller.vm.canSuspendHostCall():
+            componentFail("cannot block a synchronous task before returning")
+          if keepRunning: store.pendingSubtasks.add(task)
+          if task.resolved():
+            task.deliverResolution()
+            return move task.flatResults
+          return caller.vm.suspendHostCall(WasmHostWait(
+            ready: proc(): bool = task.resolved(),
+            finish: proc(): seq[WasmValue] =
+              task.deliverResolution()
+              move task.flatResults))
+      if task.state != cstReturned:
+        task.handle = caller.newAsyncSlot(ComponentAsyncSlot(subtask: task))
+      else:
+        task.deliverResolution()
+      if keepRunning: store.pendingSubtasks.add(task)
+      @[wasmI32((task.state.ord.uint32 or (task.handle shl 4)).int32)]
+
+  proc invokeImmediateCallback(instance: ComponentInstance, entry: ptr ComponentExport,
+      args: openArray[ComponentValue], destination: ptr LoweredResult): seq[ComponentValue] =
+    let store = instance.links.store
+    if store.pendingSubtasks.len + store.startingSubtasks >= MaxComponentAsyncTasks:
+      componentFail("component async task capacity exceeded")
+    inc store.startingSubtasks
+    defer: dec store.startingSubtasks
+    let invocation = instance.queueCallback(entry, args)
+    let state = invocation.pollCallbackTurn()
+    if not invocation.callbackResultReady():
+      when defined(wasmComponentStackful):
+        if not destination.access.vm[].canSuspendHostCall():
+          componentFail("cannot block a synchronous task before returning")
+      componentFail("canonical synchronous lower cannot block on an unresolved callback")
+    result = invocation.takeCallbackResult()
+    resolveLoweredResult(destination, result)
+    if state in RunnableCallback:
+      store.pendingSubtasks.add(ComponentSubtask(call: invocation, state: cstReturned))
+
+  proc pumpComponentTasks(instance: ComponentInstance, exclude: ComponentInvocation = nil): bool =
+    ## Advance one runnable guest subtask in store order, including a task
+    ## that continues after its result has been delivered to the caller.
+    if instance == nil or instance.links == nil or instance.isLocked: return false
+    let store = instance.links.store
+    if store.pumping or store.startingSubtasks != 0 or store.activeCallbackTurns != 0 or
+        store.callDepth != 0:
+      return false
+    let count = store.pendingSubtasks.len
+    for step in 0 ..< count:
+      let index = (store.nextSubtask + step) mod count
+      let task = store.pendingSubtasks[index]
+      if not task.subtaskRunnable(): continue
+      store.pumping = true
+      defer: store.pumping = false
+      try:
+        store.nextSubtask = index + 1
+        task.advanceSubtask()
+        if task.state != cstStarting and task.call == nil:
+          store.removeSubtask(task)
+      except CatchableError as error:
+        instance.lockStore()
+        if error of WasmTrap: componentFail("component core trap: " & error.msg)
+        raise
+      return true
+    when defined(wasmComponentThreads):
+      let threadCount = store.guestThreads.len
+      for step in 0 ..< threadCount:
+        let index = (store.nextGuestThread + step) mod threadCount
+        let thread = store.guestThreads[index]
+        if thread.implicit and thread.invocation == exclude: continue
+        if not thread.guestThreadReady(): continue
+        store.pumping = true
+        defer: store.pumping = false
+        store.nextGuestThread = index + 1
+        thread.runScheduledGuestThread()
+        store.drainGuestThreadSwitches()
+        return true
+
+  proc pollComponentTasks*(instance: ComponentInstance): bool =
+    instance.pumpComponentTasks()
+
+  proc pollCallback*(handle: ComponentCallback): ComponentCallbackState =
+    if handle == nil: componentFail("invalid component callback")
+    let invocation = handle.invocation
+    if invocation.state notin RunnableCallback: return invocation.state
+    let instance = cast[ComponentInstance](invocation.owner)
+    if instance.isLocked: componentFail("component store locked after trap")
+    let store = instance.links.store
+    if store.activeCallbackTurns != 0 or store.callDepth != 0:
+      componentFail("cannot poll a callback from an active component call")
+    let yieldedThread = when defined(wasmComponentThreads):
+        let thread = instance.threadAt(invocation.implicitId)
+        thread != nil and thread.state == cgtReady
+      else: false
+    if invocation.state == ccsYielded or yieldedThread or not invocation.callbackRunnable():
+      discard instance.pumpComponentTasks(invocation)
+    invocation.pollCallbackTurn()
+
+proc invoke*(instance: ComponentInstance, name: string,
+             args: openArray[ComponentValue]): seq[ComponentValue] =
+  ## Invoke the typed export directly, following any component function aliases
+  ## to the instance where the function was defined.
+  if instance != nil:
+    if instance.isLocked:
+      componentFail("component store locked after trap")
+    for i in 0 ..< instance.exports.len:
+      if instance.exports[i].name == name:
+        return instance.invokeFunction(instance.exports[i], args)
+  componentFail("unknown component export")
+
+proc invokeInterface*(instance: ComponentInstance, name, methodName: string,
+                      args: openArray[ComponentValue]): seq[ComponentValue] =
+  ## Invoke a typed function exported under the named instance.
+  instance.invokeFunction(instance.exportedComponentMethod([name], methodName)[], args)
+
+proc invokeInterface*(instance: ComponentInstance, path: openArray[string], methodName: string,
+                      args: openArray[ComponentValue]): seq[ComponentValue] =
+  ## Invoke a function under a path of instance exports.
+  instance.invokeFunction(instance.exportedComponentMethod(path, methodName)[], args)

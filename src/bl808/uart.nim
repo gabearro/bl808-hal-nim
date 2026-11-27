@@ -7,6 +7,8 @@
 
 import glb, mmio, memmap
 import kernel/jtaglog
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  import core, dma, dmablock
 
 # =============================================================================
 # UART register offsets
@@ -281,13 +283,6 @@ proc sendByte*(uart: Uart, b: uint8): UartError =
   regWrite(uart.base + UartFifoWdata, b.uint32)
   uartOk
 
-proc send*(uart: Uart, data: openArray[uint8]): UartError =
-  ## Send a buffer of bytes.
-  for b in data:
-    let err = uart.sendByte(b)
-    if err != uartOk: return err
-  uartOk
-
 proc sendString*(uart: Uart, s: string): UartError =
   ## Send a string.
   for c in s:
@@ -340,17 +335,6 @@ proc recvByte*(uart: Uart, timeout: uint32 = 1_000_000): (uint8, UartError) =
     if countdown == 0: return (0'u8, uartTimeout)
   let data = regRead(uart.base + UartFifoRdata) and 0xFF
   (data.uint8, uartOk)
-
-proc recv*(uart: Uart, buf: var openArray[uint8], timeout: uint32 = 1_000_000): (int, UartError) =
-  ## Receive up to buf.len bytes. Returns number of bytes actually received.
-  var count = 0
-  for i in 0 ..< buf.len:
-    let (b, err) = uart.recvByte(timeout)
-    if err != uartOk:
-      return (count, if count > 0: uartOk else: err)
-    buf[i] = b
-    count.inc
-  (count, uartOk)
 
 # =============================================================================
 # Non-blocking operations
@@ -454,3 +438,161 @@ proc sendHex32*(uart: Uart, value: uint32) =
   for i in countdown(7, 0):
     let nibble = (value shr (i * 4)) and 0xF
     discard uart.sendByte(hexDigits[nibble].uint8)
+
+when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+  type UartDmaTransfer* = object
+    uart: Uart
+    dma: DmaBlock
+    buffer: DmaReceiveBuffer
+    txStaging: seq[byte]
+    rxLength: int
+    rx, active: bool
+
+  func requestId(uart: Uart; receiving: bool): int =
+    when defined(bl808m0) or defined(bl808lp):
+      case uart.id
+      of uart0: result = dmaPeriphUart0Rx.ord
+      of uart1: result = dmaPeriphUart1Rx.ord
+      of uart2: result = dmaPeriphUart2Rx.ord
+      else: return -1
+    else:
+      if uart.id != uart3: return -1
+      result = dmaMmUart3Rx.ord
+    if not receiving: inc result
+
+  proc start*(transfer: var UartDmaTransfer; uart: Uart;
+              data: ptr UncheckedArray[byte]; len: int; receiving: bool): bool =
+    ## Start a byte stream with the caller's buffer held until release.
+    if transfer.active or data == nil or len <= 0 or len.uint64 > high(uint32).uint64:
+      return false
+    let request = uart.requestId(receiving)
+    if request < 0: return false
+    let enableBit = if receiving: FifoDmaRxEn else: FifoDmaTxEn
+    if (regRead(uart.base + UartFifoConfig0) and (1'u32 shl enableBit)) != 0:
+      return false
+
+    var cfg = DmaTransferConfig(transferSize: len.uint32, srcWidth: width8, dstWidth: width8)
+    if receiving:
+      if not dmaBufferInRam(cast[uint](data), len): return false
+      transfer.buffer.prepare(data, len)
+      cfg.srcAddr = uart.rxFifoAddr().uint32
+      cfg.dstAddr = transfer.buffer.address.uint32
+      cfg.dstIncrement = true
+      cfg.flow = flowP2M_Dma
+      cfg.srcPeriph = request.uint32
+    else:
+      var source = cast[uint](data)
+      if not dmaBufferInRam(source, len):
+        transfer.txStaging.setLen(len)
+        copyMem(addr transfer.txStaging[0], data, len)
+        source = cast[uint](addr transfer.txStaging[0])
+      dcacheCleanRange(source, len.uint)
+      cfg.srcAddr = source.uint32
+      cfg.dstAddr = uart.txFifoAddr().uint32
+      cfg.srcIncrement = true
+      cfg.flow = flowM2P_Dma
+      cfg.dstPeriph = request.uint32
+    if not transfer.dma.prepare(openCoreDma(), cfg):
+      transfer.buffer.finish(false)
+      return false
+
+    transfer.uart = uart
+    transfer.rxLength = if receiving: len else: 0
+    transfer.rx = receiving
+    transfer.active = true
+    if receiving:
+      uart.setRxFifoThreshold(0)
+      uart.enableDmaRx()
+    else:
+      uart.enableDmaTx()
+    transfer.dma.start()
+    true
+
+  proc status*(transfer: UartDmaTransfer): DmaBlockStatus =
+    result = transfer.dma.status()
+    if result == dmaBlockDone and not transfer.rx and
+        (not transfer.uart.txFifoEmpty() or transfer.uart.txBusy()):
+      result = dmaBlockRunning
+
+  proc release*(transfer: var UartDmaTransfer; success = false;
+                keepPartial = false): int {.discardable.} =
+    ## On a blocking RX timeout, report and copy the bytes already collected.
+    if not transfer.active: return 0
+    if transfer.rx:
+      transfer.uart.disableDmaRx()
+      var nextDestination: uint
+      transfer.dma.release(addr nextDestination)
+      if success:
+        result = transfer.rxLength
+      elif keepPartial and nextDestination > transfer.buffer.address:
+        result = min(transfer.rxLength, (nextDestination - transfer.buffer.address).int)
+      transfer.buffer.finish(result != 0, result)
+    else:
+      transfer.uart.disableDmaTx()
+      transfer.dma.release()
+    transfer.active = false
+
+  proc send*(uart: Uart; data: openArray[uint8]): UartError =
+    ## Send a buffer through DMA and wait for the last byte to leave the UART.
+    if data.len == 0: return uartOk
+    var transfer: UartDmaTransfer
+    if not transfer.start(uart, cast[ptr UncheckedArray[byte]](unsafeAddr data[0]),
+                          data.len, receiving = false):
+      return uartOverflow
+    for b in data: hwValidationLogByte(b)
+    var budget = UartTxFifoWaitBudget.uint64 * data.len.uint64
+    while budget > 0:
+      case transfer.status()
+      of dmaBlockDone:
+        transfer.release(true)
+        return uartOk
+      of dmaBlockError, dmaBlockIdle:
+        transfer.release()
+        return uartOverflow
+      of dmaBlockRunning: dec budget
+    transfer.release()
+    uartTimeout
+
+  proc recv*(uart: Uart; buf: var openArray[uint8];
+             timeout: uint32 = 1_000_000): (int, UartError) =
+    ## Receive up to buf.len bytes. Restart the idle timeout on DMA progress.
+    if buf.len == 0: return (0, uartOk)
+    var transfer: UartDmaTransfer
+    if not transfer.start(uart, cast[ptr UncheckedArray[byte]](addr buf[0]),
+                          buf.len, receiving = true):
+      return (0, uartOverflow)
+    var previous = transfer.buffer.address
+    var remaining = max(timeout, 1'u32)
+    while remaining > 0:
+      case transfer.status()
+      of dmaBlockDone: return (transfer.release(true), uartOk)
+      of dmaBlockError, dmaBlockIdle:
+        transfer.release()
+        return (0, uartOverflow)
+      of dmaBlockRunning:
+        let current = transfer.dma.destinationAddress()
+        if current == previous:
+          dec remaining
+        else:
+          previous = current
+          remaining = max(timeout, 1'u32)
+    let count = transfer.release(keepPartial = true)
+    (count, if count > 0: uartOk else: uartTimeout)
+else:
+  proc send*(uart: Uart, data: openArray[uint8]): UartError =
+    ## Send a buffer of bytes.
+    for b in data:
+      let err = uart.sendByte(b)
+      if err != uartOk: return err
+    uartOk
+
+  proc recv*(uart: Uart, buf: var openArray[uint8], timeout: uint32 = 1_000_000): (int, UartError) =
+    ## Receive up to buf.len bytes. Returns number of bytes actually received.
+    var count = 0
+    for i in 0 ..< buf.len:
+      let (b, err) = uart.recvByte(timeout)
+      if err != uartOk:
+        return (count, if count > 0: uartOk else: err)
+      buf[i] = b
+      count.inc
+    (count, uartOk)

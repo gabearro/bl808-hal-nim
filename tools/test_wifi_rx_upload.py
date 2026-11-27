@@ -11,6 +11,7 @@ import subprocess
 
 import pytest
 
+from test_wifi_message_allocation import RX_RING_CONFIG_IMPORT
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -279,7 +280,7 @@ def test_rx_upload_handler(pbuf_input: bool, tmp_path: Path) -> None:
     signature = "proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} ="
     handler = signature + firmware.split(signature, 1)[1].split("\nproc ", 1)[0]
     source = tmp_path / "rx_upload_test.nim"
-    source.write_text("proc irqSave(): uint32 = 8\n"
+    source.write_text(RX_RING_CONFIG_IMPORT + "proc irqSave(): uint32 = 8\n"
                      "proc irqRestore(saved: uint32) = discard\n"
                      + PLATFORM + "\n" + strip_helper + "\n" + handler + "\n" + CHECKS)
     command = [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on",

@@ -108,14 +108,14 @@ proc smokeI2c() =
   enableI2cClock()
   let bus = initI2c(i2c0, i2cFast, ConsoleClkHz)
   checkEq("i2c tx fifo address", bus.txFifoAddr().uint32, (I2c0Base + I2cFifoWdata).uint32)
-  bus.enableDmaTx()
-  bus.enableDmaRx()
-  check("i2c dma enable", (regRead(bus.base + I2cFifoConfig0) and
-        ((1'u32 shl I2cFifoDmaTxEn) or (1'u32 shl I2cFifoDmaRxEn))) != 0)
   let wrErr = bus.writeRegByte(0x50'u8, 0x00'u8, 0xA5'u8)
   let (_, rdErr) = bus.readRegByte(0x50'u8, 0x00'u8)
   check("i2c bounded register helpers", wrErr in {i2cOk, i2cNak, i2cArbLost, i2cTimeout} and
         rdErr in {i2cOk, i2cNak, i2cArbLost, i2cTimeout})
+  bus.enableDmaTx()
+  bus.enableDmaRx()
+  check("i2c dma enable", (regRead(bus.base + I2cFifoConfig0) and
+        ((1'u32 shl I2cFifoDmaTxEn) or (1'u32 shl I2cFifoDmaRxEn))) != 0)
   discard bus.busy()
   bus.deinitI2c()
   check("i2c deinit", (regRead(bus.base + I2cConfig) and (1'u32 shl I2cMasterEn)) == 0)

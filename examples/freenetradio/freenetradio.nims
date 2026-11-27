@@ -8,6 +8,14 @@
 # time. `tcpconn.nim` sizes its buffers from the same number.
 switch("passC", "-DTCP_WND=10240")
 
+# FreeNetRadio's measured RX DMA ring depth.
+if not defined(WifiRxRingSlots):
+  switch("define", "WifiRxRingSlots=8")
+
+# Keep host submission slots separate from the live MAC DMA chain.
+if not defined(bl808WifiCombinedTxSlots):
+  switch("define", "bl808WifiSplitTxSlots")
+
 # WPA2 key derivation (4096 rounds of HMAC-SHA-1 when joining) on the chip's
 # SHA engine, like the rest of this firmware's hashing.
 switch("define", "bl808WifiMbedTlsSha1Hardware")

@@ -1,0 +1,10 @@
+(module
+  (type $entry (shared (func (result i32))))
+  (memory 1 1 shared)
+  (global $offset (shared i32) (i32.const 0))
+  (data (global.get $offset) "\2a")
+  (data $passive "\01\00\00")
+  (func (export "initialize") (type $entry)
+    (memory.init $passive (i32.const 1) (i32.const 0) (i32.const 3))
+    (data.drop $passive)
+    (i32.sub (i32.load (i32.const 0)) (i32.const 256))))

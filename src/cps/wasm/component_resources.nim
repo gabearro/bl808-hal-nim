@@ -35,6 +35,11 @@ type
     rsVacant
     rsOwned
     rsBorrowed
+    rsAsync
+    rsErrorContext
+
+  ComponentErrorContextValue* = ref object
+    message: string
 
   ResourceSlot = object
     kind: ResourceSlotKind
@@ -43,6 +48,8 @@ type
     lends: uint16
     rootOwner: uint32
     scope: uint32
+    when defined(wasmComponentErrorContext):
+      errorContext: ComponentErrorContextValue
 
   ComponentResourceTable* = object
     types: seq[ResourceType]
@@ -54,6 +61,10 @@ type
     freeHead: uint32
     liveOwned: uint32
     liveBorrowed: uint32
+    when defined(wasmComponentAsyncCallbacks):
+      liveAsync: uint32
+    when defined(wasmComponentErrorContext):
+      liveErrorContexts: uint32
 
   ComponentResourceStats* = object
     liveOwned*: uint32
@@ -99,7 +110,7 @@ proc bindResourceType*(table: var ComponentResourceTable, typeIndex, canonicalTy
   if not table.validType(typeIndex) or not table.validType(canonicalType):
     return crInvalidType
   for slot in table.slots:
-    if slot.kind != rsVacant and slot.typeIndex.uint32 == typeIndex:
+    if slot.kind in {rsOwned, rsBorrowed} and slot.typeIndex.uint32 == typeIndex:
       return crInvalidType
   table.types[typeIndex.int].identity = table.types[canonicalType.int].identity
   table.types[typeIndex.int].destructor = destructor
@@ -129,6 +140,49 @@ proc release(table: var ComponentResourceTable, handle: uint32) =
     table.slots[handle.int].rootOwner = table.freeHead
     table.freeHead = handle
 
+when defined(wasmComponentAsyncCallbacks):
+  proc newAsyncHandle*(table: var ComponentResourceTable, handle: var uint32): bool =
+    if table.locked or not table.reserve(handle): return false
+    table.slots[handle.int] = ResourceSlot(kind: rsAsync)
+    inc table.liveAsync
+    true
+
+  proc dropAsyncHandle*(table: var ComponentResourceTable, handle: uint32): bool =
+    if table.locked or not table.liveSlot(handle) or table.slots[handle.int].kind != rsAsync:
+      return false
+    table.release(handle)
+    dec table.liveAsync
+    true
+
+when defined(wasmComponentErrorContext):
+  proc newErrorContextValue*(message: sink string): ComponentErrorContextValue =
+    ComponentErrorContextValue(message: move message)
+
+  proc debugMessage*(value: ComponentErrorContextValue): string = value.message
+
+  proc newErrorContextHandle*(table: var ComponentResourceTable,
+      value: ComponentErrorContextValue, handle: var uint32): bool =
+    if value == nil or table.locked or not table.reserve(handle): return false
+    table.slots[handle.int] = ResourceSlot(kind: rsErrorContext, errorContext: value)
+    inc table.liveErrorContexts
+    true
+
+  proc errorContextAt*(table: ComponentResourceTable,
+      handle: uint32): ComponentErrorContextValue =
+    if not table.locked and table.liveSlot(handle) and table.slots[handle.int].kind == rsErrorContext:
+      return table.slots[handle.int].errorContext
+
+  proc dropErrorContextHandle*(table: var ComponentResourceTable, handle: uint32): bool =
+    if table.errorContextAt(handle) == nil: return false
+    table.release(handle)
+    dec table.liveErrorContexts
+    true
+
+  proc clearErrorContextHandles*(table: var ComponentResourceTable) =
+    for handle in 1 ..< table.slots.len:
+      if table.slots[handle].kind == rsErrorContext: table.release(handle.uint32)
+    table.liveErrorContexts = 0
+
 proc newOwned*(table: var ComponentResourceTable, typeIndex: uint32,
                rep: uint64, handle: var uint32): ComponentResourceStatus =
   if table.locked: return crLocked
@@ -145,7 +199,8 @@ proc borrow*(table: var ComponentResourceTable, source, scope: uint32,
              handle: var uint32): ComponentResourceStatus =
   if table.locked: return crLocked
   if scope == 0: return crWrongScope
-  if not table.liveSlot(source): return crInvalidHandle
+  if not table.liveSlot(source) or table.slots[source.int].kind notin {rsOwned, rsBorrowed}:
+    return crInvalidHandle
   let original = table.slots[source.int]
   let root = if original.kind == rsOwned: source else: original.rootOwner
   if not table.liveSlot(root) or table.slots[root.int].kind != rsOwned:
@@ -163,7 +218,8 @@ proc borrow*(table: var ComponentResourceTable, source, scope: uint32,
 proc representation*(table: ComponentResourceTable, handle,
                      typeIndex: uint32, rep: var uint64): ComponentResourceStatus =
   if table.locked: return crLocked
-  if not table.liveSlot(handle): return crInvalidHandle
+  if not table.liveSlot(handle) or table.slots[handle.int].kind notin {rsOwned, rsBorrowed}:
+    return crInvalidHandle
   if not table.validType(typeIndex) or
       table.types[table.slots[handle.int].typeIndex.int].identity !=
         table.types[typeIndex.int].identity:
@@ -185,7 +241,7 @@ proc releaseLend*(table: var ComponentResourceTable, handle: uint32) =
 
 proc newScopedBorrow*(table: var ComponentResourceTable, typeIndex, scope: uint32,
                       rep: uint64, handle: var uint32): ComponentResourceStatus =
-  ## Its lender is retained by the calling ABI frame in a different table.
+  ## The caller retains the lender independently of the receiving handle.
   if table.locked: return crLocked
   if scope == 0: return crWrongScope
   if not table.validType(typeIndex): return crInvalidType
@@ -201,6 +257,11 @@ proc hasScopedBorrows*(table: ComponentResourceTable, scope: uint32): bool =
   for slot in table.slots:
     if slot.kind == rsBorrowed and slot.scope == scope:
       return true
+
+when defined(wasmComponentAsyncCallbacks):
+  proc borrowScopeForHandle*(table: ComponentResourceTable, handle: uint32): uint32 =
+    if table.liveSlot(handle) and table.slots[handle.int].kind == rsBorrowed:
+      result = table.slots[handle.int].scope
 
 proc takeOwnedRepresentation*(table: var ComponentResourceTable, handle,
                               typeIndex: uint32,
@@ -317,6 +378,7 @@ proc drainResourceTable*(table: var ComponentResourceTable): ComponentResourceSt
 proc closeResourceTable*(table: var ComponentResourceTable): ComponentResourceStatus =
   result = table.drainResourceTable()
   if result == crOk:
+    when defined(wasmComponentErrorContext): table.clearErrorContextHandles()
     table.locked = true
 
 proc resourceStats*(table: ComponentResourceTable): ComponentResourceStats =
@@ -327,6 +389,10 @@ proc resourceStats*(table: ComponentResourceTable): ComponentResourceStats =
 
 proc hasResourceCapacity*(table: ComponentResourceTable, needed: uint32): bool =
   if table.locked or table.closing: return false
-  let used = if table.reuseFreed: table.liveOwned + table.liveBorrowed
+  var used = if table.reuseFreed: table.liveOwned + table.liveBorrowed
     else: max(0, table.slots.len - 1).uint32
+  when defined(wasmComponentAsyncCallbacks):
+    if table.reuseFreed: used += table.liveAsync
+  when defined(wasmComponentErrorContext):
+    if table.reuseFreed: used += table.liveErrorContexts
   used <= table.capacity and needed <= table.capacity - used

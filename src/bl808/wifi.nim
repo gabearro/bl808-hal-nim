@@ -16,6 +16,9 @@ import mmio, memmap
 
 when defined(bl808m0):
   import kernel/cps
+  import core
+  when defined(radioProfiler):
+    import kernel/profiler
 
 when defined(bl808m0) and not defined(bl808WifiNimFw):
   {.error: "BL808 M0 WiFi now requires -d:bl808WifiNimFw; vendor firmware is no longer supported.".}
@@ -36,10 +39,9 @@ when defined(bl808m0):
   import wifi/rx
   import wifi/tx
   import wifi/utils
+  import wifi/wpa2_pmk
   when defined(bl808WifiMbedTlsSha1Hardware):
     import wifi/mbedtls_sha1_alt
-  else:
-    import wifi/wpa2_pmk
 
 include wifi/facade_parts/public_types
 include wifi/facade_parts/sdk_build_config

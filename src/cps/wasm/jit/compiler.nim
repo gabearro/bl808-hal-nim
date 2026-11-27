@@ -2703,6 +2703,13 @@ proc compileInstr(ctx: var CompilerCtx, instr: Instr) =
       ctx.buf.addReg(rScratch1, rLocals, rScratch1)
       ctx.buf.strImm(rScratch0, rScratch1, 0)
 
+  of opGlobalAtomicGet .. opGlobalAtomicCmpXchg:
+    raise newException(ValueError, "global atomics require interpreter execution")
+  of opMemoryAtomic, opAtomicFence, opMemoryAtomicNotify, opMemoryAtomicWait32, opMemoryAtomicWait64:
+    raise newException(ValueError, "linear-memory atomics require interpreter execution")
+  of opCallRef, opReturnCallRef, opRefAsNonNull:
+    raise newException(ValueError, "typed function references require interpreter execution")
+
   # ---- Memory size/grow ----
   of opMemorySize:
     ctx.emitFlushTos()

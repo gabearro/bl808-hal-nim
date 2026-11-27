@@ -56,6 +56,8 @@ proc bl_pm_ops_register(): uint32 {.importc, cdecl.}
 proc ke_evt_set(events: uint32) {.importc, cdecl.}
 proc wifi_main_poll_once() {.importc, cdecl.}
 proc wifi_nimfw_step_active(): bool {.importc, cdecl.}
+proc wifi_nimfw_work_pending(): bool {.importc, cdecl.}
+proc wifi_nimfw_next_timer_delay_us(): int32 {.importc, cdecl.}
 proc wifi_pm_wake_pending(): bool {.importc, cdecl.}
 proc bl_irq_handler() {.importc, cdecl.}
 proc bl_main_event_handle(param: cint; txFcField: pointer) {.importc, cdecl.}

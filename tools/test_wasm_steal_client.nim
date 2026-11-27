@@ -2,6 +2,8 @@ import bl808/[wasm_full_baseline, wasm_full_manager, wasm_scheduler, wasm_steal_
   wasm_steal_client, wasm_store]
 import cps/runtime
 import std/os
+when defined(wasmChunkedMemory):
+  import cps/wasm/linear_memory
 when defined(wasmSoftStealing):
   import bl808/[wasm_rt_clock, wasm_rt_policy]
   var
@@ -22,6 +24,9 @@ var dropOfferReply = false
 var dropFinishReply = false
 var dropAckReply = false
 var routedSource = 0'u32
+when not defined(wasmSoftStealing):
+  const MemoryDependencySlot = 3'u32
+  var memoryDependencyImage: seq[byte]
 var image = newSeq[byte](WasmProgramHeaderLen.int + WasmFullBaselineModule.len)
 doAssert initWasmProgramImage(
   cast[ptr UncheckedArray[byte]](addr image[0]), image.len.uint32,
@@ -72,18 +77,23 @@ proc fakeRpc(request: openArray[byte], response: pointer,
     responseLen[] = size
     result.complete()
 
-proc prepare(job: WasmStealJob, admission: FullWasmAdmission): WasmSchedulerResult =
+proc prepare(job: WasmStealJob, admission: FullWasmAdmission,
+             memoryFactory: FullMemoryFactory,
+             memoryFactoryContext: pointer): WasmSchedulerResult =
   if rejectPreparation:
     return WasmSchedulerResult(status: wasmSchedOpenFailed)
   var name = ""
   for c in job.exportName:
     if c == '\0': break
     name.add(c)
+  let localImage = when defined(wasmSoftStealing): image
+    else: (if job.slot == MemoryDependencySlot: memoryDependencyImage else: image)
   result = startFullWasmImageTaskI32(
-    cast[ptr UncheckedArray[byte]](addr image[0]), image.len.uint32,
+    cast[ptr UncheckedArray[byte]](unsafeAddr localImage[0]), localImage.len.uint32,
     name, job.args.toOpenArray(0, job.argCount.int - 1),
     maxTotalFuel = job.maxFuel, slotLabel = job.slot.int32,
     maxMemoryPages = job.maxMemoryPages, requireNoStart = true,
+    memoryFactory = memoryFactory, memoryFactoryContext = memoryFactoryContext,
     admission = admission, allowPortableMigration = false, retainTrappedTask = true)
   when defined(wasmSoftStealing): lastPrepared = result.id
 
@@ -339,11 +349,11 @@ else:
       source.outcome.kind == wokReturned and source.outcome.returnedI32() == 42 and
       source.outcome.fuelUsed > 0 and source.outcome.workerCoreBit == core
 
-  proc loadImage(path: string) =
+  proc loadImage(path: string): seq[byte] =
     let module = cast[seq[byte]](readFile(path))
-    image = newSeq[byte](WasmProgramHeaderLen.int + module.len)
-    doAssert initWasmProgramImage(cast[ptr UncheckedArray[byte]](addr image[0]),
-      image.len.uint32, module) == wasmProgramOk
+    result = newSeq[byte](WasmProgramHeaderLen.int + module.len)
+    doAssert initWasmProgramImage(cast[ptr UncheckedArray[byte]](addr result[0]),
+      result.len.uint32, module) == wasmProgramOk
 
   doAssert broker.initWasmStealBroker(21, 100)
   const cores = [wasmCoreM0, wasmCoreD0, wasmCoreLP]
@@ -357,12 +367,10 @@ else:
       if source == target: continue
       inc ticket
       var job = makeJob()
-      job.affinityMask = workers[target].coreBit
+      job.affinityMask = WasmStealAllCores
       let id = workers[source].submit(job, ticket)
       doAssert workers[source].submit(job, ticket) == id
       doAssert workers[source].readOutcome(id) == wssEmpty
-      workers[source].claim()
-      doAssert workers[source].state == wscNoJob
       workers[target].claim()
       let firstRoute = source == 0 and target == 1
       workers[target].finishJob(id, loseReply = firstRoute)
@@ -449,7 +457,10 @@ else:
 
   if paramCount() != 0:
     doAssert paramCount() == 2
-    const d0Service = 1'u32 shl 17
+    let baselineImage = image
+    const
+      d0Service = 1'u32 shl 17
+      d0LocalResource = 1'u16 shl 15
     var hostCalls = 0
     proc add(args: openArray[WasmValue]): seq[WasmValue] =
       inc hostCalls
@@ -462,16 +473,35 @@ else:
     doAssert not workers[2].initWasmStealClient(5, 0, hostCore = wasmCoreLP,
       hostInterfaceMask = d0Service)
     doAssert workers[1].initWasmStealClient(7, 0, hostCore = wasmCoreD0,
-      hostBindings = @[service], resourceMask = WasmStealDirectPsram)
+      hostBindings = @[service], resourceMask = WasmStealDirectPsram or d0LocalResource)
     doAssert workers[2].initWasmStealClient(9, 0, hostCore = wasmCoreLP)
     workers[1].connect()
     workers[2].connect()
-    loadImage(paramStr(1))
+    job.affinityMask = WasmStealAllCores
+    job.requiredResources = d0LocalResource
+    let local = workers[1].submit(job, 1)
+    for index in [2, 0]:
+      workers[index].claim()
+      doAssert workers[index].state == wscNoJob
+    var fallback = job
+    fallback.requiredResources = 0
+    let portable = workers[0].submit(fallback, 1)
+    workers[2].claim()
+    workers[2].finishJob(portable)
+    workers[0].expectReturn(portable, WasmStealLP)
+    workers[0].acknowledge(portable)
+    doAssert broker.stateOfWasmStealJob(local) == wstQueued
+    workers[1].claim()
+    workers[1].finishJob(local)
+    workers[1].expectReturn(local, WasmStealD0)
+    workers[1].acknowledge(local)
+
+    image = loadImage(paramStr(1))
     job.affinityMask = WasmStealAllCores
     job.requiredHostInterfaces = d0Service
     job.requiredResources = WasmStealDirectPsram
     # D0 offers the job. LP and M0 both lack its service and resource.
-    let dependent = workers[1].submit(job, 1)
+    let dependent = workers[1].submit(job, 2)
     for index in [2, 0]:
       workers[index].claim()
       doAssert workers[index].state == wscNoJob
@@ -490,7 +520,7 @@ else:
       hostBindings = @[wrong])
     workers[2].connect()
     job.requiredResources = 0
-    let exact = workers[0].submit(job, 1)
+    let exact = workers[0].submit(job, 2)
     workers[2].claim()
     doAssert workers[2].state == wscNoJob and broker.telemetry.dependencyDeclines == 1
     workers[2].claim()
@@ -509,14 +539,79 @@ else:
     doAssert workers[1].state == wscNoJob and broker.stateOfWasmStealJob(undeclared) == wstQueued
     doAssert hostCalls == 2
 
-    loadImage(paramStr(2))
-    let memBase = cast[ptr UncheckedArray[byte]](addr image[0])
-    let noMemory = startFullWasmImageTaskI32(memBase, image.len.uint32, "run", [],
+    image = baselineImage
+    memoryDependencyImage = loadImage(paramStr(2))
+    var growth = WasmStealJob(slot: MemoryDependencySlot, affinityMask: WasmStealAllCores,
+      requiredBackends: WasmBackendInterpreter, maxFuel: 64)
+    for i, c in "run": growth.exportName[i] = c
+    let needsBacking = workers[1].submit(growth, 3)
+    let beforeDeclines = broker.telemetry.dependencyDeclines
+    for index in [2, 0]:
+      workers[index].claim()
+      doAssert workers[index].state == wscNoJob and
+        broker.stateOfWasmStealJob(needsBacking) == wstQueued
+      workers[index].claim()
+      doAssert workers[index].state == wscNoJob
+    doAssert broker.telemetry.dependencyDeclines == beforeDeclines + 2
+    let afterDecline = workers[0].submit(fallback, 3)
+    workers[2].claim()
+    workers[2].finishJob(afterDecline)
+    workers[0].expectReturn(afterDecline, WasmStealLP)
+    workers[0].acknowledge(afterDecline)
+    workers[1].claim()
+    doAssert workers[1].state == wscReady and workers[1].jobId == needsBacking
+    let limited = resumeWasmTask(workers[1].taskId)
+    doAssert limited.state == wasmTaskExited and limited.result == -1
+    doAssert workers[1].finishWasmSteal()
+    workers[1].drive()
+    discard killWasmTask(limited.id)
+    doAssert workers[1].readOutcome(needsBacking) == wssOk and
+      workers[1].outcome.workerCoreBit == WasmStealD0 and
+      workers[1].outcome.returnedI32() == -1
+    workers[1].acknowledge(needsBacking)
+
+    let memBase = cast[ptr UncheckedArray[byte]](addr memoryDependencyImage[0])
+    let memLen = memoryDependencyImage.len.uint32
+    let noMemory = startFullWasmImageTaskI32(memBase, memLen, "run", [],
       admission = FullWasmAdmission(enforceMemoryQuota: true))
     doAssert noMemory.status == wasmSchedOk and resumeWasmTask(noMemory.id).result == -1
     discard killWasmTask(noMemory.id)
-    let withMemory = startFullWasmImageTaskI32(memBase, image.len.uint32, "run", [],
+    let withMemory = startFullWasmImageTaskI32(memBase, memLen, "run", [],
       maxMemoryPages = 1, admission = FullWasmAdmission(enforceMemoryQuota: true))
     doAssert withMemory.status == wasmSchedOk and resumeWasmTask(withMemory.id).result == 0
     discard killWasmTask(withMemory.id)
-    echo "WASM steal dependency PASS: core-local service, typed linking and zero-page quota"
+    echo "WASM steal dependency PASS: core-local service, typed linking, memory backing and quota"
+
+    when defined(wasmChunkedMemory):
+      var factoryCalls = 0
+      proc createBacking(ctx: pointer, mt: MemType): ref LinearMemory {.nimcall.} =
+        inc cast[ptr int](ctx)[]
+        doAssert mt.limits.min == 0 and mt.limits.max == 1
+        new(result)
+        doAssert result[].initLinearMemory(LinearMemoryConfig(maxPages: 1,
+          admissionPages: 1, maxCommittedChunks: 1, residentChunks: 1)) == lmOk
+      doAssert not workers[2].initWasmStealClient(12, 1, hostCore = wasmCoreLP,
+        resourceMask = WasmStealPagedBacking)
+      doAssert workers[2].initWasmStealClient(12, 1, hostCore = wasmCoreLP,
+        resourceMask = WasmStealPagedBacking, memoryFactory = createBacking,
+        memoryFactoryContext = addr factoryCalls)
+      workers[2].connect()
+      var paged = WasmStealJob(slot: MemoryDependencySlot, affinityMask: WasmStealAllCores,
+        requiredBackends: WasmBackendInterpreter, requiredResources: WasmStealPagedBacking,
+        maxMemoryPages: 1, maxFuel: 64)
+      for i, c in "run": paged.exportName[i] = c
+      let backed = workers[1].submit(paged, 4)
+      workers[0].claim()
+      doAssert workers[0].state == wscNoJob
+      workers[2].claim()
+      doAssert workers[2].state == wscReady and workers[2].jobId == backed and factoryCalls == 1
+      let task = resumeWasmTask(workers[2].taskId, 64)
+      doAssert task.state == wasmTaskExited and task.result == 0
+      doAssert workers[2].finishWasmSteal()
+      workers[2].drive()
+      discard killWasmTask(task.id)
+      doAssert workers[1].readOutcome(backed) == wssOk and
+        workers[1].outcome.workerCoreBit == WasmStealLP and
+        workers[1].outcome.returnedI32() == 0
+      workers[1].acknowledge(backed)
+      echo "WASM steal paged dependency PASS: LP used its registered memory factory"

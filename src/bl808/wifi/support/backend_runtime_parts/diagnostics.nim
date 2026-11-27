@@ -1,6 +1,16 @@
 proc bl808_wifi_backend_scan_count*(): uint32 {.exportc, cdecl.} =
   scanItemCount
 
+when defined(radioDiag):
+  proc bl808_wifi_backend_cps_compat_counts*(snapshot: ptr array[3, uint32])
+      {.exportc, cdecl.} =
+    snapshot[] = [wifiCpsNestedWaitPolls, wifiCpsSleepPolls, wifiCpsLegacyPollCalls]
+
+  proc bl808_wifi_backend_cps_compat_reset*() {.exportc, cdecl.} =
+    wifiCpsNestedWaitPolls = 0
+    wifiCpsSleepPolls = 0
+    wifiCpsLegacyPollCalls = 0
+
 proc bl808_wifi_backend_scan_done_count*(): uint32 {.exportc, cdecl.} =
   scanDoneCount
 

@@ -78,6 +78,7 @@ proc vendorPollOnce() =
   inc polls
   doAssert polls <= maxPolls, "wait did not terminate"
   if pollHook != nil: pollHook()
+proc vendorNotifyWork() = discard
 '''
     code += (SUPPORT / "defs_parts/local_types.nim").read_text()
     code += (SUPPORT / "os_adapter_parts/object_waits.nim").read_text()

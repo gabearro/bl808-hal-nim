@@ -54,6 +54,57 @@ proc invertPixel*(fb: var FrameBuf; x, y: int) {.inline.} =
   ## 15 minus what is there (upstream's `Invert` draw target).
   fb.setPixel(x, y, 15'u8 - fb.pixel(x, y))
 
+proc drawMask*(fb: var FrameBuf; x, y, width: int; rows: openArray[uint16];
+               level: uint8; invert: bool) =
+  ## Draw a 1-bit mask up to 16 pixels wide. Each row starts at bit 15.
+  const PairMasks = [0x00'u8, 0x0F, 0xF0, 0xFF]
+  let left = max(x, fb.x0.int)
+  let right = min(x + width, fb.x1.int)
+  let top = max(y, fb.y0.int)
+  let bottom = min(y + rows.len, fb.y1.int)
+  if left >= right or top >= bottom: return
+
+  let keep = 0xFFFF'u16 shl (16 - (right - left))
+  let skip = left - x
+  let align = 16 - (left and 1)
+  let gray = level and 0x0F
+  let packed = (gray shl 4) or gray
+  for yy in top ..< bottom:
+    var bits = (((rows[yy - y] shl skip) and keep).uint32 shl align)
+    var i = yy * (Width div 2) + (left shr 1)
+    while bits != 0:
+      let mask = PairMasks[bits shr 30]
+      if mask != 0:
+        if invert:
+          fb.buf[i] = fb.buf[i] xor mask
+        elif mask == 0xFF:
+          fb.buf[i] = packed
+        else:
+          fb.buf[i] = (fb.buf[i] and not mask) or (packed and mask)
+      bits = bits shl 2
+      inc i
+
+proc fillRect*(fb: var FrameBuf; x, y, w, h: int; level: uint8) =
+  ## Clip once and write whole bytes between the two edge pixels.
+  let left = max(x, fb.x0.int)
+  let right = min(x + w, fb.x1.int)
+  let top = max(y, fb.y0.int)
+  let bottom = min(y + h, fb.y1.int)
+  if left >= right or top >= bottom: return
+
+  let gray = level and 0x0F
+  let packed = (gray shl 4) or gray
+  for yy in top ..< bottom:
+    let offset = yy * (Width div 2)
+    if (left and 1) != 0:
+      let i = offset + (left shr 1)
+      fb.buf[i] = (fb.buf[i] and 0xF0) or gray
+    for i in offset + ((left + 1) shr 1) ..< offset + (right shr 1):
+      fb.buf[i] = packed
+    if (right and 1) != 0:
+      let i = offset + (right shr 1)
+      fb.buf[i] = (fb.buf[i] and 0x0F) or (gray shl 4)
+
 proc clear*(fb: var FrameBuf; level: uint8 = 0) =
   ## Fill the whole screen (the clip does not apply).
   let l = level and 0x0F

@@ -24,6 +24,7 @@ proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] 
   wifiDisconnectFuture = fut
   wifiDisconnectIssuePending = true
   wifiDisconnectIssueTimeoutMs = timeoutMs
+  bl808_wifi_backend_signal_work()
   return fut
 
 proc wifiDisconnect*(): WifiError =
@@ -43,12 +44,12 @@ proc wifiDisconnectAsync*(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
   if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
     return failedLocalFuture[WifiError](
       newException(CatchableError, "WiFi disconnect already pending"))
-  wifiServicePump()
+  wifiWakeServiceOrPump()
   if not wifiBackendConnected() and wifiNimFirmwareStaIdle():
     return completedLocalFuture(wifiOk)
   if wifiBackendUsesEventFutures():
     if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
       return failedLocalFuture[WifiError](
         newException(CatchableError, "WiFi disconnect already pending"))
-    wifiServicePump(64)
+    wifiWakeServiceOrPump(64)
   return wifiIssueDisconnectAsync(timeoutMs)

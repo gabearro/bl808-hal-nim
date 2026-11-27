@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import RX_RING_CONFIG_IMPORT
 from test_wifi_rx_upload import RX_FORWARD_SHIM
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -331,7 +332,7 @@ def test_rx_chain(mode, pbuf_input, tmp_path):
     source += procedure(upper, "rxu_swdesc_upload_evt")
     source += procedure((FW / "mac_config_debug.nim").read_text(), "bl60x_firmwre_mpdu_free")
     path = tmp_path / "rx_chain.nim"
-    path.write_text(source + CHECKS)
+    path.write_text(RX_RING_CONFIG_IMPORT + source + CHECKS)
     binary = tmp_path / "test"
     command = [nim, "c", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
                f"--nimcache:{tmp_path / 'cache'}", f"-o:{binary}"]

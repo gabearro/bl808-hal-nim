@@ -16,10 +16,10 @@ type CoList = object
 
 SUPPORT = r'''
 var
-  headers: array[41, RxHeaderHwDescView]
-  payloads: array[41, RxPayloadHwDescView]
-  buffers: array[41, RxPayloadBufferView]
-  software: array[41, RxSwTableDescView]
+  headers: array[WifiRxRingSlots, RxHeaderHwDescView]
+  payloads: array[WifiRxRingSlots, RxPayloadHwDescView]
+  buffers: array[WifiRxRingSlots, RxPayloadBufferView]
+  software: array[WifiRxRingSlots, RxSwTableDescView]
   lower: RxlCntrlEnvView
   hardware: RxHwDescEnvView
   triggers: seq[uint32]
@@ -100,14 +100,14 @@ proc reset() =
   disabledMacIrqs = 0
   irqLevel = 8
   rxInitializationEpoch = 0
-  for i in 0 ..< 41:
+  for i in 0 ..< WifiRxRingSlots:
     headers[i].magic = 0x12345678
-    headers[i].next = addr headers[(i + 3) mod 41]
+    headers[i].next = addr headers[(i + 3) mod WifiRxRingSlots]
     headers[i].flags = 0xFFFF0001'u32
     headers[i].bufferAddr = 0x34567890
     headers[i].tsfLow = 0xB6B61234'u32
     payloads[i].magic = 0x23456789
-    payloads[i].next = addr payloads[(i + 5) mod 41]
+    payloads[i].next = addr payloads[(i + 5) mod WifiRxRingSlots]
     payloads[i].status = 0xA5A51234'u32
 '''
 
@@ -162,13 +162,13 @@ for full in 0'u32 .. 1:
   for initialIrq in [0'u32, 8]:
     reset()
     irqLevel = initialIrq
-    for i in 0 ..< 41:
+    for i in 0 ..< WifiRxRingSlots:
       headers[i].usedFlag = (i mod 4 == 1).uint32
       payloads[i].usedFlag = (i mod 3 == 1).uint32
     let originalHeaders = headers
     let originalPayloads = payloads
     var eligibleHeaders, eligiblePayloads: seq[int]
-    for i in 0 ..< 41:
+    for i in 0 ..< WifiRxRingSlots:
       if full != 0 or headers[i].usedFlag != 1: eligibleHeaders.add(i)
       if full != 0 or payloads[i].usedFlag != 1: eligiblePayloads.add(i)
     rxl_hwdesc_init(full)
@@ -197,7 +197,7 @@ for full in 0'u32 .. 1:
       doAssert payloads[i].bufferStart == payloads[i].bufferAddr
       doAssert payloads[i].bufferEnd == payloads[i].bufferAddr + 1735
     if full == 0:
-      for i in 0 ..< 41:
+      for i in 0 ..< WifiRxRingSlots:
         if i notin eligibleHeaders: doAssert headers[i] == originalHeaders[i]
         if i notin eligiblePayloads: doAssert payloads[i] == originalPayloads[i]
     doAssert enters == 1 and exits == 1 and irqLevel == initialIrq
@@ -208,7 +208,7 @@ for matchesHardware in [false, true]:
     reset()
     hardware.pdCurrent = addr payloads[0]
     hardware.pdTail = addr payloads[1]
-    pdHead = pointerAddrU32(if matchesHardware: addr payloads[0] else: addr payloads[9])
+    pdHead = pointerAddrU32(if matchesHardware: addr payloads[0] else: addr payloads[payloads.high])
     let first = if multiple: addr payloads[2] else: addr payloads[4]
     let previous = if multiple: cast[pointer](addr payloads[3]) else: nil
     payloads[2].next = addr payloads[3]
@@ -225,7 +225,7 @@ for matchesHardware in [false, true]:
     doAssert hardware.pdCurrent == addr payloads[if matchesHardware: 0 else: 4]
     if not matchesHardware and multiple:
       doAssert payloads[0].next == addr payloads[2]
-    for i in 0 ..< 41:
+    for i in 0 ..< WifiRxRingSlots:
       if i != selected: doAssert payloads[i].status == old[i].status
       doAssert payloads[i].usedFlag == old[i].usedFlag
     doAssert triggers == @[0x02000000'u32] and errors == 0
@@ -240,7 +240,7 @@ for matchesHardware in [false, true]:
     lower.currentHd = addr headers[0]
     lower.submittedTail = addr headers[1]
     lower.submittedHead = if empty: nil else: addr headers[1]
-    hdHead = pointerAddrU32(if matchesHardware: addr headers[0] else: addr headers[9])
+    hdHead = pointerAddrU32(if matchesHardware: addr headers[0] else: addr headers[headers.high])
     let old = headers
     rxl_hd_append(addr headers[2])
     let selected = if matchesHardware: 2 else: 0
@@ -252,7 +252,7 @@ for matchesHardware in [false, true]:
     doAssert lower.currentHd == addr headers[if matchesHardware: 0 else: 2]
     doAssert lower.submittedHead == addr headers[if empty: selected else: 1]
     doAssert forgotten == @[selected] and triggers == @[0x01000000'u32]
-    for i in 0 ..< 41:
+    for i in 0 ..< WifiRxRingSlots:
       if i != selected and i != 1: doAssert headers[i] == old[i]
     doAssert errors == 0
 reset()
@@ -273,21 +273,21 @@ for cycle in 0 ..< 123:
   pdHead = if matchesHardware: pointerAddrU32(hardware.pdCurrent) else: 0
   rxl_pd_append(releasedPayload, nil, releasedPayload)
   rxl_hd_append(releasedHeader)
-  var seenHeaders, seenPayloads: array[41, bool]
+  var seenHeaders, seenPayloads: array[WifiRxRingSlots, bool]
   var header = lower.submittedHead
   var payload = firstPayload
-  for position in 0 ..< 40:
+  for position in 0 ..< (WifiRxRingSlots - 1):
     doAssert header != nil and payload != nil
     doAssert header != lower.currentHd and payload != hardware.pdCurrent
     var headerIndex, payloadIndex = -1
-    for i in 0 ..< 41:
+    for i in 0 ..< WifiRxRingSlots:
       if header == addr headers[i]: headerIndex = i
       if payload == addr payloads[i]: payloadIndex = i
     doAssert headerIndex >= 0 and payloadIndex >= 0
     doAssert not seenHeaders[headerIndex] and not seenPayloads[payloadIndex]
     seenHeaders[headerIndex] = true
     seenPayloads[payloadIndex] = true
-    if position == 39:
+    if position == (WifiRxRingSlots - 2):
       doAssert header == lower.submittedTail and payload == hardware.pdTail
     header = rxHeaderHwDescView(header).next
     payload = rxDmaProgressDescAt(payload).next
@@ -299,5 +299,6 @@ doAssert errors == 0 and irqLevel == 8
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_rx_dma_ring(tmp_path: Path, mode: str, case: str) -> None:
-    run_program(tmp_path, mode, source() + CASES[case])
+@pytest.mark.parametrize("slots", [8, 41])
+def test_rx_dma_ring(tmp_path: Path, mode: str, case: str, slots: int) -> None:
+    run_program(tmp_path, mode, source() + CASES[case], defines=(f"WifiRxRingSlots={slots}",))

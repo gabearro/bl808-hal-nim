@@ -8,6 +8,7 @@
 ## plus (size - 1) div 2.
 
 import ./framebuf, ./fonts
+export framebuf.fillRect
 
 {.localPassC: "-ffp-contract=off".}   # the arc's trigonometry must round as upstream's
 
@@ -57,25 +58,12 @@ proc drawText*(fb: var FrameBuf; text: openArray[char]; x, y: int;
   let top = if baseline == blMiddle: y - (h - 1) div 2 else: y
   for c in text:
     if c.isContinuation: continue         # one glyph ('?') per non-ASCII character
-    for row in 0 ..< h:
-      var bits = s.font.glyphRow(c, row)
-      var col = 0
-      while bits != 0:
-        if (bits and 0x8000) != 0:
-          if s.invert: fb.invertPixel(px + col, top + row)
-          else: fb.setPixel(px + col, top + row, s.level)
-        bits = bits shl 1
-        inc col
+    fb.drawMask(px, top, w, s.font.glyphRows(c), s.level, s.invert)
     px += w + s.spacing
 
 proc hline*(fb: var FrameBuf; x0, x1, y: int; level: uint8) =
   ## A 1 px horizontal line from `x0` to `x1` inclusive.
-  for x in x0 .. x1: fb.setPixel(x, y, level)
-
-proc fillRect*(fb: var FrameBuf; x, y, w, h: int; level: uint8) =
-  for yy in y ..< y + h:
-    for xx in x ..< x + w:
-      fb.setPixel(xx, yy, level)
+  fb.fillRect(x0, y, x1 - x0 + 1, 1, level)
 
 # ---- Circles and arcs -------------------------------------------------------
 # embedded-graphics tests doubled coordinates against a squared diameter, so
@@ -98,8 +86,7 @@ proc fillCircle*(fb: var FrameBuf; cx, cy, diameter: int; level: uint8) =
       let dx = 2 * x - c2x
       if dx * dx + dy * dy < threshold:
         # The row is symmetric: it runs from here to the mirrored column.
-        for xx in x ..< left + diameter - (x - left):
-          fb.setPixel(xx, y, level)
+        fb.fillRect(x, y, diameter - 2 * (x - left), 1, level)
         break
 
 # micromath 2.x `F32Ext::cos` / `sin`, which embedded-graphics uses without
@@ -213,5 +200,4 @@ proc fillRoundRect*(fb: var FrameBuf; x, y, w, h, rx, ry: int; level: uint8) =
       if xs == x + w: xs = x                    # no pixel found: the full row
       while xe > x and not inEllipse(xe - 1, yy, x + w - 2 * rx, ey, rx, ry, threshold): dec xe
       if xe == x: xe = x + w
-    for xx in xs ..< xe:
-      fb.setPixel(xx, yy, level)
+    fb.fillRect(xs, yy, xe - xs, 1, level)

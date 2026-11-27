@@ -49,6 +49,18 @@ proc portableMemoryLimit(mem: var MemInst): uint32 =
 proc portableReferenceValid(raw: uint64, vt: ValType, funcs: int): bool =
   raw == high(uint32).uint64 or (vt == vtFuncRef and raw < funcs.uint64)
 
+proc portableTableReferenceValid(vm: WasmVM, table: TableType, raw: uint64): bool =
+  if not portableReferenceValid(raw, table.elemType, vm.store.funcs.len): return false
+  when defined(wasmFunctionReferences):
+    vm.typedValueMatches(table.elemType, table.elementReference, rawToWasmValue(raw, table.elemType))
+  else: true
+
+proc portableGlobalReferenceValid(vm: WasmVM, global: GlobalType, raw: uint64): bool =
+  if not portableReferenceValid(raw, global.valType, vm.store.funcs.len): return false
+  when defined(wasmFunctionReferences):
+    vm.typedValueMatches(global.valType, global.reference, rawToWasmValue(raw, global.valType))
+  else: true
+
 type PortableMemoryCapture = object
   when defined(wasmChunkedMemory):
     memory: ref LinearMemory
@@ -116,7 +128,7 @@ proc capturePortableStore(vm: WasmVM, data: var WasmPortableSnapshot,
     for i, entry in table.elems:
       let raw = wasmValueToRaw(entry)
       if entry.kind != elemType.toValueKind() or
-          not portableReferenceValid(raw, elemType, vm.store.funcs.len):
+          not vm.portableTableReferenceValid(table.tableType, raw):
         return wpsUnsupportedState
       portableWrite(view, at + 4 + 4 * i, raw.uint32)
   for global in vm.store.globals:
@@ -129,7 +141,7 @@ proc capturePortableStore(vm: WasmVM, data: var WasmPortableSnapshot,
       requirePortableIo(data.portableView().writePortableRange(at, unsafeAddr global.value.v128[0], 16))
     else:
       let raw = wasmValueToRaw(global.value)
-      if vt.isRefType and not portableReferenceValid(raw, vt, vm.store.funcs.len):
+      if vt.isRefType and not vm.portableGlobalReferenceValid(global.globalType, raw):
         return wpsUnsupportedState
       portableWrite(data.portableView(), at, raw)
   let at = data.appendPortable(vm.store.elems.len + vm.store.datas.len, maxBytes)
@@ -223,9 +235,8 @@ proc restorePortableStoreTail(vm: var WasmVM, data: WasmPortableStaging, at: int
     when apply: table.elems.setLen(count.int)
     for i in 0 ..< count.int:
       let raw = portableRead32(data, pos).uint64
-      let vt = table.tableType.elemType
-      if not portableReferenceValid(raw, vt, vm.store.funcs.len): return false
-      when apply: table.elems[i] = rawToWasmValue(raw, vt)
+      if not vm.portableTableReferenceValid(table.tableType, raw): return false
+      when apply: table.elems[i] = rawToWasmValue(raw, table.tableType.elemType)
       pos += 4
   for global in vm.store.globals.mitems:
     if global.globalType.mut == mutConst: continue
@@ -238,7 +249,7 @@ proc restorePortableStoreTail(vm: var WasmVM, data: WasmPortableStaging, at: int
     else:
       let raw = portableRead64(data, pos)
       if (vt in {vtI32, vtF32} and raw > high(uint32).uint64) or
-          (vt.isRefType and not portableReferenceValid(raw, vt, vm.store.funcs.len)):
+          (vt.isRefType and not vm.portableGlobalReferenceValid(global.globalType, raw)):
         return false
       when apply: global.value = rawToWasmValue(raw, vt)
     pos += size

@@ -231,7 +231,9 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
                      respType: SdhRespType, dataPresent: bool = false,
                      transferMode: uint16 = 0, crcCheck: bool = true,
                      cmdType: uint32 = CmdTypeNormal,
-                     timeout: uint32 = 1_000_000): SdhError =
+                     timeout: uint32 = 1_000_000,
+                     blockSize, blockCount: uint16 = 0,
+                     admaAddress: uint32 = 0): SdhError =
   ## Send an SD command and wait for completion.
 
   # Wait for CMD line not busy
@@ -253,6 +255,14 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
 
   # Set argument
   regWrite(SdhArgument, argument)
+
+  # SDH can ignore block-register writes while DAT is inhibited, including
+  # during the busy response to card selection.
+  if dataPresent and blockSize != 0:
+    regWrite16(SdhBlockSize, blockSize)
+    regWrite16(SdhBlockSize + 2'u, blockCount)
+  if dataPresent and admaAddress != 0:
+    regWrite(SdhAdmaAddr, admaAddress)
 
   # Build command register value
   var cmd = transferMode.uint32 or

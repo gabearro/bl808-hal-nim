@@ -1,6 +1,9 @@
 ## Sleep, event group, event notification, and task adapter callbacks.
 
 proc osSleepUs(duration: uint64) =
+  when defined(radioDiag):
+    if wifiSchedulerWorkHook != nil:
+      inc wifiCpsSleepPolls
   if duration == 0:
     return
   var remaining = duration
@@ -121,6 +124,7 @@ proc osTaskNotify(taskHandle: pointer) {.cdecl.} =
   let saved = osEnterCritical()
   defer: osExitCritical(saved)
   osTaskNotifications = osTaskNotifications + 1'u32
+  vendorNotifyWork()
 proc osTaskWait(taskHandle: pointer; tick: uint32) {.cdecl.} =
   discard taskHandle
   var state = osWaitState(tick)

@@ -1,0 +1,26 @@
+(component
+  (type $unit (future))
+  (core func $new (canon future.new $unit))
+  (core func $write (canon future.write $unit async))
+  (core func $read (canon future.read $unit async))
+  (core module $m
+    (import "" "n" (func $new (result i64)))
+    (import "" "w" (func $write (param i32 i32) (result i32)))
+    (import "" "r" (func $read (param i32 i32) (result i32)))
+    (func (export "make") (result i32)
+      (local $pair i64)
+      (local.set $pair (call $new))
+      (if (i32.ne (call $write
+                    (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32)))
+                    (i32.const -1))
+                  (i32.const -1)) (then unreachable))
+      (i32.wrap_i64 (local.get $pair)))
+    (func (export "consume") (param $reader i32) (result i32)
+      (if (call $read (local.get $reader) (i32.const -1)) (then unreachable))
+      (i32.const 42)))
+  (core instance $m (instantiate $m (with "" (instance
+    (export "n" (func $new)) (export "w" (func $write))
+    (export "r" (func $read))))))
+  (func (export "make") (result $unit) (canon lift (core func $m "make")))
+  (func (export "consume") (param "reader" $unit) (result u32)
+    (canon lift (core func $m "consume"))))

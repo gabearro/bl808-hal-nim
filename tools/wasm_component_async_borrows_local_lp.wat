@@ -1,0 +1,18 @@
+(component
+  (type $r (resource (rep i32)))
+  (export $named "r" (type $r))
+  (core func $new (canon resource.new $r))
+  (core func $return (canon task.return (result u32)))
+  (core module $m
+    (import "" "r" (func $return (param i32)))
+    (func (export "start") (param i32) (result i32)
+      (if (i32.ne (local.get 0) (i32.const 42)) (then unreachable))
+      (i32.const 1))
+    (func (export "next") (param i32 i32 i32) (result i32)
+      (call $return (i32.const 42))
+      (i32.const 0)))
+  (core instance $i (instantiate $m (with "" (instance (export "r" (func $return))))))
+  (func (export "new") (param "value" u32) (result (own $named))
+    (canon lift (core func $new)))
+  (func (export "use") async (param "value" (borrow $named)) (result u32)
+    (canon lift (core func $i "start") async (callback (core func $i "next")))))

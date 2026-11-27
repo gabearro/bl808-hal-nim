@@ -2,6 +2,11 @@ proc vendorPrintChar(c: char)
 proc vendorPutsRaw(s: cstring)
 proc vendorPrintU32(value: uint32; base: uint32)
 proc vendorPollOnce()
+proc vendorNotifyWork()
+proc mgmrPmPending(): bool
+proc osTimerNextDelayUs(nowUs: uint64): uint64
+proc aosNextDelayedDelayUs(nowUs: uint64): uint64
+proc aosEventsPending(): bool
 proc aosPollEvents()
 proc aosPollDelayedActions()
 proc aos_post_event*(`type`, code: uint16; value: culong): cint {.exportc, cdecl.}

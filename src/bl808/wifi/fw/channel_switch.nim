@@ -108,6 +108,7 @@ proc chanSwitchFinish(arrived: bool) =
   if pmSet and current != nil and chanCtxtAt(current).contextIndexOrMarker <= 2 and
       psAwake():
     blmac_pwr_mgt_setf(0)
+  when defined(bl808m0): postponedTxChannelReady()
 
 proc chanSwitchRedirect() =
   ## The destination leaves the pool. As in chan.o chan_ctxt_unlink, the

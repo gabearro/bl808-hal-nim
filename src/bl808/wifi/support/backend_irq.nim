@@ -50,7 +50,9 @@ proc bl808WifiBackendMacIrqTrampoline() {.cdecl.} =
   inc macIrqCount
   inc macTrapIrqCount
   mac_irq()
+  vendorNotifyWork()
 
 proc bl808WifiBackendIpcIrqTrampoline() {.cdecl.} =
   inc ipcTrapIrqCount
   bl_irq_handler()
+  vendorNotifyWork()

@@ -15,6 +15,16 @@ execution backends, host interfaces, and initialized platform resources
 and enough guest pages. Zero is a zero-page growth quota. Direct PSRAM is
 eligible on M0 and D0 when initialized. Direct SD is eligible on M0.
 LP can advertise paged backing through its configured XRAM memory factory.
+Pass that factory and its context to `initWasmStealClient` when setting
+`WasmStealPagedBacking`. The worker uses the registered factory to prepare
+claimed jobs. A paged advertisement without the factory is rejected.
+Firmware can assign resource bits 8–15 to additional dependencies, such as
+a D0-local device or an IPC service. Use the same bit assignments on all
+three cores. Set the bit in the job's `requiredResources` and advertise it
+in a worker's `resourceMask` only after the dependency is available. Keep
+advertised resources available for the lifetime of the worker's jobs.
+Affinity can still be broad, so another core becomes eligible if it can
+provide the same dependency.
 
 Best-effort workers derive advertised host bits from local typed
 `FullWasmHostBinding` registrations. The application assigns the same
@@ -26,12 +36,17 @@ binding declines the job for that worker's current boot, leaving it
 eligible elsewhere while the worker can claim other work. RT-policy builds
 keep these host bindings disabled pending a bounded host call contract.
 
+A module declaring linear memory also needs a local memory factory on M0
+or LP. Preparation checks the module even when the job allows zero pages.
+A worker without the factory declines that job for its current boot, so it
+can claim other work and a worker with suitable memory can run the job.
+
 The descriptor carries scalar input and no VM instance, local resource
 handles, or native stack. The worker prepares a normal full task using the
 destination's flash mapping. It leaves the task dormant until the M0 broker
-rechecks eligibility and acknowledges the start. Started broker jobs stay
-on the claiming core until completion. The portable suspension path needs an
-ownership handoff that preserves the broker's claim and the job dependencies.
+rechecks eligibility and acknowledges the start. The opt-in managed
+migration path below can transfer an eligible started job at a portable
+suspension point.
 
 The owner serializes claims, applies capability and affinity checks, and
 leases only unstarted jobs. An expired or reset peer's unstarted claim returns
@@ -101,13 +116,18 @@ nim c -r -d:bl808WasmFullScheduler -d:wasmStealHostTest \
   build/wasm-steal-any/dependencies.wasm build/wasm-steal-any/zero-memory.wasm
 ```
 
-The host matrix completes all six directions with the full interpreter's
-`call_indirect` corpus and returns the result to each source. Tests cover
+The host matrix completes all six directions with all-core affinity and
+the full interpreter's `call_indirect` corpus and returns the result to
+each source. Tests cover
 lost finish and outcome acknowledgment replies, retained traps, bounded
 outcome capacity, cancel/start ordering, and worker and source resets.
-The dependency fixture exercises a typed host call
-on D0, rejection on LP and M0, an incompatible signature, an undeclared
-import, and the zero-page quota. Additional checks cover route spoofing,
+The dependency fixture exercises a D0-local resource, a compatible job
+behind the D0-only entry, a typed host call on D0, an incompatible signature,
+an undeclared import, a missing local memory factory, and the zero-page quota.
+Add `-d:wasmChunkedMemory
+-d:WasmMemoryChunkBytesConfig=512` to the fixture command to exercise a
+job offered by D0 and executed by LP using its registered memory factory.
+Additional checks cover route spoofing,
 capability changes before start, lost offer replies, stale sessions, peer
 reset, lease expiry, and duplicate start acknowledgments.
 
@@ -159,12 +179,12 @@ nim c -d:bl808lp -d:bl808kernel -d:bl808WasmFull \
 
 | QEMU CPU profile | Best-effort heap peak | Best-effort stack used | Soft heap peak | Soft stack used |
 | --- | ---: | ---: | ---: | ---: |
-| M0 | 11,576 | 4,016 | 11,576 | 4,304 |
-| D0 | 47,632 | 6,656 | 47,632 | 6,944 |
-| LP | 6,088 | 3,780 | 6,088 | 4,200 |
+| M0 | 11,552 | 4,064 | 11,552 | 4,368 |
+| D0 | 47,720 | 6,688 | 47,720 | 7,024 |
+| LP | 6,064 | 3,852 | 6,064 | 4,304 |
 
-The native LP all-route probe reserves 364 bytes of `.data`, 4,496
-bytes of `.bss`, 7,424 bytes of heap, and a 4,096-byte stack. Its
+The native LP all-route probe reserves 364 bytes of `.data`, 4,504
+bytes of `.bss`, 7,416 bytes of heap, and a 4,096-byte stack. Its
 four-timer profile limits this worker to four simultaneous kernel timers.
 Physical IPC, flash access, and interrupt paths need separate high-water
 measurements before enabling LP stealing by default.
@@ -175,7 +195,9 @@ Build `examples/wasm_steal_client_build_test.nim` on each core with
 `-d:wasmCrossCoreStealProbe -d:bl808WasmFull -d:bl808WasmFullScheduler
 -d:WasmSchedulerMaxTasks=1 -d:MaxRpcHandlers=1`. The LP build uses the
 four-timer, one-pending-call, one-completion profile above. The M0 build
-includes the broker and a local worker.
+includes the broker and a local worker. Each core advertises a different
+test resource. Jobs have all-core affinity and require the resource
+advertised by the selected target.
 
 For a coordinated bench run, place the baseline module in slot 2. Put a
 fresh nonzero boot ID at status plus `0x20` on each core before it starts.
@@ -186,13 +208,14 @@ word to zero on the other cores. The source reports `0x57534402` and the
 job ID at status plus four. The target reports `0x57534400` and 42 at
 status plus four after finishing. The source then also reports
 `0x57534400` and 42 at status plus four after reading and acknowledging
-the target's outcome. Repeat for each directed pair under the hardware
-harness. Physical validation is pending.
+the target's outcome. Keep the third core polling and verify it stays at
+`0x5753447F`. Repeat for each directed pair under the hardware harness.
+Physical validation is pending.
 
 ## Soft job stealing and clock correlation
 
-Best effort uses wire v5 with 40-byte control requests and 104-byte
-offers and replies. `-d:wasmSoftStealing` selects wire v6 for the broker
+Best effort uses wire v9 with 40-byte control requests and 104-byte
+offers and replies. `-d:wasmSoftStealing` selects wire v10 for the broker
 and all workers. Control requests stay 40 bytes. Offers and replies grow
 to 160 bytes. Each peer's claimed core bit is checked against the hardware
 IPC route. M0 passes a fresh, nonzero boot epoch to the server.
@@ -236,7 +259,7 @@ The host tests check asymmetric delays, different tick rates, stale
 epochs, overflow, conservative release, deadline order, bad samples,
 late acknowledgments, and fallback. All three QEMU profiles run the correlated
 claim and complete a full interpreter task with fake IPC and clock
-samples. LP's measured QEMU heap peak is 6,088 bytes. The soft LP
+samples. LP's measured QEMU heap peak is 6,064 bytes. The soft LP
 firmware reserves 332 bytes of `.data`, 5,024 bytes of `.bss`, 6,416
 bytes of heap, and 4,608 bytes of stack within 16 KiB.
 
@@ -252,6 +275,112 @@ clock samples, maximum round-trip ticks, maximum uncertainty and peak heap.
 The firmware images cross-link. Physical clock skew, IPC latency and
 admission margins still require coordinated Ox64 runs.
 
+## Migrating a started broker job
+
+`-d:wasmManagedMigration` connects the broker's ownership protocol to the
+existing portable snapshot transport. It supports best-effort core Wasm
+tasks without host imports. Before accepting snapshot bytes, the
+destination asks M0 whether it satisfies the active claim's affinity,
+resource, interpreter, and guest page requirements. That check reserves
+no ownership. The destination rechecks with M0 before preparing the
+handoff and restores a dormant task after validating the flash slot,
+module digest, export, and fuel. An incompatible receiver leaves the
+source eligible to resume. A managed restore uses the same registered
+memory factory and context as the destination's worker, when supplied.
+Standalone migration uses the receiver's configured factory. The managed
+restore also preserves the job's guest page quota.
+
+After prepare, the source stays frozen while M0 authorizes the checked
+destination session. If M0 confirms that the prepared session disappeared
+and the source still owns the claim, the source resumes. On authorization,
+the source retires its task before sending the destination commit.
+The receiver acquires a new claim token from M0
+before activation. The old worker cannot finish the job with its former
+token. The job keeps its original submitter and consumed fuel. A repeated
+authorization or activation grant can recover an ambiguous reply. The
+receiver keeps the most recent completed managed transfer receipt after
+reaping the task so that the source can resolve a lost activation reply.
+An ambiguous authorization leaves the source frozen. After authorization,
+an unrecoverable destination reset or transport failure can strand the
+transfer. Work is never replayed automatically.
+
+Use `bindWasmMigrationSourceWorker` and `bindWasmMigrationServerWorker`
+with the existing migration client and server. Drive each bound worker
+from the core's kernel loop. The migration client drives the source
+worker's authorization RPC during handoff. The server drives the
+destination's broker RPC while preparing and committing. Once active,
+the destination drives the task and finishes it through the ordinary
+steal client. The destination must have a connected, available worker
+before transfer. The managed transport uses wire v5 with a 56-byte header
+and up to 448 snapshot bytes in each existing XRAM slot. All managed peers
+must use the same version.
+
+All six directed routes are available. D0 and LP send to one another
+through M0. Initialize the relay with `initM0WasmMigrationRelay` after the
+IPC bridge and poll it with `pollM0WasmMigrationRelay` in the ordinary
+kernel loop. M0 uses 1,080 bytes of local RAM for two packet records,
+each holding a 504-byte request and one reply. The caller polls for the
+forwarded reply by repeating the same packet until its transfer timeout.
+M0 checks the claimed source
+against the incoming IPC slot. The receiver checks that the packet arrived
+from M0 and names the opposite core as its source. The destination still
+owns snapshot validation and the broker handoff. Transfer of component
+state and WIT resources remains open.
+
+The host test uses the actual queue, interpreter, snapshot wire, and
+handoff clients with in-process RPC. It covers all six routes, result
+delivery to a third core, lost replies from the broker and both legs of
+the relay, and a destination that finishes before the sender sees
+activation. It also checks full-size packets, independent relay slots,
+source and destination route validation, preservation of fuel, and a stale
+finish. A job with all-core affinity and a D0-only resource stays on D0
+when either LP or M0 is offered the suspended task. The sender produces
+zero snapshot fragments for those attempts, and D0 resumes and returns
+the original outcome. The tests also exercise source recovery on export
+mismatch, an unreachable destination, and destination reset before authorization.
+A lost authorization reply leaves the source frozen until a retry confirms
+the outcome. D0-to-LP and D0-to-M0 transfers that need a D0-only resource
+send no snapshot fragments.
+
+```sh
+nim c -r --skipUserCfg --skipParentCfg --skipProjCfg --path:src \
+  --checks:on --assertions:on -d:bl808WasmFullScheduler \
+  -d:wasmManagedMigration -d:wasmStealHostTest \
+  -d:wasmMigrationClientHostTest -d:wasmMigrationWireHostTest \
+  --nimcache:build/wasm-managed-migration/host-cache \
+  --out:build/wasm-managed-migration/host tools/test_wasm_managed_migration.nim
+```
+
+Add `-d:wasmStreamMigration` to exercise the streaming sender with both an
+eligible and an ineligible destination.
+
+Add `-d:wasmChunkedMemory -d:WasmMemoryChunkBytesConfig=512` and pass
+`build/wasm-steal-any/zero-memory.wasm` to exercise a D0-to-LP migration
+that depends on the advertised backing. M0 declines the same job before
+any snapshot fragments are sent. LP restores through its worker's
+registered factory and the guest grows memory within its one-page quota.
+
+Build the native probe from `examples/wasm_steal_client_build_test.nim`
+using the all-route flags above, plus `-d:wasmManagedMigration
+-d:wasmManagedMigrationProbe -d:MaxRpcHandlers=2`. Add
+`-d:wasmManagedMigrationProbeReceiver` to the destination. On LP, use
+`-d:WasmLpNativeStackBytes=4608` and
+`--passL:-Wl,--defsym=__bl808_lp_stack_bytes=4608`. The test guest in
+slot 2 is `tools/wasm_migration_small.wat` compiled with `wat2wasm`.
+Set the migration target bit at the source worker's status plus
+`0x28`. Set status plus `0x2C` to one on the destination so it waits for
+a handoff. Use the third core as submitter by setting its status plus
+`0x24` to the final destination bit. Clear unused control words and set
+fresh boot IDs on all three cores. The source worker reports the
+handoff, and the destination and submitter each report the value 42.
+For D0 to LP and LP to D0, M0 submits the test job and runs the relay.
+The build-only hardware harness builds both relayed probe configurations.
+Its LP profile uses a 4,096-byte stack and 388 bytes of `.data`.
+The sender has 5,336 bytes of `.bss` and 6,560 bytes of heap. The receiver
+has 5,992 bytes of `.bss` and 5,904 bytes of heap.
+The physical device and actual RAM high-water marks still need coordinated
+bench validation.
+
 ## Portable guest suspension gate
 
 The full scheduler now freezes a yielded task through
@@ -263,7 +392,9 @@ holds the new task dormant until `activateWasmTaskMigration`. Source
 retirement must precede activation. If the eventual commit is lost, work may
 strand but must never replay on both cores. The scheduler rejects real-time
 registered jobs, host imports, and host resources. The snapshot contains
-guest state only.
+guest state only. After a Wasm tail call replaces the first frame, the
+snapshot keeps the original entry export and restores the current callee
+frame after checking that its result types match the entry.
 
 The scheduler APIs are transport-neutral. The opt-in
 `wasm_migration_wire.nim`, `wasm_migration_client.nim`, and
@@ -660,8 +791,8 @@ with a single 460-byte packet buffer, then restores the recorded value.
 
 | QEMU core | Peak heap bytes | Native stack bytes used |
 | --- | ---: | ---: |
-| D0 | 43,728 | 6,864 |
-| LP | 3,704 | 4,196 |
+| D0 | 43,728 | 6,992 |
+| LP | 3,704 | 4,272 |
 
 ```sh
 mkdir -p build/wasm-stream-migration

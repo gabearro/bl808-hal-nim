@@ -6,6 +6,8 @@
 
 import mmio, memmap, core
 import kernel/fault
+when defined(bl808m0) and defined(radioProfiler):
+  import kernel/profiler
 
 # =============================================================================
 # IRQ numbers (base offset = 16 for all cores)
@@ -545,10 +547,17 @@ proc getTrapHandler*(irq: uint32): TrapHandler =
     nil
 
 proc dispatchTrapInterrupt(irq: uint32): bool {.raises: [].} =
+  when defined(bl808m0) and defined(radioProfiler):
+    static: doAssert TrapHandlerCount == ProfileIrqCount
   let handler = getTrapHandler(irq)
   if handler != nil:
+    when defined(bl808m0) and defined(radioProfiler):
+      let span = beginProfileSpan()
     {.cast(raises: []).}:
       handler()
+    when defined(bl808m0) and defined(radioProfiler):
+      endProfileSpan(span, prIrq, detail = irq.uint16,
+        trace = irq in {IrqM0Wifi.uint32, IrqM0WifiIpcPub.uint32})
     return true
   else:
     lastUnhandledIrq = irq

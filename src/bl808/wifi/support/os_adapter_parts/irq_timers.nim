@@ -87,7 +87,23 @@ proc osTimerStart(timer: pointer; tSec, tNsec: clong;
   state.periodic = periodic
   state.active = true
   osExitCritical(saved)
+  vendorNotifyWork()
   0
+
+proc osTimerNextDelayUs(nowUs: uint64): uint64 =
+  ## Timer objects are not stored in deadline order. Inspect them under the
+  ## same lock as osTimerStart and osTimerPoll, then return a relative delay.
+  result = high(uint64)
+  let saved = osEnterCritical()
+  defer: osExitCritical(saved)
+  var timer = osTimerHead
+  while timer != nil:
+    if timer.active and not timer.running:
+      let remaining = cast[int64](timer.deadlineUs - nowUs)
+      if remaining <= 0:
+        return 0
+      result = min(result, remaining.uint64)
+    timer = timer.next
 
 proc osTimerStartOnce(timer: pointer; tSec, tNsec: clong): cint {.cdecl.} =
   osTimerStart(timer, tSec, tNsec, false)
